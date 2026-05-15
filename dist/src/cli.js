@@ -586,7 +586,7 @@ async function miTuiCommand(initial = '') {
         const line = truncateText(inputDisplayText(), width);
         const padding = Math.max(0, width - widthOf(line));
         const inputRow = Math.max(1, height - 3);
-        process.stdout.write(`\x1b[${inputRow};1H\x1b[2K${line}${' '.repeat(padding)}\x1b[${inputRow};${inputCursorColumn(width)}H`);
+        process.stdout.write(`${WHITE_CURSOR}\x1b[${inputRow};1H\x1b[2K${line}${' '.repeat(padding)}\x1b[${inputRow};${inputCursorColumn(width)}H`);
     }
     function render() {
         if (closed)
@@ -638,7 +638,7 @@ async function miTuiCommand(initial = '') {
             if (index < lines.length - 1)
                 out.push('\r\n');
         });
-        out.push(`\x1b[${Math.max(1, height - 3)};${inputCursorColumn(width)}H`, '\x1b[?25h', '\x1b[?2026l');
+        out.push(WHITE_CURSOR, `\x1b[${Math.max(1, height - 3)};${inputCursorColumn(width)}H`, '\x1b[?25h', '\x1b[?2026l');
         process.stdout.write(out.join(''));
     }
     async function askOne(text) {
