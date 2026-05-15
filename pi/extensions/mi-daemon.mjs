@@ -124,6 +124,102 @@ async function runPrompt(message) {
   });
 }
 
+function createRpcProcess({ cwd = HOME, sessionDir = join(HOME, ".pi", "agent", "sessions"), model = MI_MODEL, env = {} } = {}) {
+  const proc = spawn(PI_BIN, ["--mode", "rpc", "--session-dir", sessionDir, "--model", model], {
+    cwd,
+    env: { ...process.env, ...env },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let rpcBuffer = "";
+  let rpcNextId = 1;
+  const rpcPending = new Map();
+  const agentEndWaiters = [];
+
+  proc.stdout.on("data", (chunk) => {
+    rpcBuffer += chunk.toString("utf8");
+    while (true) {
+      const newlineIndex = rpcBuffer.indexOf("\n");
+      if (newlineIndex === -1) break;
+      const line = rpcBuffer.slice(0, newlineIndex).trim();
+      rpcBuffer = rpcBuffer.slice(newlineIndex + 1);
+      if (!line) continue;
+      let payload;
+      try { payload = JSON.parse(line); } catch { log(`worker_parse_error ${line.slice(0, 500)}`); continue; }
+      if (payload.type === "response" && payload.id) {
+        const entry = rpcPending.get(payload.id);
+        if (!entry) continue;
+        rpcPending.delete(payload.id);
+        payload.success ? entry.resolve(payload.data ?? payload) : entry.reject(new Error(payload.error || "Worker RPC failed"));
+      } else if (payload.type === "agent_end") {
+        const waiter = agentEndWaiters.shift();
+        if (waiter) waiter.resolve(payload);
+      }
+    }
+  });
+  proc.stderr.on("data", (chunk) => log(`worker_stderr ${chunk.toString("utf8").trim()}`));
+  proc.on("exit", (code, signal) => {
+    const error = new Error(`Worker pi process exited ${code ?? "null"}/${signal ?? "null"}`);
+    for (const entry of rpcPending.values()) entry.reject(error);
+    rpcPending.clear();
+    for (const waiter of agentEndWaiters.splice(0)) waiter.reject(error);
+  });
+
+  function rpc(cmd) {
+    if (!proc.stdin.writable) throw new Error("Worker pi process is not writable");
+    const id = `worker-${rpcNextId++}`;
+    const payload = { id, ...cmd };
+    return new Promise((resolve, reject) => {
+      rpcPending.set(id, { resolve, reject });
+      proc.stdin.write(`${JSON.stringify(payload)}\n`, "utf8", (error) => {
+        if (error) {
+          rpcPending.delete(id);
+          reject(error);
+        }
+      });
+    });
+  }
+
+  function waitAgentEnd(timeoutMs = 300000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Timed out waiting for worker agent_end")), timeoutMs);
+      agentEndWaiters.push({
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+    });
+  }
+
+  return { proc, rpc, waitAgentEnd };
+}
+
+async function runWorker(request) {
+  const message = String(request.message || "").trim();
+  if (!message) throw new Error("Message is empty");
+  const name = String(request.name || `Mi worker ${new Date().toISOString()}`).trim();
+  const cwd = String(request.cwd || HOME).trim();
+  const model = String(request.model || MI_MODEL).trim();
+  const sessionDir = String(request.sessionDir || join(HOME, ".pi", "agent", "sessions")).trim();
+  log(`starting worker ${name} cwd=${cwd} model=${model}`);
+  const worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1" } });
+  try {
+    await worker.rpc({ type: "set_session_name", name });
+    const before = await worker.rpc({ type: "get_state" });
+    const done = worker.waitAgentEnd(Number(request.timeoutMs || 300000));
+    await worker.rpc({ type: "prompt", message });
+    const end = await done;
+    const after = await worker.rpc({ type: "get_state" }).catch(() => before);
+    return {
+      text: lastAssistantText(end.messages) || "Worker completed without text.",
+      sessionFile: after.sessionFile || before.sessionFile,
+      sessionId: after.sessionId || before.sessionId,
+      sessionName: after.sessionName || name,
+      model: after.model || before.model,
+    };
+  } finally {
+    worker.proc.kill();
+  }
+}
+
 async function handle(socket, request) {
   if (request.type === "prompt") {
     const message = String(request.message || "").trim();
@@ -178,6 +274,11 @@ async function handle(socket, request) {
   if (request.type === "get_available_models") {
     const state = await command({ type: "get_available_models" });
     socket.end(JSON.stringify({ ok: true, state }) + "\n");
+    return;
+  }
+  if (request.type === "run_worker") {
+    const result = await runWorker(request);
+    socket.end(JSON.stringify({ ok: true, ...result }) + "\n");
     return;
   }
   throw new Error(`Unknown request type: ${request.type}`);
