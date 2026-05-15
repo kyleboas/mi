@@ -233,7 +233,7 @@ const PUSHOVER_ENV_FILE = join(HOME, '.config', 'pushover', 'env');
 const PUSHOVER_MESSAGE_LIMIT = 1024;
 const MI_MAX_RESPONSE_CHARS = 255;
 const MI_TASKS_DIR = join(HOME, 'mi');
-const MI_PROMPT_PREFIX = `Answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not exceed the limit. Be concise. Durable Mi tasks, goals, objectives, todos, plans, and work queues must live in Markdown files under /home/kyle/mi/ and be kept current.\n\n`;
+const MI_PROMPT_PREFIX = `Answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not exceed the limit. Be concise.\n\n`;
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 'mi');
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
@@ -430,6 +430,9 @@ async function requestMi(message) {
     const response = await sendSocketRequest({ type: 'prompt', message });
     return normalizeMiResponse(response.text || '');
 }
+async function abortMiMain() {
+    return sendSocketRequest({ type: 'abort' }, 10000).catch(() => undefined);
+}
 async function getMiState() {
     try {
         return (await sendSocketRequest({ type: 'state' }, 10000)).state;
@@ -568,17 +571,12 @@ async function miTuiCommand(initial = '') {
         const model = miState?.model;
         const modelName = model ? `${model.provider}/${model.id}` : MI_MODEL;
         const thinking = miState?.thinkingLevel ? ` ${miState.thinkingLevel}` : '';
-        const stats = miState?.stats;
-        const inputTokens = stats?.tokens?.input;
-        const outputTokens = stats?.tokens?.output;
-        const cost = Number.isFinite(stats?.cost) ? `$${Number(stats.cost).toFixed(2)}` : '$—';
-        const queued = messageQueue.length > 0 ? ` q${messageQueue.length}` : '';
-        const left = `↑${formatTokens(inputTokens)} ↓${formatTokens(outputTokens)} ${cost}${queued}`;
+        const left = messageQueue.length > 0 ? `q${messageQueue.length}` : '';
         const right = `${modelName}${thinking}`;
         const available = Math.max(1, width - widthOf(left) - widthOf(right));
-        if (available > 1)
+        if (left && available > 1)
             return fgDim(`${left}${' '.repeat(available)}${right}`);
-        return fgDim(truncateText(`${left} ${right}`, width));
+        return fgDim(right.padStart(Math.max(widthOf(right), width)));
     }
     function renderInputLine() {
         if (closed)
@@ -672,6 +670,8 @@ async function miTuiCommand(initial = '') {
             return;
         while (messageQueue.length > 0) {
             const next = messageQueue.shift();
+            if (closed)
+                break;
             await askOne(next);
         }
         setPending(false);
@@ -694,6 +694,7 @@ async function miTuiCommand(initial = '') {
         process.stdout.off('resize', requestRender);
         if (process.stdin.isTTY)
             process.stdin.setRawMode(false);
+        process.stdin.pause();
         process.stdout.write(`${RESET_CURSOR}\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l\x1b[?1049l`);
     }
     function scrollBy(delta) {
@@ -748,10 +749,40 @@ async function miTuiCommand(initial = '') {
         }
         requestRender();
     }
+    function submitInput() {
+        const text = inputLine.trim();
+        if (!text)
+            return;
+        inputLine = '';
+        renderInputLine();
+        void applyPiCycle(text)
+            .then(({ body }) => {
+            if (body)
+                enqueueMessage(body);
+            else
+                requestRender();
+        })
+            .catch((error) => {
+            statusMessage = error instanceof Error ? error.message : String(error);
+            requestRender();
+        });
+    }
     function onData(buffer) {
         const data = buffer.toString('utf8');
         if (data === '\x03' || data === '\x1b') {
-            cleanup();
+            if (pending || messageQueue.length > 0) {
+                messageQueue.length = 0;
+                statusMessage = 'Stopping...';
+                setPending(false);
+                void abortMiMain().then(() => {
+                    statusMessage = `Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
+                    requestRender();
+                });
+                requestRender();
+            }
+            else {
+                cleanup();
+            }
             return;
         }
         if (data === '\x1b[Z' || data === '\x1b[1;2Z' || data === '\x1b\t' || data.includes('\x1b[Z') || data.includes('\x1b[1;2Z')) {
@@ -763,23 +794,18 @@ async function miTuiCommand(initial = '') {
         else if (data === '\x1b[6~' || data === '\x1b[B' || data === '\x1bOB' || data === '\x1b[1;2B' || data.includes('\x1b[<65;')) {
             scrollBy(-Math.max(3, Math.floor(rows() / 2)));
         }
-        else if (data === '\r' || data === '\n') {
-            const text = inputLine.trim();
-            if (text) {
-                inputLine = '';
-                renderInputLine();
-                void applyPiCycle(text)
-                    .then(({ body }) => {
-                    if (body)
-                        enqueueMessage(body);
-                    else
-                        requestRender();
-                })
-                    .catch((error) => {
-                    statusMessage = error instanceof Error ? error.message : String(error);
-                    requestRender();
-                });
-            }
+        else if (data.includes('\r') || data.includes('\n')) {
+            const parts = data.split(/[\r\n]+/);
+            const beforeEnter = parts.shift() || '';
+            const textBeforeEnter = beforeEnter.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+            if (textBeforeEnter)
+                inputLine += textBeforeEnter;
+            submitInput();
+            const afterEnter = parts.join('');
+            const textAfterEnter = afterEnter.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+            if (textAfterEnter)
+                inputLine += textAfterEnter;
+            renderInputLine();
         }
         else if (data === '\x7f' || data === '\b') {
             inputLine = inputLine.slice(0, -1);

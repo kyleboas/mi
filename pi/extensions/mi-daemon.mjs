@@ -232,6 +232,17 @@ async function handle(socket, request) {
     socket.end(JSON.stringify({ ok: true, pi: !!piProc && !piProc.killed }) + "\n");
     return;
   }
+  if (request.type === "abort") {
+    promptQueue.length = 0;
+    if (activePrompt) {
+      const entry = activePrompt;
+      activePrompt = undefined;
+      entry.resolve("Mi stopped.");
+    }
+    await command({ type: "abort" }).catch(() => undefined);
+    socket.end(JSON.stringify({ ok: true }) + "\n");
+    return;
+  }
   if (request.type === "state") {
     const state = await command({ type: "get_state" });
     let stats;
