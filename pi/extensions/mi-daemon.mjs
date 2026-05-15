@@ -163,6 +163,23 @@ async function handle(socket, request) {
     socket.end(JSON.stringify({ ok: true, state }) + "\n");
     return;
   }
+  if (request.type === "new_session") {
+    const state = await command({ type: "new_session", parentSession: request.parentSession });
+    socket.end(JSON.stringify({ ok: true, state }) + "\n");
+    return;
+  }
+  if (request.type === "set_session_name") {
+    const name = String(request.name || "").trim();
+    if (!name) throw new Error("name required");
+    const state = await command({ type: "set_session_name", name });
+    socket.end(JSON.stringify({ ok: true, state }) + "\n");
+    return;
+  }
+  if (request.type === "get_available_models") {
+    const state = await command({ type: "get_available_models" });
+    socket.end(JSON.stringify({ ok: true, state }) + "\n");
+    return;
+  }
   throw new Error(`Unknown request type: ${request.type}`);
 }
 
