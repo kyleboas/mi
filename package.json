@@ -1,0 +1,46 @@
+{
+  "name": "mi",
+  "version": "1.0.0",
+  "description": "Tiny private assistant harness: Markdown assistants plus triggers, tools, permissions, and workers.",
+  "main": "dist/src/server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/src/server.js",
+    "build": "tsc",
+    "check:manual": "bash scripts/manual-checks.sh",
+    "proactive": "tsx scripts/proactive.ts",
+    "proactive:brief": "tsx scripts/proactive.ts daily-brief",
+    "proactive:approvals": "tsx scripts/proactive.ts approval-reminders",
+    "proactive:health": "tsx scripts/proactive.ts health-check",
+    "flue:dev": "tsx scripts/flue-persistent.ts start",
+    "flue:build": "tsx scripts/flue-persistent.ts build",
+    "flue:status": "tsx scripts/flue-persistent.ts status",
+    "mi": "tsx src/cli.ts",
+    "scheduled": "tsx scripts/scheduled.ts",
+    "scheduled:production": "tsx scripts/scheduled.ts run production",
+    "validate:v0": "tsx scripts/validate-v0.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@flue/cli": "^0.3.10",
+    "@flue/sdk": "^0.3.10",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "valibot": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "bin": {
+    "mi": "dist/src/cli.js"
+  }
+}

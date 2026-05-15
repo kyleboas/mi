@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Mi</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0b0b0c; color: #f5f5f5; }
+    #login, #chat { max-width: 720px; margin: 0 auto; min-height: 100dvh; }
+    #login { display: grid; align-content: center; padding: 22px; }
+    #chat { display: none; grid-template-rows: 1fr auto; }
+    h1 { font-size: 20px; margin: 0 0 6px; }
+    .muted { color: #a1a1aa; font-size: 13px; margin: 0 0 14px; }
+    #messages { padding: 16px 12px 8px; overflow-y: auto; }
+    .msg { max-width: 88%; margin: 10px 0; padding: 11px 13px; border-radius: 18px; white-space: pre-wrap; line-height: 1.35; font-size: 15px; overflow-wrap: anywhere; }
+    .me { margin-left: auto; background: #6d5efc; color: white; border-bottom-right-radius: 5px; }
+    .bot { margin-right: auto; background: #1b1b20; border: 1px solid #2b2b31; border-bottom-left-radius: 5px; }
+    .approval { border-color: #6d5efc; }
+    form { display: flex; gap: 8px; padding: 10px 12px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid #242428; background: rgba(11,11,12,.98); position: sticky; bottom: 0; }
+    input, textarea { width: 100%; border-radius: 16px; padding: 12px; background: #18181b; color: #fff; border: 1px solid #333; font: inherit; outline: none; }
+    textarea { min-height: 46px; max-height: 130px; resize: none; }
+    button { border: 0; border-radius: 999px; padding: 10px 15px; background: #6d5efc; color: white; font-weight: 700; font: inherit; }
+    button:disabled { opacity: .55; }
+    .error { color: #ffb4b4; min-height: 20px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <main id="login">
+    <div>
+      <h1>Mi</h1>
+      <p class="muted">Private Tailnet chat.</p>
+      <input id="password" type="password" placeholder="Password" autocomplete="current-password" />
+      <button style="margin-top:10px;width:100%" onclick="login()">Login</button>
+      <div id="loginError" class="error"></div>
+    </div>
+  </main>
+
+  <main id="chat">
+    <section id="messages" aria-live="polite"></section>
+    <form onsubmit="send(event)">
+      <textarea id="msg" placeholder="Message Mi" rows="1" autocomplete="off"></textarea>
+      <button id="sendBtn" type="submit">Send</button>
+    </form>
+  </main>
+
+<script>
+let csrf = '';
+let authToken = sessionStorage.getItem('mi_token') || sessionStorage.getItem('assistant_token') || '';
+let busy = false;
+
+async function init() {
+  try {
+    const r = await fetch('/api/session', authToken ? { headers: { Authorization: `Bearer ${authToken}` } } : undefined);
+    if (!r.ok) return showLogin();
+    const j = await r.json();
+    csrf = j.csrf;
+    showChat();
+  } catch { showLogin(); }
+}
+
+function showLogin(){ document.getElementById('login').style.display='grid'; document.getElementById('chat').style.display='none'; }
+function showChat(){ document.getElementById('login').style.display='none'; document.getElementById('chat').style.display='grid'; setTimeout(() => document.getElementById('msg').focus(), 100); }
+
+async function api(url, opts={}) {
+  opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers || {});
+  if (authToken) opts.headers.Authorization = `Bearer ${authToken}`;
+  if (csrf && opts.method && opts.method !== 'GET') opts.headers['x-csrf-token'] = csrf;
+  const r = await fetch(url, opts);
+  if (r.status === 401 || r.status === 503) { showLogin(); throw new Error(await r.text()); }
+  return r;
+}
+
+async function login() {
+  const password = document.getElementById('password').value;
+  const r = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password}) });
+  if (!r.ok) { document.getElementById('loginError').textContent = 'Login failed'; return; }
+  const j = await r.json();
+  csrf = j.csrf;
+  authToken = password;
+  sessionStorage.setItem('mi_token', password);
+  sessionStorage.removeItem('assistant_token');
+  document.getElementById('loginError').textContent = '';
+  showChat();
+}
+
+async function send(event) {
+  event.preventDefault();
+  if (busy) return;
+  const box = document.getElementById('msg');
+  const message = box.value.trim();
+  if (!message) return;
+  box.value = '';
+  box.style.height = '46px';
+  add('me', message);
+  const pending = add('bot', '...');
+  busy = true;
+  document.getElementById('sendBtn').disabled = true;
+  try {
+    const r = await api('/api/chat', { method:'POST', body: JSON.stringify({message}) });
+    const j = await r.json();
+    pending.textContent = j.reply || j.error || 'Done.';
+    if (j.type === 'approval') pending.classList.add('approval');
+  } catch (e) {
+    pending.textContent = `Something went wrong. ${e?.message || ''}`.trim();
+  } finally {
+    busy = false;
+    document.getElementById('sendBtn').disabled = false;
+    scrollBottom();
+  }
+}
+
+function add(kind, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind;
+  div.textContent = text;
+  document.getElementById('messages').appendChild(div);
+  scrollBottom();
+  return div;
+}
+function scrollBottom() { const m = document.getElementById('messages'); setTimeout(() => m.scrollTop = m.scrollHeight, 0); }
+
+document.getElementById('msg').addEventListener('input', (e) => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 130) + 'px';
+});
+document.getElementById('password').addEventListener('keydown', (e) => { if (e.key === 'Enter') login(); });
+init();
+</script>
+</body>
+</html>

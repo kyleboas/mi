@@ -1,0 +1,8 @@
+[Unit]
+Description=Mi scheduled production assistant run
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/kyle/assistant
+EnvironmentFile=-/home/kyle/assistant/.env
+ExecStart=/home/kyle/.nvm/versions/node/v24.15.0/bin/npm run scheduled -- run production
