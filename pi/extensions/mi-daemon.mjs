@@ -280,6 +280,18 @@ async function runPrompt(message) {
   });
 }
 
+function workerKeys(task, fallbackName) {
+  return [...new Set([task.id, task.name, task.sessionName, fallbackName].filter(Boolean))];
+}
+
+function trackActiveWorker(task, fallbackName, worker) {
+  for (const key of workerKeys(task, fallbackName)) activeWorkers.set(key, worker);
+}
+
+function untrackActiveWorker(task, fallbackName) {
+  for (const key of workerKeys(task, fallbackName)) activeWorkers.delete(key);
+}
+
 function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODEL, env = {} } = {}) {
   const args = ["--mode", "rpc", "--model", model];
   if (sessionDir) args.splice(2, 0, "--session-dir", sessionDir);
@@ -363,9 +375,9 @@ async function continueWorker(request) {
   const workerMessage = String(request.useGoal || "1") === "0" || message.trim().startsWith("/goal") ? message : `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next. Do not answer only with goal-status boilerplate.`;
   const activeWorker = activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(name) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
-    await activeWorker.rpc({ type: "prompt", message: workerMessage, streamingBehavior: "followUp" });
+    await activeWorker.rpc({ type: "prompt", message: workerMessage, streamingBehavior: "steer" });
     await upsertTask({ ...task, status: "running", continuedAt: new Date().toISOString() });
-    return { text: `Queued follow-up for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+    return { text: `Queued message for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
   }
   const sessionFile = task.actualSessionFile || task.sessionFile;
   if (!sessionFile) throw new Error(`Task has no session file: ${taskId}`);
@@ -379,7 +391,9 @@ async function continueWorker(request) {
     const done = worker.waitAgentEnd(Number(request.timeoutMs || 300000));
     await worker.rpc({ type: "prompt", message: workerMessage });
     if (request.background) {
+      trackActiveWorker(task, name, worker);
       done.then(async (end) => {
+        untrackActiveWorker(task, name);
         const after = await worker.rpc({ type: "get_state" }).catch(() => before);
         const text = lastUsefulAssistantText(end.messages) || "Worker completed without text.";
         const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile);
@@ -387,6 +401,7 @@ async function continueWorker(request) {
         await deliverTaskMessage(`Mi task updated: ${name}`, formatTaskMessage("Task updated", name, text, after.sessionName || name, visibleSessionFile));
         worker.proc.kill();
       }).catch(async (error) => {
+        untrackActiveWorker(task, name);
         const errorText = String(error.message || error);
         await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: errorText });
         await deliverTaskMessage(`Mi task failed: ${name}`, formatTaskMessage("Task follow-up failed", name, errorText, name, task.sessionFile || "unknown"));
@@ -435,13 +450,9 @@ async function runWorker(request) {
     const workerMessage = String(request.useGoal || "1") === "0" || message.trim().startsWith("/goal") ? message : `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next. Do not answer only with goal-status boilerplate.`;
     await worker.rpc({ type: "prompt", message: workerMessage });
     if (request.background) {
-      activeWorkers.set(task.id, worker);
-      activeWorkers.set(task.name, worker);
-      activeWorkers.set(task.sessionName || name, worker);
+      trackActiveWorker(task, name, worker);
       done.then(async (end) => {
-        activeWorkers.delete(task.id);
-        activeWorkers.delete(task.name);
-        activeWorkers.delete(task.sessionName || name);
+        untrackActiveWorker(task, name);
         const after = await worker.rpc({ type: "get_state" }).catch(() => before);
         const text = lastUsefulAssistantText(end.messages) || "Worker completed without text.";
         const sessionFile = await mirrorSessionToHome(after.sessionFile || before.sessionFile);
@@ -459,9 +470,7 @@ async function runWorker(request) {
         await deliverTaskMessage(`Mi task complete: ${name}`, formatTaskMessage("Task complete", name, text, after.sessionName || name, sessionFile));
         worker.proc.kill();
       }).catch(async (error) => {
-        activeWorkers.delete(task.id);
-        activeWorkers.delete(task.name);
-        activeWorkers.delete(task.sessionName || name);
+        untrackActiveWorker(task, name);
         const errorText = String(error.message || error);
         await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: errorText });
         await deliverTaskMessage(`Mi task failed: ${name}`, formatTaskMessage("Task failed", name, errorText, task.sessionName || name, task.sessionFile || "unknown"));

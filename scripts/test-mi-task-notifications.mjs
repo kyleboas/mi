@@ -31,7 +31,8 @@ assertCliIncludes("const payload = { type: 'run_worker', name, cwd, message, bac
 assertCliNotIncludes("name: `Mi task: ${name}`", 'New Mi task workers must not prefix session names with "Mi task:".');
 assertMatches(/entry\.name === `Mi task: \$\{taskId\}`/, 'Existing prefixed Mi task records must remain addressable by unprefixed task id/name.');
 assertIncludes('const activeWorkers = new Map();', 'Mi daemon must track active task workers so follow-ups can queue into the running session.');
-assertMatches(/activeWorker[\s\S]*streamingBehavior: "followUp"[\s\S]*Queued follow-up for background task/, 'Mi task replies to running workers must use pi queued follow-up behavior instead of opening a competing session.');
+assertMatches(/activeWorker[\s\S]*streamingBehavior: "steer"[\s\S]*Queued message for background task/, 'Mi task replies to running workers must use pi normal queued-message behavior (Enter while streaming = steer) instead of opening a competing session.');
+assertIncludes('function trackActiveWorker(task, fallbackName, worker)', 'Mi daemon must track both newly-started and continued background workers while they are active.');
 
 if (!/function isActiveTask[\s\S]*task\.finishedAt[\s\S]*complete[\s\S]*completed[\s\S]*done[\s\S]*error[\s\S]*\['running', 'waiting', 'active'\]\.includes\(status\)/.test(cliSource)) {
   throw new Error('Mi TUI status-bar task list must exclude completed/terminal tasks and only show active tasks.');
