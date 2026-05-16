@@ -25,6 +25,7 @@ let buffer = "";
 let nextId = 1;
 const pending = new Map();
 const promptQueue = [];
+const activeWorkers = new Map();
 let activePrompt;
 
 async function log(line) {
@@ -358,9 +359,16 @@ async function continueWorker(request) {
   const tasks = await readTasks();
   const task = tasks.find((entry) => entry.id === taskId || entry.name === taskId || entry.name === `Mi task: ${taskId}`);
   if (!task) throw new Error(`Task not found: ${taskId}`);
+  const name = task.sessionName || task.name || `Mi task: ${taskId}`;
+  const workerMessage = String(request.useGoal || "1") === "0" || message.trim().startsWith("/goal") ? message : `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next. Do not answer only with goal-status boilerplate.`;
+  const activeWorker = activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(name) || activeWorkers.get(taskId);
+  if (activeWorker && !activeWorker.proc.killed) {
+    await activeWorker.rpc({ type: "prompt", message: workerMessage, streamingBehavior: "followUp" });
+    await upsertTask({ ...task, status: "running", continuedAt: new Date().toISOString() });
+    return { text: `Queued follow-up for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+  }
   const sessionFile = task.actualSessionFile || task.sessionFile;
   if (!sessionFile) throw new Error(`Task has no session file: ${taskId}`);
-  const name = task.sessionName || task.name || `Mi task: ${taskId}`;
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
   log(`continuing worker ${name} cwd=${cwd} model=${model}`);
@@ -369,7 +377,6 @@ async function continueWorker(request) {
     const before = await worker.rpc({ type: "get_state" });
     await upsertTask({ ...task, status: "running", continuedAt: new Date().toISOString() });
     const done = worker.waitAgentEnd(Number(request.timeoutMs || 300000));
-    const workerMessage = String(request.useGoal || "1") === "0" || message.trim().startsWith("/goal") ? message : `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next. Do not answer only with goal-status boilerplate.`;
     await worker.rpc({ type: "prompt", message: workerMessage });
     if (request.background) {
       done.then(async (end) => {
@@ -428,7 +435,13 @@ async function runWorker(request) {
     const workerMessage = String(request.useGoal || "1") === "0" || message.trim().startsWith("/goal") ? message : `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next. Do not answer only with goal-status boilerplate.`;
     await worker.rpc({ type: "prompt", message: workerMessage });
     if (request.background) {
+      activeWorkers.set(task.id, worker);
+      activeWorkers.set(task.name, worker);
+      activeWorkers.set(task.sessionName || name, worker);
       done.then(async (end) => {
+        activeWorkers.delete(task.id);
+        activeWorkers.delete(task.name);
+        activeWorkers.delete(task.sessionName || name);
         const after = await worker.rpc({ type: "get_state" }).catch(() => before);
         const text = lastUsefulAssistantText(end.messages) || "Worker completed without text.";
         const sessionFile = await mirrorSessionToHome(after.sessionFile || before.sessionFile);
@@ -446,6 +459,9 @@ async function runWorker(request) {
         await deliverTaskMessage(`Mi task complete: ${name}`, formatTaskMessage("Task complete", name, text, after.sessionName || name, sessionFile));
         worker.proc.kill();
       }).catch(async (error) => {
+        activeWorkers.delete(task.id);
+        activeWorkers.delete(task.name);
+        activeWorkers.delete(task.sessionName || name);
         const errorText = String(error.message || error);
         await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: errorText });
         await deliverTaskMessage(`Mi task failed: ${name}`, formatTaskMessage("Task failed", name, errorText, task.sessionName || name, task.sessionFile || "unknown"));
