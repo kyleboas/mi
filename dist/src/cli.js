@@ -558,7 +558,12 @@ function activeTaskSince(task) {
     return Number.isFinite(started) ? started : Date.now();
 }
 function isActiveTask(task) {
-    return ['running', 'waiting', 'active'].includes(String(task.status || '').toLowerCase());
+    if (task.finishedAt)
+        return false;
+    const status = String(task.status || '').toLowerCase();
+    if (['complete', 'completed', 'done', 'success', 'succeeded', 'failed', 'error', 'cancelled', 'canceled'].includes(status))
+        return false;
+    return ['running', 'waiting', 'active'].includes(status);
 }
 function sendSocketRequest(payload, timeoutMs = 120000) {
     return new Promise((resolve, reject) => {

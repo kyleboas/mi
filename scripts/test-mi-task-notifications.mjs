@@ -2,6 +2,7 @@
 import { readFile } from 'node:fs/promises';
 
 const source = await readFile(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
+const cliSource = await readFile(new URL('../src/cli.ts', import.meta.url), 'utf8');
 
 function assertIncludes(needle, message) {
   if (!source.includes(needle)) throw new Error(message);
@@ -18,5 +19,9 @@ assertMatches(/done\.then\([\s\S]*deliverTaskMessage\(`Mi task complete:/, 'Back
 assertMatches(/done\.then\([\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task errors must be surfaced to Kyle immediately after being recorded.');
 assertMatches(/continueWorker[\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task follow-up errors must be surfaced to Kyle immediately after being recorded.');
 assertIncludes('safeNotificationText', 'Task notifications must sanitize obvious secrets before push delivery.');
+
+if (!/function isActiveTask[\s\S]*task\.finishedAt[\s\S]*complete[\s\S]*completed[\s\S]*done[\s\S]*error[\s\S]*\['running', 'waiting', 'active'\]\.includes\(status\)/.test(cliSource)) {
+  throw new Error('Mi TUI status-bar task list must exclude completed/terminal tasks and only show active tasks.');
+}
 
 console.log('Mi task notification behavior checks passed.');

@@ -396,6 +396,7 @@ type MiTask = {
   status?: string;
   startedAt?: string;
   continuedAt?: string;
+  finishedAt?: string;
 };
 
 function readPushoverEnvFile(): Record<string, string> {
@@ -565,7 +566,10 @@ function activeTaskSince(task: MiTask) {
 }
 
 function isActiveTask(task: MiTask) {
-  return ['running', 'waiting', 'active'].includes(String(task.status || '').toLowerCase());
+  if (task.finishedAt) return false;
+  const status = String(task.status || '').toLowerCase();
+  if (['complete', 'completed', 'done', 'success', 'succeeded', 'failed', 'error', 'cancelled', 'canceled'].includes(status)) return false;
+  return ['running', 'waiting', 'active'].includes(status);
 }
 
 function sendSocketRequest(payload: unknown, timeoutMs = 120000): Promise<{ ok?: boolean; error?: string; text?: string; state?: any; sessionFile?: string; sessionId?: string; sessionName?: string; model?: unknown; taskId?: string; tasks?: unknown[] }> {
