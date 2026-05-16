@@ -87,6 +87,8 @@ From this repo before install, use `npm run mi -- ...`.
 
 Mi chat UI slash commands are reserved for useful in-context actions. `/inbox` is intentionally hidden there because Mi already opens on the durable main inbox and temporary threads are legacy/troubleshooting state; use `/tasks` for actionable background worker status or `mi inbox`/`mi threads` from a shell when inspecting thread files.
 
+For Mi background tasks, `mi task reply <task-id-or-name> -- <message>` uses the same steering semantics as pi's normal queued messages while a task is active: Mi queues the message into the active RPC worker with `streamingBehavior: "steer"`. This lets the current worker incorporate the queued steer instead of creating another worker on the same task. If no active worker is tracked, Mi falls back to resuming the saved task session.
+
 ## Role of Tailscale
 
 The Mi web UI remains private and Tailnet-only. Tailscale is the only remote control surface; there is no public webhook/control UI. Persistent Flue orchestration binds to loopback and is reached through Mi, not directly. Pushover is only for safe notifications, not a control plane.

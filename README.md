@@ -127,6 +127,8 @@ Inside pi:
 
 Mi's own chat UI intentionally does not expose a `/inbox` slash command: the normal Mi view is already the durable main inbox, while temporary threads are legacy/troubleshooting state. Use `/tasks` in Mi for actionable background work status, or `mi inbox`/`mi threads` from a shell when inspecting thread files.
 
+`mi task reply <task-id-or-name> -- <message>` matches pi's normal queued-message behavior for active workers: if the worker is still streaming, Mi sends the reply to that same RPC session as a `prompt` with `streamingBehavior: "steer"` instead of starting a competing resume session. If the worker is no longer active, Mi resumes the saved task session and sends the message normally.
+
 ## Run web app
 
 ```bash
