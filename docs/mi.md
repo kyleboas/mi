@@ -85,6 +85,8 @@ mi logs <assistant>
 
 From this repo before install, use `npm run mi -- ...`.
 
+Mi chat UI slash commands are reserved for useful in-context actions. `/inbox` is intentionally hidden there because Mi already opens on the durable main inbox and temporary threads are legacy/troubleshooting state; use `/tasks` for actionable background worker status or `mi inbox`/`mi threads` from a shell when inspecting thread files.
+
 ## Role of Tailscale
 
 The Mi web UI remains private and Tailnet-only. Tailscale is the only remote control surface; there is no public webhook/control UI. Persistent Flue orchestration binds to loopback and is reached through Mi, not directly. Pushover is only for safe notifications, not a control plane.

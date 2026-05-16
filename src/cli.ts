@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { createInterface } from 'node:readline/promises';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
@@ -14,6 +14,7 @@ import { checkAssistant, runAssistant } from './runner.js';
 import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
 import { readRecentEvents, logEvent } from './state.js';
+import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import {
   appendThreadMessage,
   compactThread,
@@ -39,6 +40,11 @@ Usage:
   mi threads                      List Mi conversations
   mi temp <title>                 Create/open a temporary conversation
   mi compact [thread]             Compact old read messages in a thread
+  mi cron list|tick|remove <name>
+  mi cron add <name> --every 1h [--cwd <path>] -- <command>
+  mi task <name> [--cwd <path>] -- <task prompt>
+  mi task reply <task-id-or-name> -- <follow-up prompt>
+  mi task list
 
   mi make <description> [--name <name>]
   mi run <assistant>
@@ -151,14 +157,62 @@ async function showThread(threadId: string) {
   await markThreadRead(threadId);
 }
 
+function timezoneOffsetMs(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  }).formatToParts(date).reduce<Record<string, string>>((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+  const asUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
+  return asUtc - date.getTime();
+}
+
+function localTimeToUtcIso(hour: number, minute: number, timeZone = 'America/New_York') {
+  const nowDate = new Date();
+  const nowParts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(nowDate).reduce<Record<string, string>>((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+  let guess = new Date(Date.UTC(Number(nowParts.year), Number(nowParts.month) - 1, Number(nowParts.day), hour, minute, 0));
+  guess = new Date(guess.getTime() - timezoneOffsetMs(guess, timeZone));
+  if (guess.getTime() <= nowDate.getTime()) guess = new Date(guess.getTime() + 24 * 60 * 60_000);
+  return guess.toISOString();
+}
+
+async function maybeHandleLocalIntent(message: string) {
+  const match = message.trim().match(/^remind\s+me\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$/i);
+  if (!match) return undefined;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || '0');
+  const meridiem = match[3]?.toLowerCase();
+  const text = match[4].trim();
+  if (meridiem === 'pm' && hour < 12) hour += 12;
+  if (meridiem === 'am' && hour === 12) hour = 0;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || !text) return undefined;
+  const at = localTimeToUtcIso(hour, minute);
+  const name = `reminder-${Date.now().toString(36)}`;
+  await upsertCron({ name, at, message: text, enabled: true });
+  return `Reminder set for ${new Date(at).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'short' })}: ${text}`;
+}
+
 async function askMi(threadId: string, message: string) {
   const thread = await getThread(threadId);
   if (!thread) throw new Error(`thread not found: ${threadId}`);
   await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'cli' });
   await logEvent('mi.thread.user', { threadId, message });
 
+  const localReply = await maybeHandleLocalIntent(message);
+  if (localReply) {
+    await appendThreadMessage(threadId, 'assistant', localReply, { unread: false, source: 'mi-local' });
+    return localReply;
+  }
+
   const context = await threadContext(threadId);
-  const prompt = `You are Mi, Kyle's private persistent assistant. Reply as Mi in the current conversation. Be concise. Do not claim to have inspected files or services unless context explicitly says so. Risky actions require approval.\n\nThread: ${thread.title}\n\n${context}\n\nCurrent user message:\n${message}`;
+  const prompt = `You are Mi, Kyle's private persistent assistant. Reply as Mi in the current conversation. Be concise. Do not claim to have inspected files or services unless context explicitly says so. Risky actions require approval. If Kyle asks in plain English to monitor, periodically check, alert on, or schedule something, translate that into a Mi cron when enough details are known. Mi crons live in /home/kyle/mi/state/crons.json and are managed with: mi cron add <name> --every 1h [--cwd <path>] -- <command>; mi cron list; mi cron tick; mi cron remove <name>. If details are missing, ask only for the missing repo/path, cadence, health command, and alert behavior. When Kyle gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with: mi task <name> [--cwd <path>] -- <task prompt>. Name it clearly. Mi task wraps the prompt in /goal by default for sustained execution. This command returns after the worker starts; do not wait for the task to finish before replying to Kyle. Worker sessions use /home/kyle/.pi/agent/sessions so Kyle can see them in /resume. Use mi task list to inspect background task status. When Kyle responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: mi task reply <task-id-or-name> -- <follow-up prompt>. Follow-ups are also wrapped in /goal by default unless already using /goal. Escalate to Kyle when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs Kyle review/merge.\n\nThread: ${thread.title}\n\n${context}\n\nCurrent user message:\n${message}`;
   const result = await runFlueChat(prompt);
   const reply = result.reply || 'Got it.';
   await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.source });
@@ -200,9 +254,100 @@ async function compactCommand(args: string[]) {
   if (result.archivePath) console.log(`Archive: ${result.archivePath}`);
 }
 
+async function taskCommand(args: string[]) {
+  const name = args[0];
+  if (name === 'reply') {
+    const taskId = args[1];
+    const sep = args.indexOf('--');
+    const message = sep >= 0 ? args.slice(sep + 1).join(' ').trim() : args.slice(2).join(' ').trim();
+    if (!taskId || !message) throw new Error('usage: mi task reply <task-id-or-name> -- <follow-up prompt>');
+    const payload = { type: 'continue_worker', taskId, message, background: true };
+    const result = await sendSocketRequest(payload, 30_000).catch(async (error) => {
+      if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
+      await startMiDaemon();
+      return sendSocketRequest(payload, 30_000);
+    });
+    console.log(result.text || 'Sent follow-up.');
+    if (result.taskId) console.log(`Task: ${result.taskId}`);
+    if (result.sessionName) console.log(`Session: ${result.sessionName}`);
+    if (result.sessionFile) console.log(`Visible in /resume: ${result.sessionFile}`);
+    return;
+  }
+  if (name === 'list') {
+    const result = await sendSocketRequest({ type: 'list_tasks' }, 10000).catch(async (error) => {
+      if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
+      await startMiDaemon();
+      return sendSocketRequest({ type: 'list_tasks' }, 10000);
+    });
+    console.log(JSON.stringify(result.tasks || [], null, 2));
+    return;
+  }
+  const cwd = argValue(args, '--cwd') || '/home/kyle';
+  const sep = args.indexOf('--');
+  const message = sep >= 0 ? args.slice(sep + 1).join(' ').trim() : args.slice(1).join(' ').trim();
+  if (!name || !message) throw new Error('usage: mi task <name>|list [--cwd <path>] -- <task prompt>');
+  const payload = { type: 'run_worker', name: `Mi task: ${name}`, cwd, message, background: true };
+  try {
+    const result = await sendSocketRequest(payload, 30_000);
+    console.log(result.text || 'Started background task.');
+    if (result.taskId) console.log(`Task: ${result.taskId}`);
+    if (result.sessionName) console.log(`Session: ${result.sessionName}`);
+    if (result.sessionFile) console.log(`Visible in /resume: ${result.sessionFile}`);
+  } catch (error) {
+    if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
+    await startMiDaemon();
+    const result = await sendSocketRequest(payload, 30_000);
+    console.log(result.text || 'Started background task.');
+    if (result.taskId) console.log(`Task: ${result.taskId}`);
+    if (result.sessionName) console.log(`Session: ${result.sessionName}`);
+    if (result.sessionFile) console.log(`Visible in /resume: ${result.sessionFile}`);
+  }
+}
+
+async function cronCommand(args: string[]) {
+  const sub = args[0] || 'list';
+  if (sub === 'list') {
+    const crons = await readCrons();
+    if (crons.length === 0) {
+      console.log('No Mi crons.');
+      console.log(`State: ${cronPaths().cronsPath}`);
+      return;
+    }
+    for (const cron of crons) {
+      const schedule = cron.at ? `at ${cron.at}` : `every ${cron.every}`;
+      const action = cron.message || cron.command || '';
+      console.log(`${cron.enabled ? 'on ' : 'off'} ${cron.name} ${schedule}${cron.cwd ? ` cwd=${cron.cwd}` : ''} last=${cron.lastStatus || 'never'} — ${action}`);
+    }
+    return;
+  }
+  if (sub === 'tick') {
+    const ran = await tickCrons();
+    console.log(ran.length ? JSON.stringify(ran, null, 2) : 'No crons due.');
+    return;
+  }
+  if (sub === 'remove') {
+    const name = args[1];
+    if (!name) throw new Error('usage: mi cron remove <name>');
+    console.log(`Removed ${await removeCron(name)} cron(s).`);
+    return;
+  }
+  if (sub === 'add') {
+    const name = args[1];
+    const every = argValue(args, '--every');
+    const cwd = argValue(args, '--cwd');
+    const sep = args.indexOf('--');
+    const command = sep >= 0 ? args.slice(sep + 1).join(' ').trim() : '';
+    if (!name || !every || !command) throw new Error('usage: mi cron add <name> --every 1h [--cwd <path>] -- <command>');
+    await upsertCron({ name, every, cwd, command, enabled: true });
+    console.log(`Saved cron ${name}. Run due jobs with: mi cron tick`);
+    return;
+  }
+  throw new Error(`unknown cron command: ${sub}`);
+}
+
 async function chatCommand(threadId = 'main') {
   await showThread(threadId);
-  console.log('\nType a message. Commands: /inbox, /compact, /exit');
+  console.log('\nType a message. Commands: /compact, /exit');
   const rl = createInterface({ input, output });
   try {
     while (true) {
@@ -210,11 +355,7 @@ async function chatCommand(threadId = 'main') {
       if (!line) continue;
       if (line === '/exit' || line === '/quit') break;
       if (line === '/help') {
-        console.log('Commands: /inbox, /compact, /exit');
-        continue;
-      }
-      if (line === '/inbox') {
-        await inboxCommand();
+        console.log('Commands: /compact, /exit');
         continue;
       }
       if (line === '/compact') {
@@ -347,6 +488,7 @@ function wrapPlain(text: string, width: number) {
 
 const PI_ACCENT = '\x1b[38;2;138;190;183m';
 const PI_DIM = '\x1b[38;2;102;102;102m';
+const PI_LIGHT_DIM = '\x1b[38;2;170;170;170m';
 const PI_USER_BG = '\x1b[48;2;52;53;65m';
 const THINKING_COLORS: Record<string, string> = {
   off: '\x1b[38;2;80;80;80m',
@@ -358,6 +500,9 @@ const THINKING_COLORS: Record<string, string> = {
 };
 const RESET_FG = '\x1b[39m';
 const RESET_BG = '\x1b[49m';
+const INVERSE = '\x1b[7m';
+const RESET_INVERSE = '\x1b[27m';
+const CURSOR_CELL = ' ';
 const WHITE_CURSOR = '\x1b]12;white\x07';
 const RESET_CURSOR = '\x1b]112\x07';
 const PI_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -368,6 +513,10 @@ function fgAccent(text: string) {
 
 function fgDim(text: string) {
   return `${PI_DIM}${text}${RESET_FG}`;
+}
+
+function fgLightDim(text: string) {
+  return `${PI_LIGHT_DIM}${text}${RESET_FG}`;
 }
 
 function fgThinking(level: string | undefined, text: string) {
@@ -384,7 +533,7 @@ function workingLine() {
   return `${fgAccent(frame)} ${fgDim('Working...')}`;
 }
 
-function sendSocketRequest(payload: unknown, timeoutMs = 120000): Promise<{ ok?: boolean; error?: string; text?: string; state?: any }> {
+function sendSocketRequest(payload: unknown, timeoutMs = 120000): Promise<{ ok?: boolean; error?: string; text?: string; state?: any; sessionFile?: string; sessionId?: string; sessionName?: string; model?: unknown; taskId?: string; tasks?: unknown[] }> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(MI_SOCKET_PATH);
     let data = '';
@@ -399,7 +548,7 @@ function sendSocketRequest(payload: unknown, timeoutMs = 120000): Promise<{ ok?:
       clearTimeout(timer);
       socket.end();
       try {
-        const response = JSON.parse(data.slice(0, data.indexOf('\n'))) as { ok?: boolean; error?: string; text?: string; state?: any };
+        const response = JSON.parse(data.slice(0, data.indexOf('\n'))) as { ok?: boolean; error?: string; text?: string; state?: any; sessionFile?: string; sessionId?: string; sessionName?: string; model?: unknown; taskId?: string; tasks?: unknown[] };
         if (response.ok) resolve(response);
         else reject(new Error(response.error || 'Mi main returned an error'));
       } catch (error) {
@@ -413,8 +562,13 @@ function sendSocketRequest(payload: unknown, timeoutMs = 120000): Promise<{ ok?:
   });
 }
 
+function isSocketConnectionRefused(error: unknown) {
+  return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ECONNREFUSED');
+}
+
 async function startMiDaemon() {
   await mkdir(dirname(MI_SOCKET_PATH), { recursive: true });
+  if (existsSync(MI_SOCKET_PATH)) await rm(MI_SOCKET_PATH, { force: true });
   const child = spawn(process.execPath, [MI_DAEMON_PATH], {
     detached: true,
     stdio: 'ignore',
@@ -453,7 +607,7 @@ async function getMiState() {
   try {
     return (await sendSocketRequest({ type: 'state' }, 10000)).state;
   } catch (error) {
-    if (existsSync(MI_SOCKET_PATH)) throw error;
+    if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
     await startMiDaemon();
     return (await sendSocketRequest({ type: 'state' }, 10000)).state;
   }
@@ -467,7 +621,7 @@ async function setMiModelThinking(modelSpec: string, level?: ThinkingLevel) {
     await sendSocketRequest({ type: 'set_model', provider, modelId }, 30000);
     return level ? (await sendSocketRequest({ type: 'set_thinking', level }, 30000)).state : await getMiState();
   } catch (error) {
-    if (existsSync(MI_SOCKET_PATH)) throw error;
+    if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
     await startMiDaemon();
     await sendSocketRequest({ type: 'set_model', provider, modelId }, 30000);
     return level ? (await sendSocketRequest({ type: 'set_thinking', level }, 30000)).state : await getMiState();
@@ -502,7 +656,7 @@ async function sendToMiMain(message: string): Promise<string> {
     text = await requestMi(`Rewrite this answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not truncate; produce a complete concise answer.\n\n${text}`);
     return normalizeMiResponse(text);
   } catch (error) {
-    if (existsSync(MI_SOCKET_PATH)) throw error;
+    if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
   }
   await startMiDaemon();
   let text = await requestMi(miPrompt(message));
@@ -513,7 +667,9 @@ async function sendToMiMain(message: string): Promise<string> {
 
 async function miTuiCommand(initial = '') {
   await mkdir(MI_TASKS_DIR, { recursive: true });
-  let transcript = (await readThreadMessages('main', 300))
+  const initialMessages = await readThreadMessages('main', 300);
+  const seenMessageIds = new Set(initialMessages.map((message) => message.id));
+  let transcript = initialMessages
     .filter((message) => message.role === 'user' || message.role === 'assistant')
     .map((message) => ({ role: message.role as 'user' | 'assistant', text: message.text }));
   await markThreadRead('main');
@@ -529,6 +685,9 @@ async function miTuiCommand(initial = '') {
   let closed = false;
   let renderTimer: NodeJS.Timeout | undefined;
   let workingTimer: NodeJS.Timeout | undefined;
+  let threadPollTimer: NodeJS.Timeout | undefined;
+  let lastSigintTime = 0;
+  let slashSelectedIndex = 0;
 
   const rows = () => process.stdout.rows || 24;
   const cols = () => process.stdout.columns || 80;
@@ -570,8 +729,79 @@ async function miTuiCommand(initial = '') {
     return inputText();
   }
 
-  function inputCursorColumn(width: number) {
-    return Math.min(width, widthOf(inputText()) + 1);
+  function inputWrappedPlainLines(width: number) {
+    const wrapWidth = Math.max(1, width);
+    const text = inputDisplayText();
+    const lines: string[] = [];
+    for (let i = 0; i < text.length; i += wrapWidth) lines.push(text.slice(i, i + wrapWidth));
+    return lines.length ? lines : [''];
+  }
+
+  function slashSuggestions() {
+    const slashCommands = [
+      { command: '/quit', description: 'Quit Mi' },
+      { command: '/reload', description: 'Reload Mi' },
+      { command: '/tasks', description: 'Show background tasks' },
+    ];
+    if (!inputLine.startsWith('/')) return [];
+    return slashCommands.filter((item) => item.command.startsWith(inputLine));
+  }
+
+  function slashSuggestionLines(width: number) {
+    const suggestions = slashSuggestions();
+    if (suggestions.length === 0) return [];
+    slashSelectedIndex = Math.max(0, Math.min(slashSelectedIndex, suggestions.length - 1));
+    const maxVisible = 8;
+    const start = Math.max(0, Math.min(slashSelectedIndex - Math.floor(maxVisible / 2), suggestions.length - maxVisible));
+    const visible = suggestions.slice(start, start + maxVisible);
+    const primaryWidth = Math.min(32, Math.max(12, ...suggestions.map((item) => item.command.length + 2)));
+    const lines = visible.map((item, offset) => {
+      const index = start + offset;
+      const selected = index === slashSelectedIndex;
+      const prefix = selected ? '→ ' : '  ';
+      const command = item.command.padEnd(primaryWidth);
+      const line = truncateText(`${prefix}${command}${item.description}`, width);
+      return selected ? fgLightDim(line) : line;
+    });
+    if (start > 0 || start + visible.length < suggestions.length) lines.push(fgDim(truncateText(`  (${slashSelectedIndex + 1}/${suggestions.length})`, width)));
+    return lines;
+  }
+
+  function acceptSlashSelection() {
+    const suggestions = slashSuggestions();
+    if (suggestions.length === 0) return false;
+    slashSelectedIndex = Math.max(0, Math.min(slashSelectedIndex, suggestions.length - 1));
+    inputLine = `${suggestions[slashSelectedIndex].command} `;
+    requestRender();
+    return true;
+  }
+
+  function moveSlashSelection(delta: number) {
+    const suggestions = slashSuggestions();
+    if (suggestions.length === 0) return false;
+    slashSelectedIndex = (slashSelectedIndex + delta + suggestions.length) % suggestions.length;
+    requestRender();
+    return true;
+  }
+
+  function inputDisplayLines(width: number) {
+    const wrapWidth = Math.max(1, width);
+    const lines = inputWrappedPlainLines(width);
+    const lastIndex = lines.length - 1;
+    const last = lines[lastIndex] || '';
+    const hasCursorRoom = widthOf(last) < wrapWidth;
+    const rendered = lines.slice(0, lastIndex).map((line) => truncateText(line, width));
+    if (hasCursorRoom) rendered.push(truncateText(`${last}${INVERSE}${CURSOR_CELL}${RESET_INVERSE}`, width));
+    else rendered.push(truncateText(last, width), `${INVERSE}${CURSOR_CELL}${RESET_INVERSE}`);
+    return rendered;
+  }
+
+  function inputCursorPosition(width: number, inputRows: number, inputStartRow: number) {
+    const lines = inputWrappedPlainLines(width);
+    const last = lines[lines.length - 1] || '';
+    const row = inputStartRow + Math.min(inputRows - 1, lines.length - 1);
+    const col = Math.min(width, widthOf(last) + 1);
+    return { row, col };
   }
 
   function formatTokens(value: number | undefined) {
@@ -597,10 +827,7 @@ async function miTuiCommand(initial = '') {
     if (closed) return;
     const width = cols();
     const height = rows();
-    const line = truncateText(inputDisplayText(), width);
-    const padding = Math.max(0, width - widthOf(line));
-    const inputRow = Math.max(1, height - 3);
-    process.stdout.write(`${WHITE_CURSOR}\x1b[${inputRow};1H\x1b[2K${line}${' '.repeat(padding)}\x1b[${inputRow};${inputCursorColumn(width)}H`);
+    requestRender();
   }
 
   function render() {
@@ -608,7 +835,10 @@ async function miTuiCommand(initial = '') {
     const width = cols();
     const height = rows();
     const innerWidth = Math.max(20, width - 4);
-    const bodyViewport = Math.max(1, height - 5);
+    const inputLines = inputDisplayLines(width);
+    const inputRows = inputLines.length;
+    const suggestionLines = slashSuggestionLines(width);
+    const bodyViewport = Math.max(1, height - 4 - inputRows - suggestionLines.length);
     const body: string[] = [];
 
     for (const item of transcript) {
@@ -639,7 +869,8 @@ async function miTuiCommand(initial = '') {
     const lines = [
       ...visibleBody.map((line) => truncateText(line, width)),
       fgThinking(miState?.thinkingLevel, '─'.repeat(width)),
-      truncateText(inputDisplayText(), width),
+      ...inputLines,
+      ...suggestionLines,
       fgThinking(miState?.thinkingLevel, '─'.repeat(width)),
       statusLine(width),
       '',
@@ -652,7 +883,8 @@ async function miTuiCommand(initial = '') {
       out.push('\x1b[2K', line, ' '.repeat(padding));
       if (index < lines.length - 1) out.push('\r\n');
     });
-    out.push(WHITE_CURSOR, `\x1b[${Math.max(1, height - 3)};${inputCursorColumn(width)}H`, '\x1b[?25h', '\x1b[?2026l');
+    const cursor = inputCursorPosition(width, inputRows, Math.max(1, height - 2 - inputRows));
+    out.push(`\x1b[${cursor.row};${cursor.col}H`, '\x1b[?25l', '\x1b[?2026l');
     process.stdout.write(out.join(''));
   }
 
@@ -660,15 +892,18 @@ async function miTuiCommand(initial = '') {
     setPending(true);
     transcript.push({ role: 'user', text });
     scrollOffset = 0;
-    await appendThreadMessage('main', 'user', text, { unread: false, source: 'mi-cli' });
+    const userMessage = await appendThreadMessage('main', 'user', text, { unread: false, source: 'mi-cli' });
+    seenMessageIds.add(userMessage.id);
     requestRender();
     try {
-      const response = await sendToMiMain(text);
+      const localReply = await maybeHandleLocalIntent(text);
+      const response = localReply || await sendToMiMain(text);
       getMiState().then((state) => {
         miState = state;
         requestRender();
       }).catch(() => undefined);
-      await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'mi-main' });
+      const assistantMessage = await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'mi-main' });
+      seenMessageIds.add(assistantMessage.id);
       transcript.push({ role: 'assistant', text: response });
       await sendPushover('Mi', response).catch(() => undefined);
     } catch (error) {
@@ -696,16 +931,31 @@ async function miTuiCommand(initial = '') {
     requestRender();
   }
 
+  async function pollThread() {
+    if (closed) return;
+    const messages = await readThreadMessages('main', 300).catch(() => []);
+    const fresh = messages.filter((message) => !seenMessageIds.has(message.id) && (message.role === 'user' || message.role === 'assistant'));
+    if (fresh.length === 0) return;
+    for (const message of fresh) {
+      seenMessageIds.add(message.id);
+      transcript.push({ role: message.role as 'user' | 'assistant', text: message.text });
+    }
+    scrollOffset = 0;
+    await markThreadRead('main').catch(() => undefined);
+    requestRender();
+  }
+
   function cleanup() {
     if (closed) return;
     closed = true;
     if (renderTimer) clearTimeout(renderTimer);
     if (workingTimer) clearInterval(workingTimer);
+    if (threadPollTimer) clearInterval(threadPollTimer);
     process.stdin.off('data', onData);
     process.stdout.off('resize', requestRender);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
-    process.stdout.write(`${RESET_CURSOR}\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l\x1b[?1049l`);
+    process.stdout.write(`${RESET_CURSOR}\x1b[?25h`);
   }
 
   function scrollBy(delta: number) {
@@ -740,11 +990,6 @@ async function miTuiCommand(initial = '') {
   }
 
   async function cycleThinking() {
-    if (pending) {
-      statusMessage = 'Wait for current response before switching thinking';
-      requestRender();
-      return;
-    }
     const current = miState?.thinkingLevel === 'high' || miState?.thinkingLevel === 'medium' || miState?.thinkingLevel === 'low' ? miState.thinkingLevel : 'low';
     const next = current === 'low' ? 'medium' : current === 'medium' ? 'high' : 'low';
     statusMessage = `Switching to gpt-5.5 ${next}...`;
@@ -753,21 +998,84 @@ async function miTuiCommand(initial = '') {
       const result = await setMiThinking(next);
       miState = await getMiState();
       if (result?.thinkingLevel) miState.thinkingLevel = result.thinkingLevel;
-      statusMessage = `Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
+      statusMessage = pending ? `Thinking level will apply after current response` : `Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
     } catch (error) {
       statusMessage = error instanceof Error ? error.message : String(error);
     }
     requestRender();
   }
 
+  async function runLocalSlashCommand(text: string) {
+    if (text === '/quit') {
+      cleanup();
+      return true;
+    }
+    if (text === '/reload') {
+      transcript = (await readThreadMessages('main', 300))
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map((message) => ({ role: message.role as 'user' | 'assistant', text: message.text }));
+      seenMessageIds.clear();
+      for (const message of await readThreadMessages('main', 300)) seenMessageIds.add(message.id);
+      piCycleConfig = await loadPiCycleConfig();
+      miState = await getMiState().catch(() => miState);
+      statusMessage = `Reloaded Mi state`;
+      await markThreadRead('main');
+      requestRender();
+      return true;
+    }
+    if (text === '/tasks') {
+      const result = await sendSocketRequest({ type: 'list_tasks' }, 10000).catch(async (error) => {
+        if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
+        await startMiDaemon();
+        return sendSocketRequest({ type: 'list_tasks' }, 10000);
+      });
+      const tasks = (result.tasks || []) as Array<any>;
+      transcript.push({ role: 'assistant', text: tasks.slice(0, 10).map((task) => `${task.status || 'unknown'} ${task.id || ''} ${task.name || ''}`).join('\n') || 'No Mi tasks.' });
+      return true;
+    }
+    return false;
+  }
+
+  function commonPrefix(values: string[]) {
+    if (values.length === 0) return '';
+    let prefix = values[0];
+    for (const value of values.slice(1)) {
+      while (!value.startsWith(prefix) && prefix) prefix = prefix.slice(0, -1);
+    }
+    return prefix;
+  }
+
+  function completeInput() {
+    if (!inputLine.startsWith('/')) return false;
+    const matches = slashSuggestions();
+    if (matches.length === 1) {
+      inputLine = `${matches[0].command} `;
+      requestRender();
+      return true;
+    }
+    if (matches.length > 1) {
+      const prefix = commonPrefix(matches.map((item) => item.command));
+      if (prefix.length > inputLine.length) inputLine = prefix;
+      statusMessage = matches.map((item) => item.command).join('  ');
+      requestRender();
+      return true;
+    }
+    return false;
+  }
+
   function submitInput() {
     const text = inputLine.trim();
     if (!text) return;
     inputLine = '';
-    renderInputLine();
-    void applyPiCycle(text)
-      .then(({ body }) => {
-        if (body) enqueueMessage(body);
+    requestRender();
+    void runLocalSlashCommand(text)
+      .then((handled) => {
+        if (handled) return undefined;
+        return applyPiCycle(text);
+      })
+      .then((result) => {
+        if (!result) return;
+        if (result.body) enqueueMessage(result.body);
         else requestRender();
       })
       .catch((error) => {
@@ -778,7 +1086,28 @@ async function miTuiCommand(initial = '') {
 
   function onData(buffer: Buffer) {
     const data = buffer.toString('utf8');
-    if (data === '\x03' || data === '\x1b') {
+    if (/^\x1b\[<\d+;\d+;\d+[mM]$/.test(data)) return;
+    if (data === '\x03') {
+      if (pending || messageQueue.length > 0) {
+        messageQueue.length = 0;
+        statusMessage = 'Stopping...';
+        setPending(false);
+        void abortMiMain().then(() => {
+          statusMessage = `Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
+          requestRender();
+        });
+      } else {
+        const now = Date.now();
+        if (now - lastSigintTime < 500 && !inputLine.trim()) cleanup();
+        else {
+          inputLine = '';
+          lastSigintTime = now;
+        }
+      }
+      requestRender();
+      return;
+    }
+    if (data === '\x1b') {
       if (pending || messageQueue.length > 0) {
         messageQueue.length = 0;
         statusMessage = 'Stopping...';
@@ -788,18 +1117,27 @@ async function miTuiCommand(initial = '') {
           requestRender();
         });
         requestRender();
-      } else {
-        cleanup();
       }
       return;
     }
-    if (data === '\x1b[Z' || data === '\x1b[1;2Z' || data === '\x1b\t' || data.includes('\x1b[Z') || data.includes('\x1b[1;2Z')) {
+    if (data === '\t' || data === '\x09' || data === '\x1b[9;u') {
+      if (!completeInput()) statusMessage = 'No completion';
+      requestRender();
+    } else if (data === '\x1b[Z' || data === '\x1b[1;2Z' || data === '\x1b\t' || data.includes('\x1b[Z') || data.includes('\x1b[1;2Z')) {
       void cycleThinking();
-    } else if (data === '\x1b[5~' || data === '\x1b[A' || data === '\x1bOA' || data === '\x1b[1;2A' || data.includes('\x1b[<64;')) {
-      scrollBy(Math.max(3, Math.floor(rows() / 2)));
-    } else if (data === '\x1b[6~' || data === '\x1b[B' || data === '\x1bOB' || data === '\x1b[1;2B' || data.includes('\x1b[<65;')) {
-      scrollBy(-Math.max(3, Math.floor(rows() / 2)));
+    } else if (data === '\x1b[A' || data === '\x1bOA') {
+      if (!moveSlashSelection(-1)) requestRender();
+    } else if (data === '\x1b[B' || data === '\x1bOB') {
+      if (!moveSlashSelection(1)) requestRender();
+    } else if (data === '\x1b[5~') {
+      if (!moveSlashSelection(-8)) requestRender();
+    } else if (data === '\x1b[6~') {
+      if (!moveSlashSelection(8)) requestRender();
     } else if (data.includes('\r') || data.includes('\n')) {
+      if (inputLine.startsWith('/') && slashSuggestions().length > 0 && !slashSuggestions().some((item) => `${item.command} ` === inputLine || item.command === inputLine.trim())) {
+        acceptSlashSelection();
+        return;
+      }
       const parts = data.split(/[\r\n]+/);
       const beforeEnter = parts.shift() || '';
       const textBeforeEnter = beforeEnter.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
@@ -808,25 +1146,30 @@ async function miTuiCommand(initial = '') {
       const afterEnter = parts.join('');
       const textAfterEnter = afterEnter.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
       if (textAfterEnter) inputLine += textAfterEnter;
+      slashSelectedIndex = 0;
       renderInputLine();
     } else if (data === '\x7f' || data === '\b') {
       inputLine = inputLine.slice(0, -1);
+      slashSelectedIndex = 0;
       renderInputLine();
     } else if (data === '\x15') {
       inputLine = '';
+      slashSelectedIndex = 0;
       renderInputLine();
     } else {
-      const text = data.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+      const text = data.replace(/\x1b\[<\d+;\d+;\d+[mM]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
       if (text) {
         inputLine += text;
+        slashSelectedIndex = 0;
         renderInputLine();
       }
     }
   }
 
-  process.stdout.write(`\x1b[?1049h${WHITE_CURSOR}\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1007h\x1b[?25h\x1b[2J\x1b[H`);
+  process.stdout.write(`\x1b[?25l\x1b[2J\x1b[H`);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();
+  threadPollTimer = setInterval(() => { void pollThread(); }, 2000);
   process.stdin.on('data', onData);
   process.stdout.on('resize', requestRender);
   render();
@@ -849,6 +1192,8 @@ async function launchPiMain(args: string[]) {
     'Do not use emoji.',
     'Risky actions require explicit approval.',
     'All Mi tasks, goals, objectives, todos, plans, and work queues must be stored and maintained as Markdown files under /home/kyle/mi/.',
+    'When Kyle asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring a manual cron expression. Use: mi cron add <name> --every 1h [--cwd <path>] -- <command>; mi cron list; mi cron tick; mi cron remove <name>. Ask only for missing repo/path, cadence, health command, and alert behavior.',
+    'When Kyle gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, use mi task reply <task-id-or-name> -- <follow-up prompt> to continue that same session. Otherwise create one with mi task <name> [--cwd <path>] -- <task prompt>. Name it clearly. Mi task wraps the prompt in /goal by default for sustained execution. These commands return after the worker starts; do not wait for the task to finish before replying to Kyle. Worker sessions use /home/kyle/.pi/agent/sessions so Kyle can see them in /resume. Use mi task list to inspect background task status. Escalate to Kyle when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs Kyle review/merge.',
     'Do not deploy, merge, push, publish, edit secrets, or change production settings unless explicitly approved.',
     'Use the /mi command for side-channel notes, /mi read for unread Mi messages, and /mi bring-in only when Kyle asks to bring Mi thread context into this pi conversation.',
   ].join(' ');
@@ -889,10 +1234,13 @@ async function main() {
   if (command === 'pi') return launchPiMain(args);
   if (command === 'ui') return miTuiCommand(args.join(' '));
   if (command === 'chat' || command === 'open') return chatCommand(args[0] || 'main');
+  if (command === 'read') return showThread(args[0] || 'main');
   if (command === 'ask') return askCommand(args);
   if (command === 'inbox' || command === 'threads') return inboxCommand();
   if (command === 'temp') return tempCommand(args);
   if (command === 'compact') return compactCommand(args);
+  if (command === 'cron') return cronCommand(args);
+  if (command === 'task') return taskCommand(args);
   if (command === 'make') return makeCommand(args);
   if (command === 'run') return runCommand(args);
   if (command === 'edit') return editCommand(args);

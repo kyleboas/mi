@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+import { readFile } from 'node:fs/promises';
+
+const source = await readFile(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
+
+function assertIncludes(needle, message) {
+  if (!source.includes(needle)) throw new Error(message);
+}
+
+function assertMatches(regex, message) {
+  if (!regex.test(source)) throw new Error(message);
+}
+
+assertIncludes('async function deliverTaskMessage(title, text)', 'Mi daemon must have a task delivery path.');
+assertMatches(/async function deliverTaskMessage[\s\S]*appendMainThreadMessage\(text\)[\s\S]*sendPushover\(title, text\)/, 'Task delivery must append to the main Mi thread and attempt push notification.');
+assertMatches(/unread: true[\s\S]*source: "mi-task"/, 'Task messages must be unread Mi task messages in the main thread.');
+assertMatches(/done\.then\([\s\S]*deliverTaskMessage\(`Mi task complete:/, 'Background task completion must be surfaced to Kyle, not only stored.');
+assertMatches(/done\.then\([\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task errors must be surfaced to Kyle immediately after being recorded.');
+assertMatches(/continueWorker[\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task follow-up errors must be surfaced to Kyle immediately after being recorded.');
+assertIncludes('safeNotificationText', 'Task notifications must sanitize obvious secrets before push delivery.');
+
+console.log('Mi task notification behavior checks passed.');

@@ -77,7 +77,7 @@ Conversation commands:
 npm run mi --                         # open Mi main in pi
 npm run mi -- raw                     # open the minimal fallback conversation
 npm run mi -- --once "message"        # send one message to main and exit
-npm run mi -- inbox                   # show main + temporary conversations
+npm run mi -- inbox                   # troubleshooting: show main + legacy temporary conversations
 npm run mi -- temp "React RSC review" # create/open a focused temporary conversation
 npm run mi -- chat temp-react-rsc-review # reopen an existing temporary conversation
 npm run mi -- compact main            # summarize/archive old read messages
@@ -99,7 +99,7 @@ When installed as a package, the binary is `mi`:
 mi
 mi raw
 mi --once "message"
-mi inbox
+mi inbox                              # troubleshooting: show main + legacy temporary conversations
 mi temp "React RSC review"
 mi chat temp-react-rsc-review
 mi compact main
@@ -124,6 +124,8 @@ Inside pi:
 ```
 
 `/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation.
+
+Mi's own chat UI intentionally does not expose a `/inbox` slash command: the normal Mi view is already the durable main inbox, while temporary threads are legacy/troubleshooting state. Use `/tasks` in Mi for actionable background work status, or `mi inbox`/`mi threads` from a shell when inspecting thread files.
 
 ## Run web app
 
