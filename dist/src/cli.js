@@ -292,7 +292,7 @@ async function taskCommand(args) {
     const message = sep >= 0 ? args.slice(sep + 1).join(' ').trim() : args.slice(1).join(' ').trim();
     if (!name || !message)
         throw new Error('usage: mi task <name>|list [--cwd <path>] -- <task prompt>');
-    const payload = { type: 'run_worker', name: `Mi task: ${name}`, cwd, message, background: true };
+    const payload = { type: 'run_worker', name, cwd, message, background: true };
     try {
         const result = await sendSocketRequest(payload, 30_000);
         console.log(result.text || 'Started background task.');
