@@ -524,6 +524,9 @@ function fgDim(text) {
 function fgLightDim(text) {
     return `${PI_LIGHT_DIM}${text}${RESET_FG}`;
 }
+function thinkingLabel(level) {
+    return level === 'off' ? 'no effort' : (level || 'low');
+}
 function fgThinking(level, text) {
     return `${THINKING_COLORS[level || 'low'] || THINKING_COLORS.low}${text}${RESET_FG}`;
 }
@@ -534,6 +537,28 @@ function userBgLine(text, width) {
 function workingLine() {
     const frame = PI_SPINNER_FRAMES[Math.floor(Date.now() / 80) % PI_SPINNER_FRAMES.length];
     return `${fgAccent(frame)} ${fgDim('Working...')}`;
+}
+function formatActiveDuration(ms) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    if (seconds < 60)
+        return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60)
+        return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24)
+        return `${hours}h`;
+    return `${Math.floor(hours / 24)}d`;
+}
+function taskDisplayName(task) {
+    return (task.name || task.id || 'task').replace(/^Mi task:\s*/i, '').trim() || 'task';
+}
+function activeTaskSince(task) {
+    const started = Date.parse(task.continuedAt || task.startedAt || '');
+    return Number.isFinite(started) ? started : Date.now();
+}
+function isActiveTask(task) {
+    return ['running', 'waiting', 'active'].includes(String(task.status || '').toLowerCase());
 }
 function sendSocketRequest(payload, timeoutMs = 120000) {
     return new Promise((resolve, reject) => {
@@ -691,6 +716,8 @@ async function miTuiCommand(initial = '') {
     let renderTimer;
     let workingTimer;
     let threadPollTimer;
+    let taskPollTimer;
+    let activeTasks = [];
     let lastSigintTime = 0;
     let slashSelectedIndex = 0;
     const rows = () => process.stdout.rows || 24;
@@ -704,6 +731,16 @@ async function miTuiCommand(initial = '') {
         statusMessage = error instanceof Error ? error.message : String(error);
         requestRender();
     });
+    function refreshActiveTasks() {
+        sendSocketRequest({ type: 'list_tasks' }, 5000)
+            .then((result) => {
+            activeTasks = (result.tasks || []).filter(isActiveTask);
+            requestRender();
+        })
+            .catch(() => undefined);
+    }
+    refreshActiveTasks();
+    taskPollTimer = setInterval(refreshActiveTasks, 1000);
     function requestRender() {
         if (renderTimer)
             return;
@@ -819,13 +856,18 @@ async function miTuiCommand(initial = '') {
     function statusLine(width) {
         const model = miState?.model;
         const modelName = model ? `${model.provider}/${model.id}` : MI_MODEL;
-        const thinking = miState?.thinkingLevel ? ` ${miState.thinkingLevel}` : '';
+        const thinking = miState?.thinkingLevel ? ` ${thinkingLabel(miState.thinkingLevel)}` : '';
         const left = messageQueue.length > 0 ? `q${messageQueue.length}` : '';
         const right = `${modelName}${thinking}`;
         const available = Math.max(1, width - widthOf(left) - widthOf(right));
         if (left && available > 1)
             return fgDim(`${left}${' '.repeat(available)}${right}`);
         return fgDim(right.padStart(Math.max(widthOf(right), width)));
+    }
+    function activeTaskLines(width) {
+        return activeTasks
+            .slice(0, 5)
+            .map((task) => fgDim(truncateText(`${taskDisplayName(task)} (active ${formatActiveDuration(Date.now() - activeTaskSince(task))})`, width)));
     }
     function renderInputLine() {
         if (closed)
@@ -843,7 +885,8 @@ async function miTuiCommand(initial = '') {
         const inputLines = inputDisplayLines(width);
         const inputRows = inputLines.length;
         const suggestionLines = slashSuggestionLines(width);
-        const bodyViewport = Math.max(1, height - 4 - inputRows - suggestionLines.length);
+        const taskLines = activeTaskLines(width);
+        const bodyViewport = Math.max(1, height - 4 - inputRows - suggestionLines.length - taskLines.length);
         const body = [];
         for (const item of transcript) {
             if (item.role === 'user') {
@@ -877,6 +920,7 @@ async function miTuiCommand(initial = '') {
             ...suggestionLines,
             fgThinking(miState?.thinkingLevel, '─'.repeat(width)),
             statusLine(width),
+            ...taskLines,
             '',
         ].slice(0, height);
         while (lines.length < height)
@@ -961,6 +1005,8 @@ async function miTuiCommand(initial = '') {
             clearInterval(workingTimer);
         if (threadPollTimer)
             clearInterval(threadPollTimer);
+        if (taskPollTimer)
+            clearInterval(taskPollTimer);
         process.stdin.off('data', onData);
         process.stdout.off('resize', requestRender);
         if (process.stdin.isTTY)
@@ -990,7 +1036,7 @@ async function miTuiCommand(initial = '') {
         const modelSpec = models[index];
         piCycleNextIndex[tier] = (index + 1) % models.length;
         const level = piCycleThinkingLevel(tier, modelSpec);
-        statusMessage = `Tier ${tier}: ${modelSpec}${level ? ` ${level}` : ''}`;
+        statusMessage = `Tier ${tier}: ${modelSpec}${level ? ` ${thinkingLabel(level)}` : ''}`;
         requestRender();
         await setMiModelThinking(modelSpec, level);
         miState = await getMiState();
@@ -999,9 +1045,9 @@ async function miTuiCommand(initial = '') {
         return { handled: true, body: (match[2] || '').trim() };
     }
     async function cycleThinking() {
-        const current = miState?.thinkingLevel === 'high' || miState?.thinkingLevel === 'medium' || miState?.thinkingLevel === 'low' ? miState.thinkingLevel : 'low';
-        const next = current === 'low' ? 'medium' : current === 'medium' ? 'high' : 'low';
-        statusMessage = `Switching to gpt-5.5 ${next}...`;
+        const current = miState?.thinkingLevel === 'high' || miState?.thinkingLevel === 'medium' || miState?.thinkingLevel === 'low' || miState?.thinkingLevel === 'off' ? miState.thinkingLevel : 'off';
+        const next = current === 'off' ? 'low' : current === 'low' ? 'medium' : current === 'medium' ? 'high' : 'off';
+        statusMessage = `Switching to gpt-5.5 ${thinkingLabel(next)}...`;
         requestRender();
         try {
             const result = await setMiThinking(next);
