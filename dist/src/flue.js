@@ -22,7 +22,7 @@ function fallbackReply(message, error) {
 }
 async function runPiChat(message, error) {
     const cmd = process.env.PI_CMD || 'pi';
-    const prompt = `Normal chat only. Do not use tools. Do not inspect local files. Do not modify anything. Do not expose secrets. Keep the reply concise.\n\nUser: ${message}`;
+    const prompt = `Conversational Mi reply. Do not use tools, inspect local files, modify anything, or expose secrets. Keep momentum; ask only when needed.\n\n${message}`;
     return await new Promise((resolve) => {
         const model = process.env.PI_CHAT_MODEL || process.env.PI_MODEL;
         const args = model ? ['--mode', 'json', '--model', model, '--tools', '', prompt] : ['--mode', 'json', '--tools', '', prompt];
@@ -130,7 +130,7 @@ export async function runFlueChat(message) {
     const id = process.env.FLUE_CHAT_SESSION || 'kyle-chat';
     const payload = JSON.stringify({
         message,
-        role: 'normal conversational chat only; no host filesystem writes; no secrets in replies',
+        role: 'conversational Mi chat; keep momentum; no host filesystem writes; no secrets in replies',
     });
     const persistent = await runPersistentFlueChat(message, payload, timeoutMs, id);
     if (persistent?.ok) {

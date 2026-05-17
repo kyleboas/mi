@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Input, Key, matchesKey, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@mariozechner/pi-tui";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import net from "node:net";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -10,9 +10,6 @@ const MI_ROOT = process.env.MI_ROOT || "/home/kyle/assistant";
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const INDEX_PATH = join(THREADS_DIR, "index.json");
 const MAIN_THREAD_ID = "main";
-const MI_MAX_RESPONSE_CHARS = 255;
-const MI_PROMPT_PREFIX = `Answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not exceed the limit. Be concise.\n\n`;
-const MI_REWRITE_PREFIX = `Rewrite this answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer.`;
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || "/home/kyle/.pi/agent/mi";
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, "main.sock");
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || "/home/kyle/.pi/agent/extensions/mi-daemon.mjs";
@@ -237,7 +234,7 @@ function normalizeMiResponse(text: string) {
 }
 
 function miPrompt(message: string) {
-	return `${MI_PROMPT_PREFIX}${message}`;
+	return message;
 }
 
 async function requestMi(message: string) {
@@ -247,18 +244,27 @@ async function requestMi(message: string) {
 
 async function sendToMiMain(message: string): Promise<string> {
 	try {
-		let text = await requestMi(miPrompt(message));
-		if (text.length <= MI_MAX_RESPONSE_CHARS) return text;
-		text = await requestMi(`Rewrite this answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not truncate; produce a complete concise answer.\n\n${text}`);
-		return normalizeMiResponse(text);
+		return await requestMi(miPrompt(message));
 	} catch (error) {
 		if (existsSync(MI_SOCKET_PATH)) throw error;
 	}
 	await startMiDaemon();
-	let text = await requestMi(miPrompt(message));
-	if (text.length <= MI_MAX_RESPONSE_CHARS) return text;
-	text = await requestMi(`Rewrite this answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not truncate; produce a complete concise answer.\n\n${text}`);
-	return normalizeMiResponse(text);
+	return await requestMi(miPrompt(message));
+}
+
+async function createUploadLinkViaMiCli() {
+	return await new Promise<string>((resolve, reject) => {
+		execFile("mi", ["upload"], { cwd: MI_ROOT, env: process.env, timeout: 10000 }, (error, stdout, stderr) => {
+			if (error) reject(new Error(stderr.trim() || error.message));
+			else resolve(stdout.trim());
+		});
+	});
+}
+
+async function handleUpload(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
+	const text = await createUploadLinkViaMiCli();
+	pi.sendUserMessage(`Temporary image upload link for this conversation:\n\n${text}\n\nUpload an image, then paste the returned image URL/reference here.`);
+	await notify(ctx, "Created image upload link and inserted it into the conversation.", "success");
 }
 
 async function handleBringIn(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
@@ -275,31 +281,38 @@ async function handleBringIn(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
 class MiThreadPanel implements Component, Focusable {
 	private input = new Input();
 	private transcript: Array<{ role: "user" | "assistant"; text: string }> = [];
+	private seenMessageIds = new Set<string>();
 	private pending = false;
 	private scrollOffset = 0;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 	private requestRender?: () => void;
 	private workingTimer?: NodeJS.Timeout;
-	focused = false;
+	private threadPollTimer?: NodeJS.Timeout;
+	private messageQueue: string[] = [];
+	private statusMessage = "Esc/Ctrl+C stop or close • PageUp/PageDown scroll";
+	private closed = false;
+	private _focused = false;
 
-	constructor(initial: string, private done: () => void, private theme: { fg: (style: any, text: string) => string }) {
+	get focused() {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+		this.input.focused = value;
+	}
+
+	constructor(initial: string, private done: () => void, private theme: { fg: (style: any, text: string) => string; bg?: (style: any, text: string) => string }) {
 		this.input.onSubmit = (value) => {
 			const text = value.trim();
-			if (!text || this.pending) return;
+			if (!text) return;
 			this.input.setValue("");
-			this.ask(text).catch((error) => {
-				this.setPending(false);
-				this.transcript.push({ role: "assistant", text: error instanceof Error ? error.message : String(error) });
-				this.invalidate();
-				this.requestRender?.();
-			});
+			this.enqueue(text);
 		};
-		this.input.onEscape = () => {
-			this.setPending(false);
-			this.done();
-		};
+		this.input.onEscape = () => this.close();
 		void this.load(initial);
+		this.threadPollTimer = setInterval(() => void this.pollThread(), 2000);
 	}
 
 	setRequestRender(requestRender: () => void) {
@@ -307,12 +320,38 @@ class MiThreadPanel implements Component, Focusable {
 	}
 
 	private async load(initial: string) {
-		this.transcript = (await readMessages(MAIN_THREAD_ID, 20))
+		const messages = await readMessages(MAIN_THREAD_ID, 300);
+		this.seenMessageIds = new Set(messages.map((message) => message.id));
+		this.transcript = messages
 			.filter((message) => message.role === "user" || message.role === "assistant")
 			.map((message) => ({ role: message.role as "user" | "assistant", text: message.text }));
+		await markRead(MAIN_THREAD_ID).catch(() => undefined);
 		this.invalidate();
 		this.requestRender?.();
 		if (initial.trim()) await this.ask(initial.trim());
+	}
+
+	private close() {
+		this.closed = true;
+		this.messageQueue.length = 0;
+		this.setPending(false);
+		if (this.threadPollTimer) clearInterval(this.threadPollTimer);
+		this.done();
+	}
+
+	private async pollThread() {
+		if (this.closed) return;
+		const messages = await readMessages(MAIN_THREAD_ID, 300).catch(() => []);
+		const fresh = messages.filter((message) => !this.seenMessageIds.has(message.id) && (message.role === "user" || message.role === "assistant"));
+		if (fresh.length === 0) return;
+		for (const message of fresh) {
+			this.seenMessageIds.add(message.id);
+			this.transcript.push({ role: message.role as "user" | "assistant", text: message.text });
+		}
+		this.scrollOffset = 0;
+		await markRead(MAIN_THREAD_ID).catch(() => undefined);
+		this.invalidate();
+		this.requestRender?.();
 	}
 
 	private setPending(next: boolean) {
@@ -334,16 +373,41 @@ class MiThreadPanel implements Component, Focusable {
 		return `${this.theme.fg("accent", frame)} ${this.theme.fg("dim", "Working...")}`;
 	}
 
+	private enqueue(text: string) {
+		this.messageQueue.push(text);
+		void this.processQueue();
+		this.invalidate();
+		this.requestRender?.();
+	}
+
+	private async processQueue() {
+		if (this.pending) return;
+		while (this.messageQueue.length > 0 && !this.closed) {
+			const next = this.messageQueue.shift();
+			if (!next) continue;
+			await this.ask(next);
+		}
+		this.setPending(false);
+		this.invalidate();
+		this.requestRender?.();
+	}
+
 	private async ask(text: string) {
 		this.setPending(true);
 		this.transcript.push({ role: "user", text });
 		this.scrollOffset = 0;
-		await appendMessage(MAIN_THREAD_ID, "user", text, { unread: false, source: "pi-extension" });
+		const userMessage = await appendMessage(MAIN_THREAD_ID, "user", text, { unread: false, source: "pi-extension" });
+		this.seenMessageIds.add(userMessage.id);
 		this.invalidate();
 		this.requestRender?.();
-		const response = await sendToMiMain(text);
-		await appendMessage(MAIN_THREAD_ID, "assistant", response, { unread: false, source: "mi-main" });
-		this.transcript.push({ role: "assistant", text: response });
+		try {
+			const response = await sendToMiMain(text);
+			const assistantMessage = await appendMessage(MAIN_THREAD_ID, "assistant", response, { unread: false, source: "mi-main" });
+			this.seenMessageIds.add(assistantMessage.id);
+			this.transcript.push({ role: "assistant", text: response });
+		} catch (error) {
+			this.transcript.push({ role: "assistant", text: error instanceof Error ? error.message : String(error) });
+		}
 		this.scrollOffset = 0;
 		this.setPending(false);
 		this.invalidate();
@@ -351,45 +415,58 @@ class MiThreadPanel implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape)) {
-			this.setPending(false);
-			this.done();
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+			this.close();
 			return;
 		}
-		if (matchesKey(data, Key.pageUp)) {
-			this.scrollOffset += 10;
-		} else if (matchesKey(data, Key.pageDown)) {
-			this.scrollOffset = Math.max(0, this.scrollOffset - 10);
-		} else if (!this.pending) {
-			this.input.handleInput(data);
-		}
+		if (matchesKey(data, Key.pageUp)) this.scrollOffset += 10;
+		else if (matchesKey(data, Key.pageDown)) this.scrollOffset = Math.max(0, this.scrollOffset - 10);
+		else this.input.handleInput(data);
 		this.invalidate();
 		this.requestRender?.();
+	}
+
+	private userLine(text: string, width: number) {
+		const padded = truncateToWidth(`  ${text}`, width).padEnd(width, " ");
+		return this.theme.bg ? this.theme.bg("userMessageBg", padded) : this.theme.fg("muted", padded);
+	}
+
+	private statusLine(width: number) {
+		const left = this.messageQueue.length > 0 ? `q${this.messageQueue.length}` : "";
+		const right = this.statusMessage;
+		const gap = Math.max(1, width - left.length - right.length);
+		return this.theme.fg("dim", truncateToWidth(left ? `${left}${" ".repeat(gap)}${right}` : right.padStart(Math.min(width, right.length)), width));
 	}
 
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 		const innerWidth = Math.max(20, width - 4);
-		const lines = [truncateToWidth("Mi", width), truncateToWidth("─".repeat(width), width)];
 		const body: string[] = [];
 		for (const item of this.transcript) {
-			const text = item.text;
-			const styled = item.role === "user" ? this.theme.fg("muted", text) : text;
-			body.push(...wrapTextWithAnsi(styled, innerWidth));
-			body.push("");
+			if (item.role === "user") {
+				body.push(this.userLine("", width));
+				for (const line of wrapTextWithAnsi(item.text, innerWidth)) body.push(this.userLine(line, width));
+				body.push(this.userLine("", width), "");
+			} else {
+				body.push(...wrapTextWithAnsi(item.text, innerWidth));
+				body.push("");
+			}
 		}
-		if (this.pending) body.push(this.workingLine());
-		const viewport = 18;
+		if (this.pending) body.push(this.workingLine(), "");
+		const inputLines = this.input.render(Math.max(10, width));
+		const viewport = Math.max(1, 18 - Math.max(0, inputLines.length - 1));
 		const maxOffset = Math.max(0, body.length - viewport);
 		const offset = Math.min(this.scrollOffset, maxOffset);
 		const end = body.length - offset;
 		const start = Math.max(0, end - viewport);
-		if (offset > 0) lines.push(truncateToWidth(`↑ ${offset} line${offset === 1 ? "" : "s"} below`, width));
-		lines.push(...body.slice(start, end).map((line) => truncateToWidth(line, width)));
-		if (start > 0) lines.push(truncateToWidth("↑ PageUp for older Mi thread history", width));
-		lines.push(truncateToWidth("─".repeat(width), width));
-		const inputLine = this.pending ? "…" : this.input.render(Math.max(10, width - 3))[0] || "";
-		lines.push(truncateToWidth(inputLine, width));
+		const lines = body.slice(start, end).map((line) => truncateToWidth(line, width));
+		while (lines.length < viewport) lines.unshift("");
+		if (offset > 0) lines[0] = this.theme.fg("dim", truncateToWidth(`↑ ${offset} newer line${offset === 1 ? "" : "s"}`, width));
+		if (start > 0) lines[0] = this.theme.fg("dim", truncateToWidth("↑ PageUp for older Mi thread history", width));
+		lines.push(this.theme.fg("accent", truncateToWidth("─".repeat(width), width)));
+		lines.push(...inputLines.map((line) => truncateToWidth(line, width)));
+		lines.push(this.theme.fg("accent", truncateToWidth("─".repeat(width), width)));
+		lines.push(this.statusLine(width));
 		this.cachedWidth = width;
 		this.cachedLines = lines;
 		return lines;
@@ -412,8 +489,6 @@ async function showMiThread(initial: string, ctx: ExtensionCommandContext) {
 
 export default function miExtension(pi: ExtensionAPI) {
 	if (process.env.MI_MAIN === "1") {
-		let skipNextInternalAssistant = false;
-
 		pi.on("session_start", async (_event, ctx) => {
 			pi.setSessionName("Mi: main");
 			ctx.ui.setStatus("mi", "Mi main");
@@ -425,21 +500,8 @@ export default function miExtension(pi: ExtensionAPI) {
 				"\n\nMi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under `/home/kyle/mi/` (for example `/home/kyle/mi/TODO.md`, `/home/kyle/mi/goals.md`, or task-specific `.md` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send `prompt` commands, queue `steer`/`follow_up`, inspect `get_state`/`get_messages`, `abort` if needed, and `new_session` for fresh threads. Keep worker conversations visible in normal `/resume` by using the default pi session store: run `pi --mode rpc` from the relevant project cwd, or explicitly `pi --mode rpc --session-dir /home/kyle/.pi/agent/sessions`. Do not create worker sessions under nested custom session dirs like `/home/kyle/.pi/agent/sessions/mi-workers/...` unless the user asks for hidden/isolated sessions. Set helpful session names with `set_session_name` so they are easy to find in `/resume`. If useful, write small Node/shell supervisor scripts under /home/kyle/.pi/agent/mi/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available. When Kyle asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring manual cron syntax. Mi crons live in `/home/kyle/mi/state/crons.json` and are managed with `mi cron add <name> --every 1h [--cwd <path>] -- <command>`, `mi cron list`, `mi cron tick`, and `mi cron remove <name>`. Ask only for missing repo/path, cadence, health command, and alert behavior. When Kyle gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with `mi task <name> [--cwd <path>] -- <task prompt>`. Name it clearly. Mi task wraps the prompt in /goal by default for sustained execution. This command returns after the worker starts; do not wait for the task to finish before replying to Kyle. Worker sessions use `/home/kyle/.pi/agent/sessions` so Kyle can see them in `/resume`. Use `mi task list` to inspect background task status. When Kyle responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: `mi task reply <task-id-or-name> -- <follow-up prompt>`. Follow-ups are also wrapped in /goal by default unless already using /goal. Escalate to Kyle when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs Kyle review/merge.",
 		}));
 
-		pi.on("message_end", async (event) => {
-			const role = messageRole(event.message);
-			if (role !== "user" && role !== "assistant") return;
-			const text = messageText(event.message);
-			if (!text) return;
-			if (role === "user" && (text.startsWith(`Answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer.`) || text.startsWith(MI_REWRITE_PREFIX))) {
-				skipNextInternalAssistant = true;
-				return;
-			}
-			if (role === "assistant" && skipNextInternalAssistant) {
-				skipNextInternalAssistant = false;
-				return;
-			}
-			await appendMessage(MAIN_THREAD_ID, role, text, { unread: false, source: "pi-main" });
-		});
+		// Socket/UI clients own thread persistence. Do not mirror raw Mi-main
+		// internal prompts into the user-visible Mi thread.
 	}
 
 	async function handleMiArgs(args: string, ctx: ExtensionCommandContext) {
@@ -461,6 +523,10 @@ export default function miExtension(pi: ExtensionAPI) {
 				await handleBringIn(pi, ctx);
 				return;
 			}
+			if (trimmed === "upload") {
+				await handleUpload(pi, ctx);
+				return;
+			}
 
 			await showMiThread(trimmed, ctx);
 		} catch (error) {
@@ -477,10 +543,17 @@ export default function miExtension(pi: ExtensionAPI) {
 		return { action: "handled" };
 	});
 
+	pi.registerCommand("upload", {
+		description: "Create a temporary one-time image upload link and insert it into this conversation.",
+		async handler(_args: string, ctx: ExtensionCommandContext) {
+			await handleUpload(pi, ctx);
+		},
+	});
+
 	pi.registerCommand("mi", {
-		description: "Ask Mi a quick side question without adding it to the main assistant context; /mi read; /mi bring-in.",
+		description: "Ask Mi a quick side question without adding it to the main assistant context; /mi read; /mi bring-in; /mi upload.",
 		getArgumentCompletions(prefix) {
-			return ["read", "inbox", "bring-in"].filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
+			return ["read", "inbox", "bring-in", "upload"].filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
 		},
 		async handler(args: string, ctx: ExtensionCommandContext) {
 			await handleMiArgs(args, ctx);

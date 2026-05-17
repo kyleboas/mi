@@ -15,6 +15,7 @@ import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
 import { readRecentEvents, logEvent } from './state.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
+import { createUploadLink } from './uploads.js';
 import {
   appendThreadMessage,
   compactThread,
@@ -40,6 +41,7 @@ Usage:
   mi threads                      List Mi conversations
   mi temp <title>                 Create/open a temporary conversation
   mi compact [thread]             Compact old read messages in a thread
+  mi upload                       Create a temporary one-time image upload link
   mi cron list|tick|remove <name>
   mi cron add <name> --every 1h [--cwd <path>] -- <command>
   mi task <name> [--cwd <path>] -- <task prompt>
@@ -79,6 +81,13 @@ async function makeCommand(args: string[]) {
   await writeAssistantFile(draft.path, draft.markdown);
   await logEvent('mi.make', { name: draft.name, path: draft.path });
   console.log(`Created ${draft.path}`);
+}
+
+async function uploadCommand() {
+  const link = await createUploadLink();
+  console.log(`Upload image: ${link.url}`);
+  console.log(`Expires: ${link.expiresAt}`);
+  console.log(`Max bytes: ${link.maxBytes}`);
 }
 
 async function runCommand(args: string[]) {
@@ -242,7 +251,7 @@ async function tempCommand(args: string[]) {
     return;
   }
   const thread = await createTempThread(title);
-  await chatCommand(thread.id);
+  await miTuiCommand(thread.id);
 }
 
 async function compactCommand(args: string[]) {
@@ -374,9 +383,7 @@ const HOME = homedir();
 const PUSHOVER_ENDPOINT = 'https://api.pushover.net/1/messages.json';
 const PUSHOVER_ENV_FILE = join(HOME, '.config', 'pushover', 'env');
 const PUSHOVER_MESSAGE_LIMIT = 1024;
-const MI_MAX_RESPONSE_CHARS = 255;
 const MI_TASKS_DIR = join(HOME, 'mi');
-const MI_PROMPT_PREFIX = `Answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not exceed the limit. Be concise.\n\n`;
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 'mi');
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
@@ -630,7 +637,7 @@ function normalizeMiResponse(text: string) {
 }
 
 function miPrompt(message: string) {
-  return `${MI_PROMPT_PREFIX}${message}`;
+  return message;
 }
 
 async function requestMi(message: string) {
@@ -690,28 +697,22 @@ async function loadPiCycleConfig(): Promise<PiCycleConfig> {
 
 async function sendToMiMain(message: string): Promise<string> {
   try {
-    let text = await requestMi(miPrompt(message));
-    if (text.length <= MI_MAX_RESPONSE_CHARS) return text;
-    text = await requestMi(`Rewrite this answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not truncate; produce a complete concise answer.\n\n${text}`);
-    return normalizeMiResponse(text);
+    return await requestMi(miPrompt(message));
   } catch (error) {
     if (existsSync(MI_SOCKET_PATH) && !isSocketConnectionRefused(error)) throw error;
   }
   await startMiDaemon();
-  let text = await requestMi(miPrompt(message));
-  if (text.length <= MI_MAX_RESPONSE_CHARS) return text;
-  text = await requestMi(`Rewrite this answer in ${MI_MAX_RESPONSE_CHARS} characters or fewer. Do not truncate; produce a complete concise answer.\n\n${text}`);
-  return normalizeMiResponse(text);
+  return await requestMi(miPrompt(message));
 }
 
-async function miTuiCommand(initial = '') {
+async function miTuiCommand(threadId = 'main', initial = '') {
   await mkdir(MI_TASKS_DIR, { recursive: true });
-  const initialMessages = await readThreadMessages('main', 300);
+  const initialMessages = await readThreadMessages(threadId, 300);
   const seenMessageIds = new Set(initialMessages.map((message) => message.id));
   let transcript = initialMessages
     .filter((message) => message.role === 'user' || message.role === 'assistant')
     .map((message) => ({ role: message.role as 'user' | 'assistant', text: message.text }));
-  await markThreadRead('main');
+  await markThreadRead(threadId);
 
   let miState: any;
   let piCycleConfig = await loadPiCycleConfig();
@@ -793,7 +794,11 @@ async function miTuiCommand(initial = '') {
   function slashSuggestions() {
     const slashCommands = [
       { command: '/quit', description: 'Quit Mi' },
+      { command: '/stop', description: 'Abort the current Mi turn' },
       { command: '/reload', description: 'Reload Mi' },
+      { command: '/status', description: 'Show model/session status' },
+      { command: '/compact', description: 'Compact old read thread history' },
+      { command: '/upload', description: 'Create a temporary image upload link' },
       { command: '/tasks', description: 'Show background tasks' },
     ];
     if (!inputLine.startsWith('/')) return [];
@@ -953,18 +958,24 @@ async function miTuiCommand(initial = '') {
     setPending(true);
     transcript.push({ role: 'user', text });
     scrollOffset = 0;
-    const userMessage = await appendThreadMessage('main', 'user', text, { unread: false, source: 'mi-cli' });
-    seenMessageIds.add(userMessage.id);
     requestRender();
     try {
-      const localReply = await maybeHandleLocalIntent(text);
-      const response = localReply || await sendToMiMain(text);
-      getMiState().then((state) => {
-        miState = state;
-        requestRender();
-      }).catch(() => undefined);
-      const assistantMessage = await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'mi-main' });
-      seenMessageIds.add(assistantMessage.id);
+      let response: string;
+      if (threadId === 'main') {
+        const userMessage = await appendThreadMessage(threadId, 'user', text, { unread: false, source: 'mi-cli' });
+        seenMessageIds.add(userMessage.id);
+        const localReply = await maybeHandleLocalIntent(text);
+        response = localReply || await sendToMiMain(text);
+        getMiState().then((state) => {
+          miState = state;
+          requestRender();
+        }).catch(() => undefined);
+        const assistantMessage = await appendThreadMessage(threadId, 'assistant', response, { unread: false, source: 'mi-main' });
+        seenMessageIds.add(assistantMessage.id);
+      } else {
+        response = await askMi(threadId, text);
+        for (const message of await readThreadMessages(threadId, 300)) seenMessageIds.add(message.id);
+      }
       transcript.push({ role: 'assistant', text: response });
       await sendPushover('Mi', response).catch(() => undefined);
     } catch (error) {
@@ -994,7 +1005,7 @@ async function miTuiCommand(initial = '') {
 
   async function pollThread() {
     if (closed) return;
-    const messages = await readThreadMessages('main', 300).catch(() => []);
+    const messages = await readThreadMessages(threadId, 300).catch(() => []);
     const fresh = messages.filter((message) => !seenMessageIds.has(message.id) && (message.role === 'user' || message.role === 'assistant'));
     if (fresh.length === 0) return;
     for (const message of fresh) {
@@ -1002,7 +1013,7 @@ async function miTuiCommand(initial = '') {
       transcript.push({ role: message.role as 'user' | 'assistant', text: message.text });
     }
     scrollOffset = 0;
-    await markThreadRead('main').catch(() => undefined);
+    await markThreadRead(threadId).catch(() => undefined);
     requestRender();
   }
 
@@ -1072,16 +1083,44 @@ async function miTuiCommand(initial = '') {
       cleanup();
       return true;
     }
+    if (text === '/stop') {
+      messageQueue.length = 0;
+      setPending(false);
+      await abortMiMain();
+      statusMessage = 'Stopped Mi.';
+      requestRender();
+      return true;
+    }
     if (text === '/reload') {
-      transcript = (await readThreadMessages('main', 300))
+      transcript = (await readThreadMessages(threadId, 300))
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .map((message) => ({ role: message.role as 'user' | 'assistant', text: message.text }));
       seenMessageIds.clear();
-      for (const message of await readThreadMessages('main', 300)) seenMessageIds.add(message.id);
+      for (const message of await readThreadMessages(threadId, 300)) seenMessageIds.add(message.id);
       piCycleConfig = await loadPiCycleConfig();
       miState = await getMiState().catch(() => miState);
       statusMessage = `Reloaded Mi state`;
-      await markThreadRead('main');
+      await markThreadRead(threadId);
+      requestRender();
+      return true;
+    }
+    if (text === '/status') {
+      miState = await getMiState().catch(() => miState);
+      const model = miState?.model ? `${miState.model.provider}/${miState.model.id}` : MI_MODEL;
+      const stats = miState?.stats ? `\nTokens: in ${formatTokens(miState.stats.inputTokens)} / out ${formatTokens(miState.stats.outputTokens)} / cache ${formatTokens(miState.stats.cacheReadTokens)}` : '';
+      transcript.push({ role: 'assistant', text: `Model: ${model}\nThinking: ${thinkingLabel(miState?.thinkingLevel)}\nSession: ${miState?.sessionName || miState?.sessionId || 'unknown'}${stats}` });
+      requestRender();
+      return true;
+    }
+    if (text === '/compact') {
+      const result = await compactThread(threadId);
+      transcript.push({ role: 'assistant', text: `Compacted ${result.compacted} message(s), kept ${result.kept}.` });
+      requestRender();
+      return true;
+    }
+    if (text === '/upload') {
+      const link = await createUploadLink();
+      transcript.push({ role: 'assistant', text: `Temporary image upload link (expires ${link.expiresAt}, max ${link.maxBytes} bytes):\n${link.url}\nAfter upload, paste the returned image URL/reference into Mi or Pi.` });
       requestRender();
       return true;
     }
@@ -1286,7 +1325,7 @@ async function launchPiMain(args: string[]) {
 
 async function main() {
   const [command, ...args] = process.argv.slice(2);
-  if (!command) return miTuiCommand('');
+  if (!command) return miTuiCommand('main', '');
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(usage());
     return;
@@ -1294,9 +1333,10 @@ async function main() {
   if (command === '--once') return onceCommand(args);
   if (command === 'raw') return chatCommand(args[0] || 'main');
   if (command === 'pi') return launchPiMain(args);
-  if (command === 'ui') return miTuiCommand(args.join(' '));
-  if (command === 'chat' || command === 'open') return chatCommand(args[0] || 'main');
+  if (command === 'ui') return miTuiCommand('main', args.join(' '));
+  if (command === 'chat' || command === 'open') return miTuiCommand(args[0] || 'main');
   if (command === 'read') return showThread(args[0] || 'main');
+  if (command === 'upload') return uploadCommand();
   if (command === 'ask') return askCommand(args);
   if (command === 'inbox' || command === 'threads') return inboxCommand();
   if (command === 'temp') return tempCommand(args);
