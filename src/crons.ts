@@ -97,7 +97,8 @@ async function surfaceCronError(cron: MiCron, output: string) {
 export async function runCron(cron: MiCron) {
   const startedAt = now();
   if (cron.message && !cron.command) {
-    const sent = await notify('Mi reminder', cron.message);
+    await appendThreadMessage('main', 'assistant', cron.message, { unread: true, source: 'mi-reminder' });
+    const sent = await notify('Mi reminder', cron.message).catch(() => ({ skipped: true }));
     const result = { status: 'ok' as const, output: `Reminder: ${cron.message}${sent?.skipped ? ' (notification skipped)' : ''}` };
     await appendFile(LOG_PATH, `${JSON.stringify({ name: cron.name, startedAt, finishedAt: now(), ...result })}\n`);
     return result;
