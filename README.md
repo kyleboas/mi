@@ -81,6 +81,7 @@ npm run mi -- inbox                   # show main + temporary conversations
 npm run mi -- temp "React RSC review" # create/open a focused temporary conversation
 npm run mi -- chat temp-react-rsc-review # reopen an existing temporary conversation
 npm run mi -- compact main            # summarize/archive old read messages
+npm run mi -- upload                  # create a temporary one-time image upload link
 ```
 
 Assistant file commands:
@@ -103,6 +104,7 @@ mi inbox
 mi temp "React RSC review"
 mi chat temp-react-rsc-review
 mi compact main
+mi upload                             # create a temporary one-time image upload link
 mi make "Create an inbox assistant" --name inbox
 mi run inbox
 mi edit inbox "Also ignore newsletters"
@@ -121,9 +123,13 @@ Inside pi:
 /mi read        # show unread or recent Mi messages
 /mi inbox       # show Mi threads
 /mi bring-in    # explicitly inject recent Mi context into the current pi conversation
+/upload        # create a temporary image upload link and insert it into this conversation
+/mi upload     # same upload helper through the Mi extension
 ```
 
 `/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation.
+
+Image uploads are served by the Mi web app. `mi upload`, Mi `/upload`, and pi `/upload` create a 15-minute one-time link under `/u/<token>`. The browser uploader accepts JPEG/PNG/GIF/WebP only, enforces a 10 MiB default size cap, writes sanitized filenames under `state/uploads/files`, returns a `/uploads/<file>` URL, and hourly cleanup prunes expired tokens plus files older than 7 days. Set `MI_PUBLIC_BASE_URL`, `MI_UPLOAD_MAX_BYTES`, `MI_UPLOAD_TTL_MS`, `MI_UPLOAD_RETENTION_MS`, or `MI_UPLOAD_DIR` to match deployment.
 
 ## Run web app
 

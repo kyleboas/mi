@@ -4,7 +4,8 @@
   "description": "Tiny private assistant harness: Markdown assistants plus triggers, tools, permissions, and workers.",
   "main": "dist/src/server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node scripts/test-mi-extension-ui.mjs && node scripts/test-mi-agent-view.mjs && npm run test:upload",
+    "test:upload": "tsx scripts/test-upload.ts",
     "dev": "tsx src/server.ts",
     "start": "node dist/src/server.js",
     "build": "tsc",

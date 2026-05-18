@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import cookieParser from 'cookie-parser';
 import express from 'express';
+import { basename } from 'node:path';
 import { authConfigured, clearSession, createSession, currentCsrf, requireAuth, validLoginPassword } from './auth.js';
 import { runFlueChat } from './flue.js';
 import { classify } from './policy.js';
@@ -8,6 +9,7 @@ import { runPiReadOnly, runPiReadOnlyStream } from './pi.js';
 import { notify } from './notify.js';
 import { createApproval, isKilled, isPaused, logEvent, readApprovals, readRecentEvents, writeApprovals } from './state.js';
 import { requireTailnet, tailnetStatus } from './tailnet.js';
+import { cleanupUploads, consumeUpload, createUploadLink, UPLOAD_DIR, UPLOAD_MAX_BYTES } from './uploads.js';
 
 const app = express();
 app.use(cookieParser());
@@ -17,9 +19,33 @@ app.use((_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
 });
+app.use('/uploads', express.static(UPLOAD_DIR, { immutable: true, maxAge: '7d', index: false }));
 app.use(express.static(new URL('./public', import.meta.url).pathname));
 
 app.get('/health', (req, res) => res.json({ ok: true, authConfigured: authConfigured(), tailnet: tailnetStatus(req) }));
+
+app.post('/api/upload-link', requireAuth, async (req, res) => {
+  const base = `${req.protocol}://${req.get('host')}`;
+  const link = await createUploadLink(process.env.MI_PUBLIC_BASE_URL || base);
+  await logEvent('upload.link.created', { expiresAt: link.expiresAt, maxBytes: link.maxBytes });
+  res.json(link);
+});
+
+app.get('/u/:token', (req, res) => {
+  res.type('html').send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mi image upload</title><h1>Upload image</h1><p>This one-time link accepts JPEG, PNG, GIF, or WebP images up to ${Math.floor(UPLOAD_MAX_BYTES / 1024 / 1024)} MiB.</p><input id="file" type="file" accept="image/jpeg,image/png,image/gif,image/webp"><button id="send">Upload</button><pre id="out"></pre><script>send.onclick=async()=>{const f=file.files[0];if(!f){out.textContent='Choose an image first.';return}if(!/^image\\/(jpeg|png|gif|webp)$/.test(f.type)){out.textContent='Only image files are allowed.';return}out.textContent='Uploading...';const r=await fetch(location.pathname+'?filename='+encodeURIComponent(f.name),{method:'PUT',headers:{'content-type':f.type},body:f});const j=await r.json().catch(()=>({error:'Upload failed'}));out.textContent=j.url?'Uploaded image URL:\\n'+j.url:(j.error||'Upload failed')};</script>`);
+});
+
+app.put('/u/:token', express.raw({ type: '*/*', limit: UPLOAD_MAX_BYTES }), async (req, res) => {
+  try {
+    const result = await consumeUpload(String(req.params.token), Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0), String(req.get('content-type') || ''), basename(String(req.query.filename || 'image')));
+    await logEvent('upload.completed', { filename: result.filename });
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+setInterval(() => cleanupUploads().catch(() => undefined), 60 * 60 * 1000).unref();
 
 app.post('/api/login', (req, res) => {
   const password = String(req.body?.password || '');
