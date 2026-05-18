@@ -971,8 +971,14 @@ async function agentsCommand() {
                 lines.push(fgDim(truncateText(`PR: ${prUrls.join(' ')}`, width)));
             if (task.sessionName || task.sessionFile)
                 lines.push(fgDim(truncateText(`session: ${task.sessionName || ''} ${task.sessionFile || ''}`, width)));
+            const finalOutput = !isTaskActive(task) ? (task.error || task.text || '') : '';
             const verboseLines = verboseAgentDetail && task.sessionFile ? readSessionVerboseLines(task.sessionFile) : [];
-            if (verboseLines.length > 0) {
+            if (finalOutput) {
+                lines.push(fgDim(truncateText('final output', width)));
+                const outputBudget = Math.max(1, contentHeight - lines.length);
+                lines.push(...wrapPlain(finalOutput, Math.max(20, width - 2)).slice(0, outputBudget));
+            }
+            else if (verboseLines.length > 0) {
                 lines.push(fgDim(truncateText('live mi detail', width)));
                 for (const eventLine of verboseLines)
                     lines.push(...wrapPlain(eventLine, Math.max(20, width - 2)).slice(0, 8));

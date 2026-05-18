@@ -92,6 +92,8 @@ assert.match(cli, /let verboseAgentDetail = true/, 'agent view defaults to showi
 assert.match(cli, /function readSessionVerboseLines\(sessionFile: string/, 'agent view can read verbose Mi session events');
 assert.match(cli, /const verboseLines = verboseAgentDetail && task\.sessionFile \? readSessionVerboseLines\(task\.sessionFile\) : \[\]/, 'agent view reads selected task verbose Mi detail');
 assert.match(cli, /live mi detail[\s\S]*for \(const eventLine of verboseLines\)/, 'agent view renders selected task verbose Mi detail pane');
+assert.match(cli, /const finalOutput = !isTaskActive\(task\) \? \(task\.error \|\| task\.text \|\| ''\) : ''/, 'agent view shows final output when selected task completes');
+assert.match(cli, /if \(finalOutput\) \{[\s\S]*final output[\s\S]*const outputBudget = Math\.max\(1, contentHeight - lines\.length\)[\s\S]*wrapPlain\(finalOutput/, 'agent view lets final output fill the remaining info section');
 assert.match(cli, /data === 'v'[\s\S]*verboseAgentDetail = !verboseAgentDetail/, 'v toggles verbose Mi detail');
 assert.doesNotMatch(cli, /\/new <task> • Enter reply • o open pi • m multi-select • Esc clear task • \/quit/, 'agent view no longer shows verbose helper list above input');
 assert.doesNotMatch(cli, /open\/resume|r refresh|data === 'r'/, 'agent view no longer documents or handles manual refresh');
