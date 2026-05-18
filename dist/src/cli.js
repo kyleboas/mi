@@ -495,6 +495,7 @@ async function agentsCommand() {
     let agentSubmitting = false;
     let multiSelectMode = false;
     const selectedTaskKeys = new Set();
+    const pendingTaskUpdates = new Map();
     let pasteBuffer = '';
     let pasteMode = false;
     let slashSelected = 0;
@@ -539,7 +540,10 @@ async function agentsCommand() {
             const selectedKey = selectedTask() ? stableTaskKey(selectedTask()) : '';
             const listedTasks = (await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task)));
             optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => taskName(task) === taskName(optimistic)));
-            tasks = [...optimisticTasks, ...listedTasks];
+            tasks = [...optimisticTasks, ...listedTasks].map((task) => {
+                const update = pendingTaskUpdates.get(stableTaskKey(task));
+                return update ? { ...task, ...update } : task;
+            });
             if (selectedKey)
                 selected = tasks.findIndex((task) => stableTaskKey(task) === selectedKey);
             if (selected >= tasks.length)
@@ -1024,15 +1028,24 @@ async function agentsCommand() {
             const turn = await applyAgentPiCycle(value);
             if (!turn.body)
                 return;
-            task.status = 'running';
-            task.finishedAt = undefined;
-            task.progress = turn.body;
+            const taskKey = stableTaskKey(task);
+            const runningUpdate = { status: 'running', finishedAt: undefined, progress: turn.body };
+            Object.assign(task, runningUpdate);
+            if (taskKey)
+                pendingTaskUpdates.set(taskKey, runningUpdate);
             status = defaultAgentStatus;
             agentSubmitting = true;
             requestRender();
             void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
-                .then(() => refresh())
+                .then(async () => {
+                if (taskKey)
+                    pendingTaskUpdates.delete(taskKey);
+                await refresh();
+                setTimeout(() => void refresh(), 250);
+            })
                 .catch((error) => {
+                if (taskKey)
+                    pendingTaskUpdates.delete(taskKey);
                 task.status = 'error';
                 task.finishedAt = new Date().toISOString();
                 task.error = error instanceof Error ? error.message : String(error);

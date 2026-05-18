@@ -63,7 +63,10 @@ assert.match(cli, /value === '\/resume'[\s\S]*type: 'resume_sessions'/, 'agent v
 assert.match(cli, /const task = replyTarget \|\| selectedTask\(\)[\s\S]*type: 'continue_worker'[\s\S]*useGoal: '0'/, 'agent view forwards pi slash commands to selected worker without goal wrapping');
 assert.doesNotMatch(cli, /value === '\/model'/, 'agent view forwards pi slash commands like /model to the worker');
 assert.match(cli, /taskId = task\.id \|\| task\.sessionFile \|\| task\.sessionName \|\| task\.name/, 'agent view can reply to discovered session tasks by session file');
-assert.match(cli, /task\.status = 'running';[\s\S]*task\.progress = turn\.body;[\s\S]*void sendTaskSocketRequest\(\{ type: 'continue_worker'[\s\S]*model: turn\.model/, 'agent replies immediately mark the task working and send in the background');
+assert.match(cli, /const pendingTaskUpdates = new Map<string, Partial<MiTask>>\(\)/, 'agent view tracks pending task updates during async replies');
+assert.match(cli, /pendingTaskUpdates\.get\(stableTaskKey\(task\)\)/, 'refresh overlays pending updates so reply UI does not flicker stale state');
+assert.match(cli, /pendingTaskUpdates\.set\(taskKey, runningUpdate\)[\s\S]*void sendTaskSocketRequest\(\{ type: 'continue_worker'[\s\S]*model: turn\.model/, 'agent replies immediately mark the task working and send in the background');
+assert.match(cli, /pendingTaskUpdates\.delete\(taskKey\)[\s\S]*setTimeout\(\(\) => void refresh\(\), 250\)/, 'agent reply refreshes after daemon ack and again shortly after');
 assert.doesNotMatch(cli, /Replying to \$\{taskName\(task\)\} with/, 'agent replies do not replace the help/status line with a verbose sending message');
 assert.match(cli, /type: 'run_worker'[\s\S]*model: turn\.model/, 'agent view sends selected model with new tasks');
 assert.match(cli, /if \(command === 'agents'\) return agentsCommand\(\)/, 'cli routes mi agents');
