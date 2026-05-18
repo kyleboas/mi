@@ -197,8 +197,8 @@ async function readPiSessionTask(file, stats) {
     }
   }
   const status = String(activeGoal?.status || "").toLowerCase();
-  const name = sessionName || activeGoal?.objective?.split("\n")[0]?.slice(0, 80) || basename(cwd) || "pi session";
-  const progress = activeGoal?.objective ? activeGoal.objective.split("\n")[0].slice(0, 500) : lastAssistant || "Recent pi session";
+  const name = sessionName || activeGoal?.objective?.split("\n")[0]?.slice(0, 80) || basename(cwd) || "Mi session";
+  const progress = activeGoal?.objective ? activeGoal.objective.split("\n")[0].slice(0, 500) : lastAssistant || "Recent Mi session";
   return enrichTask({
     id: `pi-session:${sessionId || file}`,
     name,
@@ -329,7 +329,7 @@ async function resumePiSessions() {
   await writeDismissedTaskKeys(new Set());
   piSessionTaskCache = { at: 0, tasks: [] };
   const sessions = await listPiSessionTasks();
-  return { text: `Added ${sessions.length} pi session${sessions.length === 1 ? "" : "s"} to task list`, count: sessions.length };
+  return { text: `Added ${sessions.length} Mi session${sessions.length === 1 ? "" : "s"} to task list`, count: sessions.length };
 }
 
 async function writeTasks(tasks) {
