@@ -104,6 +104,21 @@ async function processStartedAtMs(startTicks) {
   }
 }
 
+function procLooksLikeInteractivePi(comm, cmdline) {
+  if (comm === "pi") return true;
+  return /(^|\u0000|\s)(pi|.*\/pi)(\u0000|\s|$)/.test(cmdline) || cmdline.includes("pi-coding-agent");
+}
+
+function sessionFileFromCmdline(cmdline) {
+  const args = cmdline.split("\u0000").filter(Boolean);
+  for (let i = 0; i < args.length; i++) {
+    if ((args[i] === "--session" || args[i] === "--resume") && args[i + 1]) return args[i + 1];
+    if (args[i]?.startsWith("--session=")) return args[i].slice("--session=".length);
+    if (args[i]?.startsWith("--resume=")) return args[i].slice("--resume=".length);
+  }
+  return "";
+}
+
 async function listActivePiProcesses() {
   let entries = [];
   try { entries = await readdir("/proc", { withFileTypes: true }); } catch { return []; }
@@ -114,14 +129,18 @@ async function listActivePiProcesses() {
     try {
       const dir = join("/proc", entry.name);
       const comm = (await readFile(join(dir, "comm"), "utf8")).trim();
-      if (comm !== "pi") continue;
+      const cmdline = await readFile(join(dir, "cmdline"), "utf8").catch(() => "");
+      if (!procLooksLikeInteractivePi(comm, cmdline)) continue;
+      const environ = await readFile(join(dir, "environ"), "utf8").catch(() => "");
+      if (environ.includes("MI_WORKER=1")) continue;
       const procStats = parseProcStat(await readFile(join(dir, "stat"), "utf8"));
       if (procStats.ppid === process.pid) continue;
       const input = await readlink(join(dir, "fd", "0")).catch(() => "");
       if (!input.startsWith("/dev/pts/") && !input.startsWith("/dev/tty")) continue;
       const cwd = await readlink(join(dir, "cwd"));
       const startedAtMs = await processStartedAtMs(procStats.startTicks || 0);
-      processes.push({ pid, cwd, startedAtMs });
+      const sessionFile = sessionFileFromCmdline(cmdline);
+      processes.push({ pid, cwd, startedAtMs, sessionFile });
     } catch {}
   }
   return processes;
@@ -221,6 +240,14 @@ async function listPiSessionTasks() {
   }
   const activeTaskIds = new Set();
   const matchedTaskIds = new Set();
+  for (const proc of activeProcesses) {
+    if (!proc.sessionFile) continue;
+    const match = tasks.find((task) => !matchedTaskIds.has(task.id) && (task.sessionFile === proc.sessionFile || task.actualSessionFile === proc.sessionFile));
+    if (match) {
+      matchedTaskIds.add(match.id);
+      activeTaskIds.add(match.id);
+    }
+  }
   const closeStartWindowMs = 10 * 60_000;
   for (const [cwd, procs] of activeByCwd) {
     for (const proc of procs) {
@@ -250,6 +277,8 @@ function taskHasActiveWorker(task) {
 function reconcileStoredTask(task) {
   const status = String(task.status || "").toLowerCase();
   if (["running", "queued", "thinking", "thinkingqueued"].includes(status) && !taskHasActiveWorker(task)) {
+    const lastActiveAt = Date.parse(task.continuedAt || task.lastEventAt || task.updatedAt || task.startedAt || 0) || 0;
+    if (Date.now() - lastActiveAt < 120000) return task;
     const finishedAt = task.finishedAt || task.lastEventAt || task.updatedAt || new Date().toISOString();
     return { ...task, status: "inactive", finishedAt, progress: task.progress || "worker is no longer running" };
   }
@@ -736,7 +765,7 @@ async function continueWorker(request) {
   const activeWorker = activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(name) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
     await activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" });
-    await upsertTask({ ...task, status: "running", continuedAt: new Date().toISOString() });
+    await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued" });
     await appendMainThreadMessage(`Task updated: ${name}\n\nStatus: running\nFollow-up queued.`, "mi-task-status").catch(() => undefined);
     return { text: `Queued message for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
   }
@@ -747,7 +776,7 @@ async function continueWorker(request) {
   const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
   try {
     const before = await worker.rpc({ type: "get_state" });
-    const updated = await upsertTask({ ...task, status: "running", continuedAt: new Date().toISOString() });
+    const updated = await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued" });
     installTaskHeartbeat(worker, updated);
     const done = worker.waitAgentEnd();
     await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });

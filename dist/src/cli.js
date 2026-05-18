@@ -393,6 +393,52 @@ function taskDetail(task) {
     const detail = task.error || (isTaskActive(task) ? (task.progress || task.text) : (task.text || task.progress)) || task.sessionName || '';
     return detail.replace(/\s+/g, ' ');
 }
+function textFromSessionMessage(message) {
+    const content = message?.content;
+    if (typeof content === 'string')
+        return content.trim();
+    if (!Array.isArray(content))
+        return '';
+    return content
+        .map((part) => typeof part === 'string' ? part : part?.type === 'text' ? part.text || '' : part?.type === 'thinking' ? `thinking: ${part.thinking || ''}` : part?.type === 'toolCall' ? `tool: ${part.name || 'unknown'} ${JSON.stringify(part.arguments || {})}` : '')
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+}
+function formatSessionEvent(record) {
+    if (record.type !== 'message')
+        return '';
+    const role = record.message?.role || '';
+    if (role === 'user')
+        return `you: ${textFromSessionMessage(record.message)}`;
+    if (role === 'assistant')
+        return `mi: ${textFromSessionMessage(record.message)}`;
+    if (role === 'toolResult') {
+        const text = textFromSessionMessage(record.message).replace(/\s+/g, ' ').slice(0, 1200);
+        return `result: ${record.message?.toolName || 'tool'} ${text}`.trim();
+    }
+    return '';
+}
+function readSessionVerboseLines(sessionFile, maxRecords = 18) {
+    try {
+        const raw = readFileSync(sessionFile, 'utf8');
+        return raw
+            .trim()
+            .split(/\r?\n/)
+            .slice(-Math.max(maxRecords * 4, 80))
+            .map((line) => { try {
+            return formatSessionEvent(JSON.parse(line));
+        }
+        catch {
+            return '';
+        } })
+            .filter(Boolean)
+            .slice(-maxRecords);
+    }
+    catch {
+        return [];
+    }
+}
 function shortTaskDetail(task, width) {
     const detail = taskDetail(task);
     return truncateText(detail, Math.max(0, width));
@@ -492,10 +538,12 @@ async function agentsCommand() {
     let pendingName = '';
     let replyTarget;
     let btwAnswer = '';
+    let verboseAgentDetail = true;
     let agentSubmitting = false;
     let multiSelectMode = false;
     const selectedTaskKeys = new Set();
     const pendingTaskUpdates = new Map();
+    const pendingTaskUpdateStartedAt = new Map();
     let pasteBuffer = '';
     let pasteMode = false;
     let slashSelected = 0;
@@ -521,7 +569,7 @@ async function agentsCommand() {
         '/compact': 'Manually compact the session context',
         '/resume': 'Resume a different session',
         '/reload': 'Reload keybindings, extensions, skills, prompts, and themes',
-        '/quit': 'Quit pi',
+        '/quit': 'Quit mi agents',
         '/mi': 'Ask Mi about the selected task',
         '/upload': 'Create an image upload link',
     };
@@ -541,11 +589,22 @@ async function agentsCommand() {
             const listedTasks = (await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task)));
             optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => taskName(task) === taskName(optimistic)));
             tasks = [...optimisticTasks, ...listedTasks].map((task) => {
-                const update = pendingTaskUpdates.get(stableTaskKey(task));
+                const key = stableTaskKey(task);
+                const terminal = ['complete', 'error', 'stopped'].includes(String(task.status || '').toLowerCase());
+                const pendingStartedAt = pendingTaskUpdateStartedAt.get(key) || 0;
+                const terminalAt = Date.parse(task.finishedAt || task.updatedAt || '') || 0;
+                if (terminal && (!pendingStartedAt || terminalAt > pendingStartedAt)) {
+                    pendingTaskUpdates.delete(key);
+                    pendingTaskUpdateStartedAt.delete(key);
+                }
+                const update = pendingTaskUpdates.get(key);
                 return update ? { ...task, ...update } : task;
             });
-            if (selectedKey)
-                selected = tasks.findIndex((task) => stableTaskKey(task) === selectedKey);
+            if (selectedKey) {
+                const nextSelected = tasks.findIndex((task) => stableTaskKey(task) === selectedKey);
+                if (nextSelected >= 0)
+                    selected = nextSelected;
+            }
             if (selected >= tasks.length)
                 selected = tasks.length - 1;
             status = inputMode === 'normal' && !agentSubmitting ? (multiSelectMode ? multiSelectStatus() : defaultAgentStatus) : status;
@@ -639,7 +698,7 @@ async function agentsCommand() {
             const index = start + offset;
             const selectedSuggestion = index === slashSelected;
             const label = command.slice(1);
-            const description = slashCommandDescriptions[command] || 'Forward to selected pi session';
+            const description = slashCommandDescriptions[command] || 'Forward to selected Mi session';
             const prefix = selectedSuggestion ? '→ ' : '  ';
             const truncatedLabel = truncateText(label, Math.max(1, primaryWidth - 2));
             const spacing = ' '.repeat(Math.max(1, primaryWidth - widthOf(truncatedLabel)));
@@ -800,7 +859,7 @@ async function agentsCommand() {
         }
         if (value === '/resume') {
             const result = await sendTaskSocketRequest({ type: 'resume_sessions' }, 10000);
-            status = result.text || 'Resumed pi sessions';
+            status = result.text || 'Resumed Mi sessions';
             await refresh();
             return true;
         }
@@ -896,9 +955,10 @@ async function agentsCommand() {
         }
         lines.push(fgThinking(undefined, '─'.repeat(width)));
         const task = selectedTask();
+        const detailMaxLines = Math.max(height, 500);
         if (btwAnswer) {
             lines.push(fgAccent(truncateText('mi', width)));
-            lines.push(...wrapPlain(btwAnswer, Math.max(20, width - 2)).slice(0, Math.max(1, contentHeight - lines.length - 1)));
+            lines.push(...wrapPlain(btwAnswer, Math.max(20, width - 2)).slice(0, detailMaxLines));
         }
         else if (task) {
             lines.push(truncateText(`${taskActivitySymbol(task)} ${taskName(task)}  ${taskStatus(task)}`, width));
@@ -911,24 +971,33 @@ async function agentsCommand() {
                 lines.push(fgDim(truncateText(`PR: ${prUrls.join(' ')}`, width)));
             if (task.sessionName || task.sessionFile)
                 lines.push(fgDim(truncateText(`session: ${task.sessionName || ''} ${task.sessionFile || ''}`, width)));
-            const body = task.error || (isTaskActive(task) ? (task.progress || task.text) : (task.text || task.progress)) || 'No result yet.';
-            lines.push(...wrapPlain(body, Math.max(20, width - 2)).slice(0, Math.max(1, contentHeight - lines.length - 1)));
+            const verboseLines = verboseAgentDetail && task.sessionFile ? readSessionVerboseLines(task.sessionFile) : [];
+            if (verboseLines.length > 0) {
+                lines.push(fgDim(truncateText('live mi detail', width)));
+                for (const eventLine of verboseLines)
+                    lines.push(...wrapPlain(eventLine, Math.max(20, width - 2)).slice(0, 8));
+            }
+            else {
+                const body = task.error || (isTaskActive(task) ? (task.progress || task.text) : (task.text || task.progress)) || 'No result yet.';
+                lines.push(...wrapPlain(body, Math.max(20, width - 2)).slice(0, detailMaxLines));
+            }
         }
         while (lines.length < contentHeight)
             lines.push('');
-        const inputStartRow = contentHeight + 3;
+        const inputStartRow = lines.length + 3;
         lines.push(...footerLines);
         while (lines.length < height)
             lines.push('');
+        const renderLines = lines.slice(0, Math.max(height, detailMaxLines + footerLines.length + 8));
         const out = ['\x1b[?2026h', '\x1b[H'];
-        lines.slice(0, height).forEach((line, index) => {
+        renderLines.forEach((line, index) => {
             const padding = Math.max(0, width - widthOf(line));
             out.push('\x1b[2K', line, ' '.repeat(padding));
-            if (index < height - 1)
+            if (index < renderLines.length - 1)
                 out.push('\r\n');
         });
         if (inputMode !== 'normal')
-            out.push(`\x1b[${inputStartRow + inputLines.length - 1};${agentInputCursorColumn(inputLines, width)}H`, '\x1b[?25h');
+            out.push(WHITE_CURSOR, `\x1b[${inputStartRow + inputLines.length - 1};${agentInputCursorColumn(inputLines, width)}H`, '\x1b[?25h');
         else
             out.push('\x1b[?25l');
         out.push('\x1b[?2026l');
@@ -1029,23 +1098,25 @@ async function agentsCommand() {
             if (!turn.body)
                 return;
             const taskKey = stableTaskKey(task);
-            const runningUpdate = { status: 'running', finishedAt: undefined, progress: turn.body };
+            const runningUpdate = { status: 'running', finishedAt: undefined, text: undefined, error: undefined, progress: turn.body, continuedAt: new Date().toISOString() };
             Object.assign(task, runningUpdate);
-            if (taskKey)
+            if (taskKey) {
                 pendingTaskUpdates.set(taskKey, runningUpdate);
+                pendingTaskUpdateStartedAt.set(taskKey, Date.now());
+            }
             status = defaultAgentStatus;
             agentSubmitting = true;
             requestRender();
             void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
                 .then(async () => {
-                if (taskKey)
-                    pendingTaskUpdates.delete(taskKey);
                 await refresh();
                 setTimeout(() => void refresh(), 250);
             })
                 .catch((error) => {
-                if (taskKey)
+                if (taskKey) {
                     pendingTaskUpdates.delete(taskKey);
+                    pendingTaskUpdateStartedAt.delete(taskKey);
+                }
                 task.status = 'error';
                 task.finishedAt = new Date().toISOString();
                 task.error = error instanceof Error ? error.message : String(error);
@@ -1183,6 +1254,11 @@ async function agentsCommand() {
         }
         if (data === 'o')
             void openSelectedInPi().catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
+        else if (data === 'v') {
+            verboseAgentDetail = !verboseAgentDetail;
+            status = verboseAgentDetail ? 'verbose Mi detail on' : 'verbose Mi detail off';
+            requestRender();
+        }
         else if (data === 'm') {
             multiSelectMode = !multiSelectMode;
             if (!multiSelectMode)
@@ -1222,7 +1298,10 @@ async function agentsCommand() {
             }
         }
     }
-    process.stdout.write('\x1b[?1049h\x1b[?2004h\x1b[2J\x1b[H');
+    // Do not enter the terminal alternate screen here. Kyle expects tmux/terminal
+    // scrollback to contain the Mi agents conversation; alternate screen makes
+    // scrollback show 0/0 in many terminals while this TUI is active.
+    process.stdout.write('\x1b[?2004h\x1b[2J\x1b[H');
     if (process.stdin.isTTY)
         process.stdin.setRawMode(true);
     process.stdin.resume();
