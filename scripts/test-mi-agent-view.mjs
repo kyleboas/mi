@@ -57,6 +57,7 @@ assert.match(cli, /optimisticTask\.id = result\.taskId \|\| optimisticTask\.id[\
 assert.match(cli, /optimisticTask\.status = 'error'[\s\S]*optimisticTask\.error = error instanceof Error/, 'failed new agent startup leaves an error row visible');
 assert.doesNotMatch(cli, /optimisticTasks = optimisticTasks\.filter\(\(task\) => task\.id !== optimisticTask\.id\)/, 'new agent optimistic row is not removed until real task appears in refresh');
 assert.match(cli, /agentSubmitting = true;[\s\S]*void sendTaskSocketRequest\(\{ type: 'run_worker'[\s\S]*\.finally\(\(\) => \{\n          agentSubmitting = false;/, 'new agent task creation is fire-and-forget after optimistic render');
+assert.match(cli, /Timed out waiting for Mi main[\s\S]*rm\(MI_SOCKET_PATH, \{ force: true \}\)/, 'cli removes stale Mi socket and restarts daemon on timeout');
 assert.match(cli, /const beforeEnter = parts\.shift\(\) \|\| '';[\s\S]*if \(textBeforeEnter\) inputBuffer \+= textBeforeEnter;[\s\S]*submitAgentInput/, 'agent input keeps text that arrives with Enter');
 assert.match(cli, /value === '\/quit'[\s\S]*close\(\)/, 'agent view slash quit exits');
 assert.match(cli, /value === '\/upload'[\s\S]*createUploadLink/, 'agent view slash upload creates upload links');

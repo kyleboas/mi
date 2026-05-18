@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import net from 'node:net';
 import { createInterface } from 'node:readline/promises';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
@@ -1520,7 +1520,9 @@ async function sendTaskSocketRequest(payload: unknown, timeoutMs = 30000) {
   try {
     return await sendSocketRequest(payload, timeoutMs);
   } catch (error) {
-    if (existsSync(MI_SOCKET_PATH)) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (existsSync(MI_SOCKET_PATH) && !message.includes('Timed out waiting for Mi main')) throw error;
+    if (message.includes('Timed out waiting for Mi main')) await rm(MI_SOCKET_PATH, { force: true }).catch(() => undefined);
     await startMiDaemon();
     return await sendSocketRequest(payload, timeoutMs);
   }
