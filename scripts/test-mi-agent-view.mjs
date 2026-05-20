@@ -44,7 +44,7 @@ assert.match(cli, /else process\.stdout\.write\('\\x1b\[3J'\)/, 'normal-screen T
 assert.match(cli, /const DISABLE_MOUSE_TRACKING_SEQUENCE = '\\x1b\[\?1000l\\x1b\[\?1002l\\x1b\[\?1003l\\x1b\[\?1006l\\x1b\[\?1015l'/, 'Mi has a local mouse tracking reset for tmux wheel scrollback');
 assert.match(cli, /Reset stale mouse tracking from prior full-screen apps before pi-tui starts[\s\S]*process\.stdout\.write\(DISABLE_MOUSE_TRACKING_SEQUENCE\)[\s\S]*tui\.start\(\)/, 'Mi disables stale mouse tracking before starting its TUI');
 assert.match(cli, /Mi does not handle mouse input; keep it disabled so tmux mouse-wheel scrollback works\.[\s\S]*process\.stdout\.write\(DISABLE_MOUSE_TRACKING_SEQUENCE\)[\s\S]*if \(options\.alternateScreen\)/, 'Mi disables mouse tracking again during TUI cleanup');
-assert.match(cli, /const PI_SLASH_COMMANDS = \['\/settings', '\/model'[\s\S]*'\/resume'[\s\S]*'\/quit'[\s\S]*'\/mi'/, 'agent view has pi-ordered slash command candidates plus mi overrides');
+assert.match(cli, /const PI_SLASH_COMMANDS = \['\/model'[\s\S]*'\/resume'[\s\S]*'\/quit'[\s\S]*'\/mi'/, 'agent view has pi-ordered slash command candidates plus mi overrides');
 assert.match(cli, /function createPiSlashAutocompleteProvider\(commands = PI_SLASH_COMMANDS\)[\s\S]*new CombinedAutocompleteProvider\(slashCommands, process\.cwd\(\)\)/, 'Mi slash autocomplete uses pi-tui CombinedAutocompleteProvider');
 assert.match(cli, /agentEditor\.setAutocompleteProvider\(createPiSlashAutocompleteProvider\(\)\)/, 'agent view lets the real pi Editor render slash command autocomplete');
 assert.match(cli, /inputEditor\.setAutocompleteProvider\(createPiSlashAutocompleteProvider\(\[[^\]]*'\/quit'[^\]]*'\/upload'[^\]]*\]\)\)/, 'main Mi input also uses pi-style slash command autocomplete');
@@ -114,6 +114,7 @@ assert.match(cli, /tasks = dedupeTasksByStableKey\(\[\.\.\.optimisticTasks, \.\.
 assert.match(cli, /function normalizeVisibleTasks\(\)[\s\S]*dedupeTasksByStableKey\(tasks\)[\s\S]*function renderAgentLines[\s\S]*normalizeVisibleTasks\(\)/, 'agent render also dedupes in-memory rows before drawing so selection cannot multiply pi sessions');
 assert.match(cli, /const update = pendingTaskUpdates\.get\(key\)/, 'refresh overlays pending updates so reply UI does not flicker stale state');
 assert.match(cli, /inputMode === 'normal' && value[\s\S]*replyTarget = task;[\s\S]*inputMode = 'reply';/, 'normal submitted text falls back to replying to the selected task');
+assert.match(cli, /const runningUpdate: Partial<MiTask> = \{ status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined[\s\S]*updatedAt: new Date\(\)\.toISOString\(\) \}/, 'agent replies immediately move completed or needs-input tasks back to working');
 assert.match(cli, /pendingTaskUpdates\.set\(taskKey, runningUpdate\)[\s\S]*void sendTaskSocketRequest\(\{ type: 'continue_worker'[\s\S]*model: turn\.model/, 'agent replies immediately mark the task working and send in the background');
 assert.match(cli, /pendingTaskUpdateStartedAt = new Map<string, number>\(\)/, 'agent view remembers when a reply began');
 assert.match(cli, /text: undefined, error: undefined[\s\S]*continuedAt: new Date\(\)\.toISOString\(\)/, 'agent reply clears completed fields and immediately makes task working');

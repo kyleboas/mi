@@ -1436,7 +1436,7 @@ async function miAgentsCommand() {
             if (!turn.body)
                 return;
             const taskKey = stableTaskKey(task);
-            const runningUpdate = { status: 'running', finishedAt: undefined, text: undefined, error: undefined, progress: turn.body, lastInput: turn.body, continuedAt: new Date().toISOString() };
+            const runningUpdate = { status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: turn.body, lastInput: turn.body, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
             Object.assign(task, runningUpdate);
             if (taskKey) {
                 pendingTaskUpdates.set(taskKey, runningUpdate);
