@@ -173,7 +173,7 @@ async function askMi(threadId, message) {
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'cli' });
     await logEvent('mi.thread.user', { threadId, message });
     const context = await threadContext(threadId);
-    const prompt = `You are Mi, Kyle's private persistent assistant. Reply as Mi in the current conversation. Be concise. Do not claim to have inspected files or services unless context explicitly says so. Risky actions require approval.\n\nThread: ${thread.title}\n\n${context}\n\nCurrent user message:\n${message}`;
+    const prompt = `You are Mi, ${miUserPossessive()} private persistent assistant. Reply as Mi in the current conversation. Be concise. Do not claim to have inspected files or services unless context explicitly says so. Risky actions require approval.\n\nThread: ${thread.title}\n\n${context}\n\nCurrent user message:\n${message}`;
     const result = await runFlueChat(prompt);
     const reply = result.reply || 'Got it.';
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.source });
@@ -315,6 +315,9 @@ function taskNameFromPrompt(prompt) {
         .slice(0, 32) || `task-${Date.now().toString(36)}`;
 }
 function taskStatus(task) {
+    const status = String(task.status || '').toLowerCase();
+    if (task.needsKyle && task.needsKyleReason === 'stopped by Escape')
+        return 'paused';
     if (task.finishedAt && !task.status)
         return 'complete';
     return task.status || 'unknown';
@@ -343,6 +346,8 @@ function taskSectionRank(task) {
     return section === 'needs input' ? 0 : section === 'working' ? 1 : 2;
 }
 function taskActivitySymbol(task, animated = true, frameIndex = 0) {
+    if (isTaskNeedsInput(task))
+        return '●';
     if (!isTaskActive(task))
         return '○';
     if (!animated || !isTaskWorking(task))
@@ -524,7 +529,7 @@ function readSessionFinalOutput(sessionFile) {
 function normalizeLastInputText(text) {
     return text
         .replace(/^\/goal\s+/, '')
-        .replace(/\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests\/checks run, PR URL if any, and what Kyle should do next\.$/, '')
+        .replace(/\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests\/checks run, PR URL if any, and what [^\n.]+ should do next\.$/, '')
         .replace(/\s+/g, ' ')
         .trim();
 }
@@ -888,15 +893,15 @@ async function miAgentsCommand() {
             `Task: ${taskName(task)}`,
             `Status: ${taskStatus(task)}`,
             task.sessionFile ? `session: ${task.sessionFile}` : '',
-            task.needsKyle ? `needs Kyle: ${task.needsKyleReason || 'attention'}` : '',
+            task.needsKyle ? `needs ${miUserName()}: ${task.needsKyleReason || 'attention'}` : '',
             task.progress ? `progress: ${task.progress}` : '',
             task.text ? `latest result: ${task.text.slice(0, 1200)}` : '',
             task.error ? `error: ${task.error}` : '',
         ].filter(Boolean).join('\n');
         return normalizeMiResponse(await sendToMiMain([
-            "You are Mi, Kyle's private persistent assistant. Answer only about the selected background task below. If the question is unrelated, say you can only answer about the selected task here.",
+            `You are Mi, ${miUserPossessive()} private persistent assistant. Answer only about the selected background task below. If the question is unrelated, say you can only answer about the selected task here.`,
             `Selected task context:\n${taskContext}`,
-            `Kyle's message in the ongoing /mi chat about this task:\n${question}`,
+            `${miUserPossessive({ capitalize: true })} message in the ongoing /mi chat about this task:\n${question}`,
         ].join('\n\n')));
     }
     function multiSelectStatus() {
@@ -912,6 +917,13 @@ async function miAgentsCommand() {
         else
             selectedTaskKeys.add(key);
         status = multiSelectStatus();
+        requestRender();
+    }
+    function toggleMultiSelectMode() {
+        multiSelectMode = !multiSelectMode;
+        if (!multiSelectMode)
+            selectedTaskKeys.clear();
+        status = multiSelectMode ? multiSelectStatus() : defaultAgentStatus;
         requestRender();
     }
     function clearSelectedTasksFromList() {
@@ -1230,17 +1242,20 @@ async function miAgentsCommand() {
             lines.push(truncateText(`${taskActivitySymbol(task, true, agentSpinnerFrame)} ${taskName(task)}  ${taskStatus(task)}`, width));
             if (task.sessionName || task.sessionFile)
                 lines.push(fgDim(truncateText(`session: ${task.sessionName || ''} ${task.sessionFile || ''}`, width)));
-            const lastInput = taskLastInput(task);
-            if (lastInput) {
-                lines.push('');
-                lines.push(...renderPiUserMessage(lastInput, width).slice(0, Math.max(1, Math.min(4, contentHeight - lines.length))));
-            }
             const prUrls = extractPrUrlsFromTask(task);
             if (prUrls.length > 0)
                 lines.push(fgDim(truncateText(`PR: ${prUrls.join(' ')}`, width)));
             if (isTaskNeedsInput(task)) {
                 lines.push('');
                 lines.push(...renderPiAssistantMessage(taskNeedsInputQuestion(task), width).slice(0, Math.max(1, contentHeight - lines.length)));
+            }
+            const lastInput = taskLastInput(task);
+            if (lastInput) {
+                lines.push('');
+                lines.push(...renderPiUserMessage(lastInput, width).slice(0, Math.max(1, Math.min(4, contentHeight - lines.length))));
+            }
+            if (isTaskNeedsInput(task)) {
+                // Needs-input details and PR links are rendered above the last user input.
             }
             else if (isTaskActive(task) && task.sessionFile) {
                 const activity = readSessionActivitySteps(task.sessionFile, task, 12);
@@ -1590,13 +1605,26 @@ async function miAgentsCommand() {
             }
             const task = selectedTask();
             if (task) {
-                const key = stableTaskKey(task);
-                if (key)
-                    dismissedTaskKeys.add(key);
-                tasks = tasks.filter((entry) => stableTaskKey(entry) !== key);
-                clampTaskSelection();
-                status = `Removed ${taskName(task)} from list`;
-                void dismissTaskFromList(task).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
+                if (isTaskActive(task)) {
+                    task.status = 'paused';
+                    task.needsKyle = true;
+                    task.needsKyleReason = 'stopped by Escape';
+                    task.finishedAt = undefined;
+                    task.progress = 'stopped by Escape; needs Kyle input';
+                    task.updatedAt = new Date().toISOString();
+                    status = `Stopped ${taskName(task)}; moved to needs input`;
+                    clampTaskSelection();
+                    void stopTaskInList(task).then(() => refresh()).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
+                }
+                else {
+                    const key = stableTaskKey(task);
+                    if (key)
+                        dismissedTaskKeys.add(key);
+                    tasks = tasks.filter((entry) => stableTaskKey(entry) !== key);
+                    clampTaskSelection();
+                    status = `Removed ${taskName(task)} from list`;
+                    void dismissTaskFromList(task).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
+                }
             }
             else {
                 status = defaultAgentStatus;
@@ -1609,13 +1637,8 @@ async function miAgentsCommand() {
         }
         if (data === 'o' && !inputBuffer)
             void openSelectedInPi().catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
-        else if (isCtrlMShortcut(data) && !inputBuffer) {
-            multiSelectMode = !multiSelectMode;
-            if (!multiSelectMode)
-                selectedTaskKeys.clear();
-            status = multiSelectMode ? multiSelectStatus() : defaultAgentStatus;
-            requestRender();
-        }
+        else if (isCtrlMShortcut(data) && !inputBuffer)
+            toggleMultiSelectMode();
         else if (multiSelectMode && !inputBuffer && (data === ' ' || data.includes('\r') || data.includes('\n')))
             toggleSelectedTaskForBulkClear();
         else if (!inputBuffer && (data.includes('\r') || data.includes('\n'))) {
@@ -1712,6 +1735,27 @@ const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
 const MI_MODEL = process.env.MI_MODEL || 'openai-codex/gpt-5.5:low';
 const PI_CYCLE_PATH = join(HOME, '.pi', 'agent', 'pi-cycle.json');
+const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, 'preferences.md');
+function miUserName() {
+    const envName = process.env.MI_USER_NAME?.trim();
+    if (envName)
+        return envName;
+    try {
+        const preferences = readFileSync(MI_PREFERENCES_PATH, 'utf8');
+        const match = preferences.match(/^\s*-\s*User(?:'s)?(?: display)? name:\s*(.+?)\s*$/im);
+        const name = match?.[1]?.trim().replace(/[.。]+$/, '');
+        if (name)
+            return name;
+    }
+    catch { }
+    return 'the user';
+}
+function miUserPossessive({ capitalize = false } = {}) {
+    const name = miUserName();
+    if (name.toLowerCase() === 'the user')
+        return capitalize ? "The user's" : "the user's";
+    return name.endsWith('s') ? `${name}'` : `${name}'s`;
+}
 function readPushoverEnvFile() {
     try {
         const text = readFileSync(PUSHOVER_ENV_FILE, 'utf8');
@@ -2020,9 +2064,8 @@ function isDownKey(data) {
     return matchesKey(data, 'down') || data.includes('\x1b[B') || data.includes('\x1bOB') || data.includes('\x1b[1;2B');
 }
 function isCtrlMShortcut(data) {
-    // In legacy terminals Ctrl-M is indistinguishable from Enter (\r), so do not
-    // treat raw CR/LF as the shortcut. In CSI-u/modifyOtherKeys terminals, accept
-    // both the literal m codepoint and the legacy Ctrl-M/CR codepoint with Ctrl.
+    // In legacy terminals Ctrl-M is indistinguishable from Enter (\r), so raw
+    // CR/LF must keep Enter semantics. CSI-u/modifyOtherKeys can distinguish it.
     return data !== '\r' && data !== '\n' && (matchesKey(data, 'ctrl+m') || /^(?:\x1b\[13;5(?::1)?u|\x1b\[27;5;13~)$/.test(data));
 }
 function splitTerminalInput(data) {
@@ -2085,6 +2128,9 @@ function startPiTuiScreen(component, options = {}) {
     // Reset stale mouse tracking from prior full-screen apps before pi-tui starts.
     process.stdout.write(DISABLE_MOUSE_TRACKING_SEQUENCE);
     tui.start();
+    // pi-tui may enable mouse tracking during start; disable it afterwards so
+    // wheel/trackpad gestures go to terminal/tmux scrollback like pi.
+    process.stdout.write(DISABLE_MOUSE_TRACKING_SEQUENCE);
     return tui;
 }
 function workingLine(frameIndex = 0) {
@@ -2401,7 +2447,7 @@ async function miTuiCommand(initial = '') {
             `Selected Mi background agent #${selectedAgentIndex + 1}: ${taskName(task)}`,
             `Status: ${taskStatus(task)}`,
             task.sessionFile ? `session: ${task.sessionFile}` : '',
-            task.needsKyle ? `needs Kyle: ${task.needsKyleReason || 'attention'}` : '',
+            task.needsKyle ? `needs ${miUserName()}: ${task.needsKyleReason || 'attention'}` : '',
             extractPrUrlsFromTask(task).length ? `PRs: ${extractPrUrlsFromTask(task).join(' ')}` : '',
             task.text ? `latest result: ${task.text.slice(0, 800)}` : '',
             task.progress ? `progress: ${task.progress}` : '',
@@ -2426,7 +2472,7 @@ async function miTuiCommand(initial = '') {
         const history = recent.map((message) => `${message.role}: ${message.text}`).join('\n');
         const agentContext = selectedAgentContext();
         return [
-            "You are Mi, Kyle's private persistent assistant. Reply naturally and use recent conversation context. Do not mention hidden context unless it is useful.",
+            `You are Mi, ${miUserPossessive()} private persistent assistant. Reply naturally and use recent conversation context. Do not mention hidden context unless it is useful.`,
             history ? `Recent conversation history for context only:\n${history}` : '',
             agentContext ? `Selected agent context:\n${agentContext}` : '',
             `New message to answer:\n${text}`,
@@ -2464,26 +2510,18 @@ async function miTuiCommand(initial = '') {
             return lines.slice(0, height);
         }
         const footer = footerLines(width, height);
-        const bodyViewport = Math.max(1, height - footer.lines.length);
         const body = [];
         body.push(...renderMiTranscript(transcript, width));
         if (pending) {
             body.push('');
             body.push(workingLine(workingFrame));
         }
-        const maxOffset = Math.max(0, body.length - bodyViewport);
-        const offset = Math.min(scrollOffset, maxOffset);
-        const end = body.length - offset;
-        const start = Math.max(0, end - bodyViewport);
-        const visibleBody = body.slice(start, end);
-        while (visibleBody.length < bodyViewport)
-            visibleBody.unshift('');
         const lines = [
-            ...visibleBody.map((line) => truncateText(line, width)),
+            ...body.map((line) => truncateText(line, width)),
             ...footer.lines,
-        ].slice(0, height);
+        ];
         while (lines.length < height)
-            lines.push('');
+            lines.unshift('');
         return lines;
     }
     async function askOne(text) {
@@ -2505,7 +2543,8 @@ async function miTuiCommand(initial = '') {
             await sendPushover('Mi', response).catch(() => undefined);
         }
         catch (error) {
-            transcript.push({ role: 'assistant', text: error instanceof Error ? error.message : String(error) });
+            const errorText = error instanceof Error ? error.message : String(error);
+            transcript.push({ role: 'assistant', text: errorText });
         }
         finally {
             scrollOffset = 0;
@@ -2840,11 +2879,8 @@ async function miTuiCommand(initial = '') {
         }
         handleInputData(data);
     }
-    // Like pi, leave conversation history in normal terminal scrollback and keep
-    // only the live composer/status area as the repainting TUI surface.
-    const historyLines = renderMiTranscript(transcript, cols());
-    if (historyLines.length > 0)
-        process.stdout.write(`\n${historyLines.map((line) => truncateText(line, cols())).join('\n')}\n`);
+    // Like pi, leave conversation history in normal terminal scrollback by
+    // rendering the whole conversation into the normal terminal buffer.
     tui = startPiTuiScreen(new FunctionScreen(renderMiLines, onData), { clearScreen: false });
     if (initial.trim())
         enqueueMessage(initial.trim());
@@ -2859,13 +2895,13 @@ async function miTuiCommand(initial = '') {
 }
 async function launchPiMain(args) {
     const prompt = [
-        'You are Mi, Kyle private persistent assistant.',
+        `You are Mi, ${miUserPossessive()} private persistent assistant.`,
         'Be concise and minimal.',
         'Do not use emoji.',
         'Risky actions require explicit approval.',
-        'All Mi tasks, goals, objectives, todos, plans, and work queues must be stored and maintained as Markdown files under /home/kyle/mi/.',
+        `All Mi tasks, goals, objectives, todos, plans, and work queues must be stored and maintained as Markdown files under ${MI_TASKS_DIR}/.`,
         'Do not deploy, merge, push, publish, edit secrets, or change production settings unless explicitly approved.',
-        'Use the /mi command for side-channel notes, /mi read for unread Mi messages, and /mi bring-in only when Kyle asks to bring Mi thread context into this pi conversation.',
+        `Use the /mi command for side-channel notes, /mi read for unread Mi messages, and /mi bring-in only when ${miUserName()} asks to bring Mi thread context into this pi conversation.`,
     ].join(' ');
     const piArgs = [
         '--append-system-prompt',

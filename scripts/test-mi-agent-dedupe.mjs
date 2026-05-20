@@ -108,7 +108,15 @@ try {
   assert.equal(rows.filter((t) => t.name === 'terminal-plus-stale-busy').length, 1, 'terminal/stale-busy task duplicated');
   assert.notEqual(terminal.status, 'running', 'terminal task was promoted to running by stale busy session');
 
-  // 5. Generic names such as Kyle must not collapse unrelated external sessions.
+  // 4b. Paused/stopped rows must not flip back to running even while the just-killed worker is still tracked.
+  await writeTasks([{ id: `pi-session:${uuid(8)}`, source: 'pi-session', name: 'paused-plus-live-busy', sessionName: 'paused-plus-live-busy', cwd: '/repo', status: 'paused', needsKyle: true, needsKyleReason: 'stopped by Escape', sessionId: uuid(8), sessionFile: await sessionFile({ id: uuid(8), name: 'paused-plus-live-busy', cwd: '/repo', busy: true, at: iso(3500) }), progress: 'stopped by Escape; needs user input', updatedAt: iso(3500) }]);
+  rows = (await request('list_tasks')).tasks;
+  const paused = rows.find((t) => t.name === 'paused-plus-live-busy');
+  assert.equal(rows.filter((t) => t.name === 'paused-plus-live-busy').length, 1, 'paused/live-busy task duplicated');
+  assert.equal(paused.status, 'paused', 'paused task was promoted to running by busy session scan');
+  assert.equal(paused.needsKyle, true, 'paused task lost needs-input state');
+
+  // 5. Generic person names must not collapse unrelated external sessions.
   await writeTasks([]);
   await sessionFile({ id: uuid(6), name: 'kyle', cwd: '/repo-a', finalText: 'a', at: iso(4000) });
   await sessionFile({ id: uuid(7), name: 'kyle', cwd: '/repo-b', finalText: 'b', at: iso(5000) });

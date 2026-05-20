@@ -2,7 +2,7 @@
 import net from "node:net";
 import { spawn } from "node:child_process";
 import { appendFile, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -16,6 +16,7 @@ const LOG_PATH = join(RUNTIME_DIR, "mi-daemon.log");
 const LOCK_PATH = join(RUNTIME_DIR, "mi-daemon.lock");
 const TASKS_PATH = join(HOME, "mi", "state", "tasks.json");
 const DISMISSED_TASKS_PATH = join(HOME, "mi", "state", "dismissed-tasks.json");
+const MI_PREFERENCES_PATH = join(HOME, "mi", "preferences.md");
 const PI_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const ACTIVE_SESSION_WINDOW_MS = Number(process.env.MI_ACTIVE_PI_SESSION_WINDOW_MS || 7 * 24 * 60 * 60_000);
 const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 5000);
@@ -35,6 +36,22 @@ const activeWorkers = new Map();
 let activePrompt;
 let piIdleTimer;
 let piSessionTaskCache = { at: 0, tasks: [] };
+
+function miUserName() {
+  const envName = process.env.MI_USER_NAME?.trim();
+  if (envName) return envName;
+  try {
+    const preferences = readFileSync(MI_PREFERENCES_PATH, "utf8");
+    const match = preferences.match(/^\s*-\s*User(?:'s)?(?: display)? name:\s*(.+?)\s*$/im);
+    const name = match?.[1]?.trim().replace(/[.。]+$/, "");
+    if (name) return name;
+  } catch {}
+  return "the user";
+}
+
+function miSummaryInstruction() {
+  return `When done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what ${miUserName()} should do next.`;
+}
 
 async function log(line) {
   await mkdir(RUNTIME_DIR, { recursive: true });
@@ -441,17 +458,18 @@ async function mergeOpenPiSessions(tasks, dismissed) {
     if (!activeSession) return task;
     const taskStatus = String(task.status || "").toLowerCase();
     const activeStatus = String(activeSession.status || "").toLowerCase();
-    const terminalTask = task.finishedAt || ["complete", "completed", "done", "error", "stopped", "inactive"].includes(taskStatus);
+    const terminalTask = task.finishedAt || ["complete", "completed", "done", "error", "stopped", "paused", "inactive"].includes(taskStatus);
     const liveTrackedWorker = taskHasActiveWorker(task);
     const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus) && !liveTrackedWorker;
+    const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused");
     return {
       ...task,
-      status: terminalTask && staleBusySession ? task.status : (activeSession.status || task.status),
-      finishedAt: terminalTask && staleBusySession ? task.finishedAt : activeSession.finishedAt,
-      text: activeSession.text || task.text,
-      progress: activeSession.progress || task.progress,
+      status: preserveStoredTerminal ? task.status : (activeSession.status || task.status),
+      finishedAt: preserveStoredTerminal ? task.finishedAt : activeSession.finishedAt,
+      text: preserveStoredTerminal ? task.text : (activeSession.text || task.text),
+      progress: preserveStoredTerminal ? task.progress : (activeSession.progress || task.progress),
       lastEventAt: activeSession.lastEventAt || task.lastEventAt,
-      updatedAt: activeSession.updatedAt || task.updatedAt,
+      updatedAt: preserveStoredTerminal ? task.updatedAt : (activeSession.updatedAt || task.updatedAt),
     };
   });
   for (const session of visibleSessions) {
@@ -467,7 +485,7 @@ async function listAllTasks() {
   if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
   const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
   const mergedTasks = await mergeOpenPiSessions(storedTasks, dismissed);
-  // Anything that appears in mi agents should stay there until Kyle clears it.
+  // Anything that appears in mi agents should stay there until the user clears it.
   // Discovered/open pi sessions used to disappear after the recent-session window;
   // persist the merged view so refreshes and daemon restarts keep the task row.
   if (JSON.stringify(reconciledRawTasks) !== JSON.stringify(mergedTasks)) await writeTasks(mergedTasks);
@@ -481,12 +499,15 @@ async function stopTask(request) {
   const task = tasks.find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
   const activeWorker = task ? (activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(task.sessionName)) : undefined;
-  if (activeWorker && !activeWorker.proc.killed) activeWorker.proc.kill();
+  if (activeWorker && !activeWorker.proc.killed) {
+    activeWorker.expectedStop = true;
+    activeWorker.proc.kill();
+  }
   if (task) {
-    await upsertTask({ ...task, status: "stopped", finishedAt: new Date().toISOString(), progress: "stopped" });
+    await upsertTask({ ...task, status: "paused", needsKyle: true, needsKyleReason: "stopped by Escape", finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: new Date().toISOString() });
     untrackActiveWorker(task, name);
   }
-  return { text: `Stopped ${name}` };
+  return { text: `Stopped ${name}; moved to needs input` };
 }
 
 async function dismissTask(request) {
@@ -545,6 +566,7 @@ function extractPrUrls(text) {
 }
 
 function detectNeedsKyle(task) {
+  if (task.needsKyle) return { needsKyle: true, needsKyleReason: task.needsKyleReason || "requested" };
   const text = `${task.error || ""}\n${task.text || ""}\n${task.progress || ""}`;
   const patterns = [
     /approval required/i,
@@ -574,7 +596,7 @@ async function upsertTask(task) {
   const merged = index >= 0 ? enrichTask({ ...previous, ...next }) : next;
   if (merged.needsKyle && !previous?.notifiedNeedsKyleAt) {
     merged.notifiedNeedsKyleAt = new Date().toISOString();
-    await appendMainThreadMessage(`Task needs Kyle: ${merged.sessionName || merged.name || merged.id}\n\n${merged.needsKyleReason || "Needs attention"}\n\n${merged.error || merged.progress || merged.text || "Open the background task for details."}`).catch(() => undefined);
+    await appendMainThreadMessage(`Task needs ${miUserName()}: ${merged.sessionName || merged.name || merged.id}\n\n${merged.needsKyleReason || "Needs attention"}\n\n${merged.error || merged.progress || merged.text || "Open the background task for details."}`).catch(() => undefined);
   }
   if (merged.status === "paused" && previous?.status !== "paused" && !previous?.notifiedPausedAt) {
     merged.notifiedPausedAt = new Date().toISOString();
@@ -888,7 +910,7 @@ function workerInputMessage(message, useGoal = "0") {
 
 function wrapWorkerMessage(message, useGoal = "0") {
   return String(useGoal) === "1" && !message.trim().startsWith("/goal")
-    ? `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next.`
+    ? `/goal ${message}\n\n${miSummaryInstruction()}`
     : message;
 }
 
@@ -920,8 +942,11 @@ async function finishTask({ task, worker, before, sessionFile, name, done, kind 
     const text = lastAssistantText(end.messages) || "Worker completed without text.";
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
     await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model });
-    await appendMainThreadMessage(`${kind}: ${name}\n\n${text}\n\nOpen in /resume: ${visibleSessionFile || "unknown"}`).catch(() => undefined);
   } catch (error) {
+    if (worker.expectedStop) {
+      await log(`worker_expected_stop ${name}`);
+      return;
+    }
     const errorText = String(error.message || error);
     await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: errorText });
     await appendMainThreadMessage(`${kind} failed: ${name}\n\n${errorText}`).catch(() => undefined);
