@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
 
-assert.match(cli, /mi agents\s+Open mi-agents live background agent view/, 'usage documents mi agents startup command and mi-agents name');
+assert.match(cli, /mi agents\s+Open mi agents live background agent view/, 'usage documents mi agents startup command and mi agents name');
 assert.match(cli, /AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTheme, UserMessageComponent/, 'CLI imports pi message components and theme');
 assert.match(cli, /CombinedAutocompleteProvider, CURSOR_MARKER, Editor, matchesKey, ProcessTerminal, TUI, type Component, type Focusable, type SlashCommand/, 'CLI imports pi Editor, autocomplete provider, key matching, and pi-tui runtime for input and differential rendering');
 assert.match(cli, /initTheme\(process\.env\.PI_THEME, false\)/, 'CLI initializes pi theme before rendering pi components');
@@ -14,7 +14,7 @@ assert.match(cli, /function renderPiAssistantMessage\(text: string, width: numbe
 assert.match(cli, /while \(lines\.length > 0 && stripAnsi\(lines\[0\] \|\| ''\)\.trim\(\) === ''\) lines\.shift\(\)/, 'Mi removes assistant component marker-only leading blank lines');
 assert.match(cli, /function renderMiTranscript\(transcript:[\s\S]*if \(body\.length > 0\) body\.push\(''\)/, 'main Mi TUI inserts one explicit blank line between transcript messages');
 assert.match(cli, /function renderPiEditorText\(text: string, width: number, terminalRows: number\)[\s\S]*new Editor\(tui, piEditorTheme\(\)\)/, 'Mi renders input with pi Editor styling');
-assert.match(cli, /async function miAgentsCommand\(\)/, 'cli defines mi-agents view command');
+assert.match(cli, /async function miAgentsCommand\(\)/, 'cli defines mi agents view command');
 assert.match(cli, /pollTimer\s*=\s*setInterval\(\(\) => void refresh\(\), MI_TASK_POLL_MS\)/, 'agent view polls live task state');
 assert.match(cli, /const MI_TASK_POLL_MS = Number\(process\.env\.MI_TASK_POLL_MS \|\| 5000\)/, 'agent view uses a lightweight default polling cadence');
 assert.match(cli, /const PI_LOADER_INTERVAL_MS = 80/, 'Mi defines pi loader default interval');
@@ -29,11 +29,11 @@ assert.match(cli, /inputMode: 'normal' \| 'new-name' \| 'new-prompt' \| 'reply'/
 assert.match(cli, /let replyTarget: MiTask \| undefined/, 'agent view tracks reply targets');
 assert.match(cli, /inputMode === 'normal' && text\.length > 0 && !text\.startsWith\('\/'\)[\s\S]*replyTarget = selectedTask\(\);[\s\S]*inputMode = replyTarget \? 'reply' : 'normal';[\s\S]*Select a task or use \/new/, 'typing normal text replies to the selected task; new tasks require /new');
 assert.match(cli, /function agentInputVisibleLines\(width: number, maxLines: number\)/, 'agent view wraps input across visible lines like main Mi');
-assert.match(cli, /fgAccent\(truncateText\('mi-agents', width\)\) \+ fgLightGrey\(truncateText\(`  \$\{status\}`/, 'agent view places status next to mi-agents title');
+assert.match(cli, /fgAccent\(truncateText\('mi agents', width\)\) \+ fgLightGrey\(truncateText\(`  \$\{status\}`/, 'agent view places status next to mi agents title');
 assert.match(cli, /const footerLines = \[[\s\S]*\.\.\.inputLines\.map\(\(line\) => truncateText\(line, width\)\)[\s\S]*agentModelWithThinking\(\), width\)\.padStart\(width\)/, 'agent view renders pi editor footer with right-aligned model');
 assert.match(cli, /const contentHeight = Math\.max\(1, height - footerLines\.length\)/, 'agent view reserves bottom space for status and input footer');
 assert.match(cli, /while \(lines\.length < contentHeight\) lines\.push\(''\);\n    lines\.push\(\.\.\.footerLines\)/, 'agent view places footer after full detail content for scrollback');
-assert.match(cli, /startPiTuiScreen\(new FunctionScreen\(renderAgentLines, onData\), \{ alternateScreen: true \}\)/, 'mi-agents uses alternate screen so stale scrollback rows cannot look like duplicate tasks');
+assert.match(cli, /startPiTuiScreen\(new FunctionScreen\(renderAgentLines, onData\), \{ alternateScreen: true \}\)/, 'mi agents uses alternate screen so stale scrollback rows cannot look like duplicate tasks');
 assert.match(cli, /stale rows cannot remain in terminal scrollback/, 'agent view documents why alternate screen is needed');
 assert.match(cli, /const detailBudget = Math\.max\(1, contentHeight - lines\.length - 1\)/, 'agent view budgets detail to the visible info pane');
 assert.match(cli, /const visibleLines = outputLines\.slice\(fullLastOutputScroll, fullLastOutputScroll \+ outputHeight\)/, 'full last output mode uses an internal scroll window');
@@ -48,7 +48,7 @@ assert.match(cli, /agentEditor\.setAutocompleteProvider\(createPiSlashAutocomple
 assert.match(cli, /inputEditor\.setAutocompleteProvider\(createPiSlashAutocompleteProvider\(\[[^\]]*'\/quit'[^\]]*'\/upload'[^\]]*\]\)\)/, 'main Mi input also uses pi-style slash command autocomplete');
 assert.doesNotMatch(cli, /function editorAutocompletePage|editorAutocompletePage\(/, 'Mi does not override pi Editor PageUp/PageDown behavior for slash autocomplete');
 assert.match(cli, /function splitTerminalInput\(data: string\)[\s\S]*\\x1b\\\[5\(\?:;\\d\+\)\?~[\s\S]*\\x1b\\\[6\(\?:;\\d\+\)\?~/, 'Mi splits combined terminal key chunks before dispatch');
-assert.match(cli, /const keyParts = splitTerminalInput\(data\);[\s\S]*for \(const keyPart of keyParts\) onData\(keyPart\)/, 'mi-agents dispatches combined PageUp/PageDown chunks one key at a time');
+assert.match(cli, /const keyParts = splitTerminalInput\(data\);[\s\S]*for \(const keyPart of keyParts\) onData\(keyPart\)/, 'mi agents dispatches combined PageUp/PageDown chunks one key at a time');
 assert.match(cli, /isPageUpKey\(data\) \|\| isPageDownKey\(data\)[\s\S]*handleAgentEditorInput\(data\)/, 'agent view routes PageUp/PageDown to the pi Editor like pi');
 assert.match(cli, /isPageUpKey\(data\) \|\| isPageDownKey\(data\) \|\| isUpKey\(data\) \|\| isDownKey\(data\)[\s\S]*inputEditor\.handleInput\(data\)/, 'main Mi routes navigation keys to the pi Editor like pi');
 assert.doesNotMatch(cli, /function slashCommandSuggestionLines|function slashFuzzyScore|let slashSelected|function moveSlashSelection|autocompleteSlashCommand/, 'Mi no longer hand-renders slash autocomplete');
@@ -121,7 +121,7 @@ assert.match(cli, /setTimeout\(\(\) => void refresh\(\), 250\)/, 'agent reply re
 assert.match(cli, /const nextSelected = tasks\.findIndex[\s\S]*if \(nextSelected >= 0\) selected = nextSelected/, 'agent refresh keeps selected task selected when it moves sections');
 assert.doesNotMatch(cli, /Replying to \$\{taskName\(task\)\} with/, 'agent replies do not replace the help/status line with a verbose sending message');
 assert.match(cli, /type: 'run_worker'[\s\S]*model: turn\.model/, 'agent view sends selected model with new tasks');
-assert.match(cli, /if \(command === 'agents'\) return miAgentsCommand\(\)/, 'cli routes mi agents startup command to mi-agents code');
+assert.match(cli, /if \(command === 'agents'\) return miAgentsCommand\(\)/, 'cli routes mi agents startup command to mi agents code');
 assert.match(cli, /if \(command === 'task'\) return taskCommand\(args\)/, 'cli routes mi task');
 assert.match(cli, /async function detectApprovalCommand\(args: string\[\]\)/, 'cli defines detect approval review command');
 assert.match(cli, /mi detect-approval \[next\|approve <id>\|reject <id>\]/, 'help documents detect approval command');
@@ -205,7 +205,7 @@ assert.match(cli, /class FunctionScreen implements Component, Focusable[\s\S]*ha
 assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, onData\), \{ clearScreen: false \}\)/, 'main Mi TUI is rendered by pi-tui instead of hand-written stdout redraws');
 assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, onData\), \{ clearScreen: false \}\)/, 'main Mi TUI avoids alternate screen so tmux scrollback works');
 assert.match(cli, /leave conversation history in normal terminal scrollback/, 'main Mi TUI documents why it avoids alternate screen');
-assert.match(cli, /if \(options\.alternateScreen\) process\.stdout\.write\('\\x1b\[\?1049l'\)/, 'alternate-screen mi-agents restores the normal screen on cleanup');
+assert.match(cli, /if \(options\.alternateScreen\) process\.stdout\.write\('\\x1b\[\?1049l'\)/, 'alternate-screen mi agents restores the normal screen on cleanup');
 assert.match(cli, /function shouldStartBackgroundWorkerFromMi\(text: string\)[\s\S]*does\(\?:n't\| not\) work[\s\S]*broken[\s\S]*bug[\s\S]*issue/, 'main Mi detects actionable bug/work requests for background workers');
 assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string\)[\s\S]*type: 'run_worker'[\s\S]*background: true/, 'main Mi can start a background worker directly');
 assert.match(cli, /shouldStartBackgroundWorkerFromMi\(text\)[\s\S]*await startBackgroundWorkerFromMi\(text\)[\s\S]*await sendToMiMain\(await buildMiTurnPrompt\(text\)\)/, 'main Mi routes actionable work to a background worker and chatty messages to Mi main');
@@ -230,7 +230,7 @@ assert.match(daemon, /command\(\{ type: "set_session_name", name: "mi-main" \}\)
 assert.match(daemon, /const LOCK_PATH = join\(RUNTIME_DIR, "mi-daemon\.lock"\)/, 'daemon has a singleton lock to prevent multiple writers/glitchy renders');
 assert.match(daemon, /async function acquireDaemonLock\(\)[\s\S]*socketHealth\(2000\)[\s\S]*singleton exit/, 'daemon exits when another healthy daemon owns the socket');
 assert.match(daemon, /removing unhealthy daemon lock[\s\S]*process\.kill\(Number\(lockOwner\), "SIGTERM"\)/, 'daemon recovers when a lock-owning process exists but the socket is unhealthy');
-assert.match(daemon, /file\.startsWith\(SESSION_DIR\) \|\| file\.includes\("\/sessions\/mi-main\/"\)/, 'daemon excludes mi-chat/mi-main sessions from mi-agents');
+assert.match(daemon, /file\.startsWith\(SESSION_DIR\) \|\| file\.includes\("\/sessions\/mi-main\/"\)/, 'daemon excludes mi-chat/mi-main sessions from mi agents');
 assert.match(daemon, /starts lazily on prompt\/state\/model requests/, 'daemon does not eagerly spawn Mi main pi on startup');
 assert.match(daemon, /const MI_MAIN_IDLE_MS = Number\(process\.env\.MI_MAIN_IDLE_MS \|\| 15000\)/, 'daemon stops idle Mi main pi quickly');
 assert.match(daemon, /function scheduleStopPi\(\)[\s\S]*stopping idle Mi main pi/, 'daemon has idle shutdown for Mi main pi');
@@ -250,8 +250,8 @@ assert.match(daemon, /if \(request\.type === "resume_sessions"\)/, 'daemon still
 assert.match(daemon, /const storedTasks = reconciledRawTasks\.filter\(\(task\) => !isTaskDismissed\(task, dismissed\)/, 'daemon lists stored tasks after dismissed filtering');
 assert.match(daemon, /const staleBusySession = \["running", "active", "queued", "thinking", "thinkingqueued"\]\.includes\(activeStatus\) && !liveTrackedWorker/, 'daemon detects stale busy pi sessions without live workers');
 assert.match(daemon, /status: terminalTask && staleBusySession \? task\.status : \(activeSession\.status \|\| task\.status\)/, 'daemon preserves terminal stored task state when matching a stale busy pi session');
-assert.match(daemon, /for \(const session of visibleSessions\)[\s\S]*!merged\.some\(\(task\) => sameLogicalTask\(task, session\)\)[\s\S]*merged\.push\(session\)/, 'daemon automatically shows visible external pi sessions in mi-agents');
-assert.match(daemon, /Anything that appears in mi agents should stay there until Kyle clears it\.[\s\S]*await writeTasks\(mergedTasks\)/, 'daemon persists the mi-agents merged view so tasks do not disappear unless cleared');
+assert.match(daemon, /for \(const session of visibleSessions\)[\s\S]*!merged\.some\(\(task\) => sameLogicalTask\(task, session\)\)[\s\S]*merged\.push\(session\)/, 'daemon automatically shows visible external pi sessions in mi agents');
+assert.match(daemon, /Anything that appears in mi agents should stay there until Kyle clears it\.[\s\S]*await writeTasks\(mergedTasks\)/, 'daemon persists the mi agents merged view so tasks do not disappear unless cleared');
 assert.match(daemon, /function samePiSessionTask\(a, b\)/, 'daemon matches open pi sessions back to stored tasks');
 assert.match(daemon, /function sessionFingerprint\(task\)[\s\S]*match\(\/\(\[0-9a-f\]/, 'daemon dedupes session tasks by UUID parsed from session filenames');
 assert.match(cli, /function sessionFingerprint\(task: MiTask\)[\s\S]*taskIdentityKeys/, 'mi agents UI dedupes rows by parsed session UUID');
@@ -262,7 +262,7 @@ assert.match(daemon, /const task = await upsertTask\(session\)/, 'adding from re
 assert.match(daemon, /function reconcileStoredTask\(task\)/, 'daemon reconciles stale running task state after restart');
 assert.match(daemon, /Date\.now\(\) - lastActiveAt < 120000[\s\S]*return task/, 'daemon keeps recently replied tasks running while worker bookkeeping catches up');
 assert.match(daemon, /status: "inactive"[\s\S]*worker is no longer running/, 'daemon marks old tasks inactive when their worker process is gone');
-assert.match(daemon, /const PI_SESSION_SCAN_CACHE_MS = Number\(process\.env\.MI_PI_SESSION_SCAN_CACHE_MS \|\| 5000\)/, 'daemon refreshes active pi session scan at mi-agents polling cadence by default');
+assert.match(daemon, /const PI_SESSION_SCAN_CACHE_MS = Number\(process\.env\.MI_PI_SESSION_SCAN_CACHE_MS \|\| 5000\)/, 'daemon refreshes active pi session scan at mi agents polling cadence by default');
 assert.doesNotMatch(daemon, /const RECENT_PI_SESSION_ACTIVE_MS = Number\(process\.env\.MI_RECENT_PI_SESSION_ACTIVE_MS \|\| 2 \* 60_000\)/, 'daemon no longer drops pi-session tasks after a recent-session window');
 assert.match(daemon, /function assistantMessageHasText\(message\)[\s\S]*Boolean\(textFromMessage\(message\)\)/, 'daemon can tell final assistant text apart from thinking/tool activity');
 assert.match(daemon, /function assistantMessageIsBusy\(message\)[\s\S]*toolCall[\s\S]*assistantMessageHasText\(message\)[\s\S]*return false[\s\S]*thinking/, 'daemon treats thinking-plus-final-text assistant messages as complete, not busy');

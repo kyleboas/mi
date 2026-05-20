@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 
-const root = await mkdtemp(join(tmpdir(), 'mi-agents-e2e-'));
+const root = await mkdtemp(join(tmpdir(), 'mi agents-e2e-'));
 const socketPath = join(root, 'mi.sock');
 const piLog = join(root, 'pi.log');
 const requestLog = join(root, 'requests.log');
@@ -144,7 +144,7 @@ function runAgentsAndSend(input, done) {
   });
 }
 
-// /resume is a mi-agents command: it opens a session picker, then Enter adds the selected pi session as a task without opening pi.
+// /resume is a mi agents command: it opens a session picker, then Enter adds the selected pi session as a task without opening pi.
 await runAgentsAndSend('/resume\n\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('resume_session'));
 let piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
 assert.equal(piCalls.length, 0, '/resume should not spawn pi');
@@ -157,7 +157,7 @@ await runAgentsAndSend('/model\n', async () => (await readFile(piLog, 'utf8').ca
 piCalls = (await readFile(piLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 assert.deepEqual(piCalls.at(-1), ['--session', sessionFile, '/model']);
 
-// /new is intentionally a mi-agents command and must not be delegated to pi.
+// /new is intentionally a mi agents command and must not be delegated to pi.
 await writeFile(piLog, '');
 await runAgentsAndSend('/new verify background task\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('run_worker'));
 piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);

@@ -71,70 +71,28 @@ When something breaks, collect context, start one worker if appropriate, and rep
 
 `mi` opens the main Mi conversation in pi. The durable Mi thread is stored locally in `state/threads/main.jsonl`, so background jobs can append messages while no terminal is open and the next `mi` run can show them through the pi extension.
 
-Conversation and worker commands:
+Primary commands:
 
 ```bash
-npm run mi --                         # open Mi main in pi
-npm run mi -- agents                  # open the live mi-agents background worker view
-npm run mi -- raw                     # open the minimal fallback conversation
-npm run mi -- --once "message"        # send one message to main and exit
-npm run mi -- inbox                   # show main + temporary conversations
-npm run mi -- temp "React RSC review" # create/open a focused temporary conversation
-npm run mi -- chat temp-react-rsc-review # reopen an existing temporary conversation
-npm run mi -- compact main            # summarize/archive old read messages
-npm run mi -- upload                  # create a temporary one-time image upload link
-npm run mi -- task "fix checkout" -- "inspect the checkout failure and open a PR"
-npm run mi -- task reply "fix checkout" -- "also add a regression test"
-npm run mi -- task list               # list background worker tasks
+mi          # open Mi chat
+mi agents   # open the live background-agent view
 ```
 
-Assistant file commands:
+From this repo before install, use `npm run mi --` and `npm run mi -- agents`.
 
-```bash
-npm run mi -- make "Create an inbox assistant" --name inbox
-npm run mi -- run inbox
-npm run mi -- edit inbox "Also ignore newsletters"
-npm run mi -- check inbox
-npm run mi -- logs inbox
-```
+## mi agents
 
-When installed as a package, the binary is `mi`:
-
-```bash
-mi
-mi raw
-mi --once "message"
-mi inbox
-mi temp "React RSC review"
-mi chat temp-react-rsc-review
-mi compact main
-mi upload                             # create a temporary one-time image upload link
-mi agents                             # live background worker view
-mi task "fix checkout" -- "inspect the checkout failure and open a PR"
-mi task reply "fix checkout" -- "also add a regression test"
-mi task list
-mi make "Create an inbox assistant" --name inbox
-mi run inbox
-mi edit inbox "Also ignore newsletters"
-mi check inbox
-mi logs inbox
-```
-
-## Background workers and mi-agents
-
-`mi task <name> -- <prompt>` starts a background pi worker through RPC and records it in Mi task state. Prompts are sent as written by default; start the prompt with `/goal` when you want pi's explicit standing-goal behavior. `mi task reply <task-id-or-name> -- <message>` continues the same worker/session. If the worker is still active, Mi queues the reply as a steer; otherwise it resumes the saved pi session.
-
-`mi agents` opens the live worker view. It uses pi-tui rendering without the alternate screen so tmux scrollback remains available, dedupes rows by pi session identity, and keeps visible tasks until they are cleared. Useful keys/commands:
+`mi agents` opens the live worker view. It uses pi-tui rendering in the alternate screen so stale scrollback rows cannot look like duplicate tasks, resets stale mouse tracking so tmux wheel behavior recovers after exit, dedupes rows by pi session identity, and keeps visible tasks until they are cleared. Useful in-view commands:
 
 - `/new <prompt>` starts a new background task from the view.
 - Enter on normal text replies to the selected task; `/goal ...` is forwarded as task prompt text.
 - `/resume` opens a picker for recent/default pi sessions so they can be added to the task list.
 - `/model` opens a pi-style model picker; Shift+Tab cycles thinking level.
 - `^L` toggles full-output mode; arrows/PageUp/PageDown scroll that output.
-- `m` toggles multi-select clear mode; Esc clears selected rows or exits input modes.
+- `^M` toggles multi-select clear mode; Esc clears selected rows or exits input modes.
 - `/mi <question>` asks Mi main about the selected task context without steering the worker.
 
-Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged mi-agents view so tasks do not disappear unless cleared. The daemon ignores known noisy tacticsjournal research-pipeline pi sessions.
+Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged mi agents view so tasks do not disappear unless cleared. The daemon ignores known noisy tacticsjournal research-pipeline pi sessions.
 
 ## Pi integration
 

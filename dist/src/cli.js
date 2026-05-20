@@ -45,7 +45,7 @@ Usage:
   mi compact [thread]             Compact old read messages in a thread
   mi upload                       Create a temporary one-time image upload link
   mi detect-approval [next|approve <id>|reject <id>]  Review pending detect trends
-  mi agents                       Open mi-agents live background agent view
+  mi agents                       Open mi agents live background agent view
   mi task <name> [--cwd <path>] -- <task prompt>
   mi task reply <task-id-or-name> -- <follow-up prompt>
   mi task list                    List background agent tasks
@@ -1158,7 +1158,7 @@ async function miAgentsCommand() {
             ? (taskFinalOutput(task) || taskDisplayText(task) || task.progress || 'No result yet.')
             : '';
         if (fullLastOutput && task) {
-            lines.push(fgAccent(truncateText('mi-agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi-agents')))));
+            lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
             lines.push(fgThinking(undefined, '─'.repeat(width)));
             const outputHeight = Math.max(1, height - lines.length);
             const outputLines = renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
@@ -1170,7 +1170,7 @@ async function miAgentsCommand() {
                 lines.push('');
             return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
         }
-        lines.push(fgAccent(truncateText('mi-agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi-agents')))));
+        lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
         lines.push(fgThinking(undefined, '─'.repeat(width)));
         if (resumeMode) {
             lines.push(fgDim(truncateText('resume pi sessions', width)));

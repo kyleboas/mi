@@ -73,49 +73,32 @@ When something breaks, collect the smallest useful context, start one worker if 
 Never merge, deploy, edit secrets, or change DNS.
 ```
 
-## V0 commands
+## User-facing commands
+
+Keep the public Mi surface small:
 
 ```bash
-mi make "<assistant description>"
-mi run <assistant>
-mi edit <assistant> "<change>"
-mi check <assistant>
-mi logs <assistant>
+mi          # open Mi chat
+mi agents   # open the live background-agent view
 ```
 
-From this repo before install, use `npm run mi -- ...`.
+From this repo before install, use `npm run mi --` and `npm run mi -- agents`.
 
-Mi chat UI slash commands are reserved for useful in-context actions. `/inbox` is intentionally hidden there because Mi already opens on the durable main inbox and temporary threads are legacy/troubleshooting state; use `/tasks` for actionable background worker status or `mi inbox`/`mi threads` from a shell when inspecting thread files.
+Other lower-level/debug commands may exist in the CLI, but docs and user flows should point to `mi` for chat and `mi agents` for background work.
 
-## Background pi workers
+## mi agents live view
 
-Mi can launch and continue separate pi conversations as background workers:
-
-```bash
-mi agents
-mi task <name> [--cwd <path>] -- <task prompt>
-mi task reply <task-id-or-name> -- <follow-up prompt>
-mi task list
-```
-
-`mi task` runs pi in RPC mode from the requested cwd and stores worker sessions in the default pi session store (`~/.pi/agent/sessions`) so they remain visible in normal pi `/resume`. Prompts and follow-ups are sent as written by default. Use an explicit `/goal ...` prompt only when you want pi standing-goal behavior.
-
-For Mi background tasks, `mi task reply <task-id-or-name> -- <message>` uses the same steering semantics as pi's normal queued messages while a task is active: Mi queues the message into the active RPC worker with `streamingBehavior: "steer"`. This lets the current worker incorporate the queued steer instead of creating another worker on the same task. If no active worker is tracked, Mi falls back to resuming the saved task session.
-
-## mi-agents live view
-
-`mi agents` is the live terminal view for background workers and discovered pi sessions. It uses pi-tui's differential renderer without the alternate screen, so it avoids flicker while preserving tmux scrollback. The view dedupes rows by task/session identity, parses pi session UUIDs from session filenames, and persists visible tasks until Kyle clears them.
+`mi agents` is the live terminal view for background workers and discovered pi sessions. It uses pi-tui's differential renderer in the alternate screen so stale scrollback rows cannot look like duplicate tasks, resets stale mouse tracking so tmux wheel behavior recovers after exit, dedupes rows by task/session identity, parses pi session UUIDs from session filenames, and persists visible tasks until Kyle clears them.
 
 Key behavior:
 
 - Normal typed text replies to the selected task. New tasks are explicit via `/new <prompt>`.
-- `/goal ...` is treated as task prompt text, not as a local mi-agents slash command.
+- `/goal ...` is treated as task prompt text, not as a local mi agents slash command.
 - `/resume` opens a picker for recent/default pi sessions; selected sessions are persisted into the Mi task list.
 - `/model` opens a pi-style model picker for new tasks and replies; Shift+Tab cycles thinking level.
 - `^L` opens full-output mode for the selected task. Arrow keys and PageUp/PageDown scroll the output; `^L` exits it.
-- `m` toggles multi-select clear mode. Enter/Space toggles a row; Esc clears selected rows.
+- `^M` toggles multi-select clear mode. Enter/Space toggles a row; Esc clears selected rows.
 - `/mi <question>` asks Mi main about the selected task context and stays in that side-chat until Ctrl-C.
-- `/upload` creates a short-lived image upload link.
 
 Daemon behavior:
 
