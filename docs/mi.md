@@ -88,7 +88,7 @@ Other lower-level/debug commands may exist in the CLI, but docs and user flows s
 
 ## mi agents live view
 
-`mi agents` is the live terminal view for background workers and discovered pi sessions. It uses pi-tui's differential renderer in the alternate screen so stale scrollback rows cannot look like duplicate tasks, resets stale mouse tracking so tmux wheel behavior recovers after exit, dedupes rows by task/session identity, parses pi session UUIDs from session filenames, and persists visible tasks until Kyle clears them.
+`mi agents` is the live terminal view for background workers and discovered pi sessions. It uses pi-tui's differential renderer in the alternate screen so stale scrollback rows cannot look like duplicate tasks, resets stale mouse tracking so tmux wheel behavior recovers after exit, dedupes rows by task/session identity, parses pi session UUIDs from session filenames, and persists visible tasks until the user clears them.
 
 Key behavior:
 

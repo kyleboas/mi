@@ -27,8 +27,8 @@ assertMatches(/unread: true[\s\S]*source: "mi-task"/, 'Task messages must be unr
 if (/appendMainThreadMessage\(`\$\{kind\}: \$\{name\}/.test(source) || /deliverTaskMessage\(`Mi task complete:/.test(source)) {
   throw new Error('Background task completions must stay in task state/resume, not be posted into the main Mi thread.');
 }
-assertMatches(/done\.then\([\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task errors must be surfaced to Kyle immediately after being recorded.');
-assertMatches(/continueWorker[\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task follow-up errors must be surfaced to Kyle immediately after being recorded.');
+assertMatches(/done\.then\([\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task errors must be surfaced to the user immediately after being recorded.');
+assertMatches(/continueWorker[\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task follow-up errors must be surfaced to the user immediately after being recorded.');
 assertIncludes('safeNotificationText', 'Task notifications must sanitize obvious secrets before push delivery.');
 assertCliIncludes("const payload = { type: 'run_worker', name, cwd, message, background: true };", 'New Mi task workers must use the raw task name as the session name so /resume shows only <task>.');
 assertCliNotIncludes("name: `Mi task: ${name}`", 'New Mi task workers must not prefix session names with "Mi task:".');

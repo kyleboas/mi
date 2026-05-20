@@ -1,6 +1,6 @@
 # Mi Rules
 
-Mi is a private, lightweight assistant harness for Kyle: assistants are Markdown files plus triggers, tools, permissions, and workers.
+Mi is a private, lightweight assistant harness for the configured user: assistants are Markdown files plus triggers, tools, permissions, and workers.
 
 Architecture policy:
 - Assistant Builder creates, edits, and explains `assistants/*.md` files as reviewable file changes.

@@ -11,17 +11,34 @@ import { Key, matchesKey, truncateToWidth, type Component, type Focusable, type 
 import { execFile, spawn } from "node:child_process";
 import net from "node:net";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
-const MI_ROOT = process.env.MI_ROOT || "/home/kyle/assistant";
+const HOME = homedir();
+const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const INDEX_PATH = join(THREADS_DIR, "index.json");
 const MAIN_THREAD_ID = "main";
-const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || "/home/kyle/.pi/agent/mi";
+const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, ".pi", "agent", "mi");
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, "main.sock");
-const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || "/home/kyle/.pi/agent/extensions/mi-daemon.mjs";
+const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, ".pi", "agent", "extensions", "mi-daemon.mjs");
+const MI_TASKS_DIR = join(HOME, "mi");
+const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, "preferences.md");
+const PI_SESSION_DIR = join(HOME, ".pi", "agent", "sessions");
 const MI_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function miUserName() {
+	const envName = process.env.MI_USER_NAME?.trim();
+	if (envName) return envName;
+	try {
+		const preferences = readFileSync(MI_PREFERENCES_PATH, "utf8");
+		const match = preferences.match(/^\s*-\s*(?:User(?:'s)?(?: display)? name|Name):\s*(.+?)\s*$/im);
+		const name = match?.[1]?.trim().replace(/[.。]+$/, "");
+		if (name) return name;
+	} catch {}
+	return "the user";
+}
 
 type ThreadRole = "user" | "assistant" | "system";
 
@@ -525,7 +542,9 @@ export default function miExtension(pi: ExtensionAPI) {
 		pi.on("before_agent_start", async (event) => ({
 			systemPrompt:
 				event.systemPrompt +
-				"\n\nMi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under `/home/kyle/mi/` (for example `/home/kyle/mi/TODO.md`, `/home/kyle/mi/goals.md`, or task-specific `.md` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send `prompt` commands, queue `steer`/`follow_up`, inspect `get_state`/`get_messages`, `abort` if needed, and `new_session` for fresh threads. Keep worker conversations visible in normal `/resume` by using the default pi session store: run `pi --mode rpc` from the relevant project cwd, or explicitly `pi --mode rpc --session-dir /home/kyle/.pi/agent/sessions`. Do not create worker sessions under nested custom session dirs like `/home/kyle/.pi/agent/sessions/mi-workers/...` unless the user asks for hidden/isolated sessions. Set helpful session names with `set_session_name` so they are easy to find in `/resume`. If useful, write small Node/shell supervisor scripts under /home/kyle/.pi/agent/mi/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available. When Kyle asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring manual cron syntax. Mi crons live in `/home/kyle/mi/state/crons.json` and are managed with `mi cron add <name> --every 1h [--cwd <path>] -- <command>`, `mi cron list`, `mi cron tick`, and `mi cron remove <name>`. Ask only for missing repo/path, cadence, health command, and alert behavior. When Kyle gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with `mi task <name> [--cwd <path>] -- <task prompt>`. Name it clearly. Mi task sends the prompt as written by default; Kyle may still start a task prompt with `/goal` when he wants explicit standing-goal behavior. This command returns after the worker starts; do not wait for the task to finish before replying to Kyle. Worker sessions use `/home/kyle/.pi/agent/sessions` so Kyle can see them in `/resume`. Use `mi task list` to inspect background task status. When Kyle responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: `mi task reply <task-id-or-name> -- <follow-up prompt>`. Follow-ups are sent as written too; if Kyle starts the follow-up with `/goal`, it is forwarded as a pi slash command. Escalate to Kyle when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs Kyle review/merge.",
+				`
+
+Mi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under \`${MI_TASKS_DIR}/\` (for example \`${join(MI_TASKS_DIR, "TODO.md")}\`, \`${join(MI_TASKS_DIR, "goals.md")}\`, or task-specific \`.md\` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send \`prompt\` commands, queue \`steer\`/\`follow_up\`, inspect \`get_state\`/\`get_messages\`, \`abort\` if needed, and \`new_session\` for fresh threads. Keep worker conversations visible in normal \`/resume\` by using the default pi session store: run \`pi --mode rpc\` from the relevant project cwd, or explicitly \`pi --mode rpc --session-dir ${PI_SESSION_DIR}\`. Do not create worker sessions under nested custom session dirs like \`${join(PI_SESSION_DIR, "mi-workers")}\` unless the user asks for hidden/isolated sessions. Set helpful session names with \`set_session_name\` so they are easy to find in \`/resume\`. If useful, write small Node/shell supervisor scripts under ${MI_RUNTIME_DIR}/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available. When ${miUserName()} asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring manual cron syntax. Mi crons live in \`${join(MI_TASKS_DIR, "state", "crons.json")}\` and are managed with \`mi cron add <name> --every 1h [--cwd <path>] -- <command>\`, \`mi cron list\`, \`mi cron tick\`, and \`mi cron remove <name>\`. Ask only for missing repo/path, cadence, health command, and alert behavior. When ${miUserName()} gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with \`mi task <name> [--cwd <path>] -- <task prompt>\`. Name it clearly. Mi task sends the prompt as written by default; ${miUserName()} may still start a task prompt with \`/goal\` when explicit standing-goal behavior is wanted. This command returns after the worker starts; do not wait for the task to finish before replying. Worker sessions use ${PI_SESSION_DIR} so they are visible in \`/resume\`. Use \`mi task list\` to inspect background task status. When ${miUserName()} responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: \`mi task reply <task-id-or-name> -- <follow-up prompt>\`. Follow-ups are sent as written too; if ${miUserName()} starts the follow-up with \`/goal\`, it is forwarded as a pi slash command. Escalate to ${miUserName()} when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs ${miUserName()} review/merge.`,
 		}));
 
 		// Socket/UI clients own thread persistence. Do not mirror raw Mi-main
