@@ -804,7 +804,7 @@ async function miAgentsCommand() {
       optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic) || taskName(task) === taskName(optimistic)));
       tasks = dedupeTasksByStableKey([...optimisticTasks, ...listedTasks]).map((task) => {
         const key = stableTaskKey(task);
-        const terminal = ['complete', 'error', 'stopped'].includes(String(task.status || '').toLowerCase());
+        const terminal = ['complete', 'error', 'stopped', 'paused'].includes(String(task.status || '').toLowerCase());
         const pendingStartedAt = pendingTaskUpdateStartedAt.get(key) || 0;
         const terminalAt = Date.parse(task.finishedAt || task.updatedAt || '') || 0;
         if (terminal && (!pendingStartedAt || terminalAt > pendingStartedAt)) {
@@ -1565,6 +1565,11 @@ async function miAgentsCommand() {
           task.progress = 'stopped by Escape; needs Kyle input';
           task.updatedAt = new Date().toISOString();
           status = `Stopped ${taskName(task)}; moved to needs input`;
+          const taskKey = stableTaskKey(task);
+          if (taskKey) {
+            pendingTaskUpdates.set(taskKey, { status: 'paused', needsKyle: true, needsKyleReason: 'stopped by Escape', finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: task.updatedAt });
+            pendingTaskUpdateStartedAt.delete(taskKey);
+          }
           clampTaskSelection();
           void stopTaskInList(task).then(() => refresh()).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
         } else {
