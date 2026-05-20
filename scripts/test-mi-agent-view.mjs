@@ -114,11 +114,11 @@ assert.match(cli, /tasks = dedupeTasksByStableKey\(\[\.\.\.optimisticTasks, \.\.
 assert.match(cli, /function normalizeVisibleTasks\(\)[\s\S]*dedupeTasksByStableKey\(tasks\)[\s\S]*function renderAgentLines[\s\S]*normalizeVisibleTasks\(\)/, 'agent render also dedupes in-memory rows before drawing so selection cannot multiply pi sessions');
 assert.match(cli, /const update = pendingTaskUpdates\.get\(key\)/, 'refresh overlays pending updates so reply UI does not flicker stale state');
 assert.match(cli, /inputMode === 'normal' && value[\s\S]*replyTarget = task;[\s\S]*inputMode = 'reply';/, 'normal submitted text falls back to replying to the selected task');
-assert.match(cli, /const runningUpdate: Partial<MiTask> = \{ status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined[\s\S]*updatedAt: new Date\(\)\.toISOString\(\) \}/, 'agent replies immediately move completed or needs-input tasks back to working');
+assert.match(cli, /const immediateRunningUpdate: Partial<MiTask> = \{ status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined[\s\S]*progress: value[\s\S]*requestRender\(\);[\s\S]*const turn = await applyAgentPiCycle\(value\)/, 'agent replies move completed or needs-input tasks to working before pi-cycle/model work');
 assert.match(cli, /pendingTaskUpdates\.set\(taskKey, runningUpdate\)[\s\S]*void sendTaskSocketRequest\(\{ type: 'continue_worker'[\s\S]*model: turn\.model/, 'agent replies immediately mark the task working and send in the background');
 assert.match(cli, /pendingTaskUpdateStartedAt = new Map<string, number>\(\)/, 'agent view remembers when a reply began');
 assert.match(cli, /text: undefined, error: undefined[\s\S]*continuedAt: new Date\(\)\.toISOString\(\)/, 'agent reply clears completed fields and immediately makes task working');
-assert.match(cli, /pendingTaskUpdateStartedAt\.set\(taskKey, Date\.now\(\)\)/, 'agent reply pins working overlay while the daemon accepts the reply');
+assert.match(cli, /const startedAt = Date\.now\(\)[\s\S]*pendingTaskUpdateStartedAt\.set\(taskKey, startedAt\)/, 'agent reply pins working overlay while the daemon accepts the reply');
 assert.match(cli, /if \(terminal\) \{[\s\S]*pendingTaskUpdates\.delete\(key\)/, 'terminal daemon state always clears pending working overlays');
 assert.match(cli, /\.then\(async \(\) => \{[\s\S]*pendingTaskUpdates\.delete\(taskKey\)[\s\S]*await refresh\(\)/, 'daemon ack clears local pending working overlay before refresh');
 assert.match(cli, /setTimeout\(\(\) => void refresh\(\), 250\)/, 'agent reply refreshes after daemon ack and again shortly after');

@@ -1060,6 +1060,11 @@ async function miAgentsCommand() {
             await openResumeMenu();
             return true;
         }
+        if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(value))) {
+            status = `${slashCommandName(value)} is a Pi app command; open Pi directly to use it.`;
+            requestRender();
+            return true;
+        }
         await runSlashCommandInPi(value);
         return true;
     }
@@ -1432,18 +1437,24 @@ async function miAgentsCommand() {
             if (!task || !value)
                 return;
             const taskId = task.id || task.sessionFile || task.sessionName || task.name;
-            const turn = await applyAgentPiCycle(value);
-            if (!turn.body)
-                return;
             const taskKey = stableTaskKey(task);
-            const runningUpdate = { status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: turn.body, lastInput: turn.body, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-            Object.assign(task, runningUpdate);
+            const startedAt = Date.now();
+            const immediateRunningUpdate = { status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: value, lastInput: value, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+            Object.assign(task, immediateRunningUpdate);
             if (taskKey) {
-                pendingTaskUpdates.set(taskKey, runningUpdate);
-                pendingTaskUpdateStartedAt.set(taskKey, Date.now());
+                pendingTaskUpdates.set(taskKey, immediateRunningUpdate);
+                pendingTaskUpdateStartedAt.set(taskKey, startedAt);
             }
             status = `Sent follow-up to ${taskName(task)}`;
             agentSubmitting = true;
+            requestRender();
+            const turn = await applyAgentPiCycle(value);
+            if (!turn.body)
+                return;
+            const runningUpdate = { ...immediateRunningUpdate, progress: turn.body, lastInput: turn.body, updatedAt: new Date().toISOString() };
+            Object.assign(task, runningUpdate);
+            if (taskKey)
+                pendingTaskUpdates.set(taskKey, runningUpdate);
             requestRender();
             void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
                 .then(async () => {
@@ -2092,7 +2103,7 @@ function renderPiLastOutputMessage(text, width) {
 function renderMiTranscriptItem(item, width) {
     return item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiAssistantMessage(item.text, width);
 }
-const PI_SLASH_COMMANDS = ['/settings', '/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/changelog', '/hotkeys', '/fork', '/clone', '/tree', '/login', '/logout', '/new', '/compact', '/resume', '/reload', '/quit', '/mi', '/upload'];
+const PI_SLASH_COMMANDS = ['/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/quit', '/mi', '/upload'];
 const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/settings': 'Open settings menu',
     '/model': 'Select Mi model',
@@ -2147,6 +2158,7 @@ async function getModelAutocompleteItems(argumentPrefix) {
     }));
 }
 const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/upload', '/resume', '/model', '/models', '/scoped-models']);
+const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 function slashCommandName(value) {
     return value.match(/^\/\S+/)?.[0] || '';
 }
@@ -2440,7 +2452,7 @@ async function miTuiCommand(initial = '') {
     let inputLine = '';
     const editorTui = { terminal: { rows: process.stdout.rows || 24 }, requestRender() { requestRender(); } };
     const inputEditor = new Editor(editorTui, piEditorTheme(miThinkingLevel));
-    inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/settings', '/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/changelog', '/hotkeys', '/fork', '/clone', '/tree', '/login', '/logout', '/compact', '/reload', '/quit', '/upload']));
+    inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/compact', '/quit', '/upload']));
     inputEditor.focused = true;
     inputEditor.onChange = (text) => { inputLine = text; };
     let pending = false;
@@ -2841,6 +2853,11 @@ async function miTuiCommand(initial = '') {
             return;
         }
         if (text.startsWith('/') && !isMiLocalSlashCommand(text)) {
+            if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(text))) {
+                statusMessage = `${slashCommandName(text)} is a Pi app command; open Pi directly to use it.`;
+                requestRender();
+                return;
+            }
             void openPiFromMi(text).catch((error) => {
                 statusMessage = error instanceof Error ? error.message : String(error);
                 requestRender();

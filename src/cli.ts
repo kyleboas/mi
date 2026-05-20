@@ -1414,17 +1414,22 @@ async function miAgentsCommand() {
       inputMode = 'normal';
       if (!task || !value) return;
       const taskId = task.id || task.sessionFile || task.sessionName || task.name;
-      const turn = await applyAgentPiCycle(value);
-      if (!turn.body) return;
       const taskKey = stableTaskKey(task);
-      const runningUpdate: Partial<MiTask> = { status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: turn.body, lastInput: turn.body, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-      Object.assign(task, runningUpdate);
+      const startedAt = Date.now();
+      const immediateRunningUpdate: Partial<MiTask> = { status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: value, lastInput: value, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      Object.assign(task, immediateRunningUpdate);
       if (taskKey) {
-        pendingTaskUpdates.set(taskKey, runningUpdate);
-        pendingTaskUpdateStartedAt.set(taskKey, Date.now());
+        pendingTaskUpdates.set(taskKey, immediateRunningUpdate);
+        pendingTaskUpdateStartedAt.set(taskKey, startedAt);
       }
       status = `Sent follow-up to ${taskName(task)}`;
       agentSubmitting = true;
+      requestRender();
+      const turn = await applyAgentPiCycle(value);
+      if (!turn.body) return;
+      const runningUpdate: Partial<MiTask> = { ...immediateRunningUpdate, progress: turn.body, lastInput: turn.body, updatedAt: new Date().toISOString() };
+      Object.assign(task, runningUpdate);
+      if (taskKey) pendingTaskUpdates.set(taskKey, runningUpdate);
       requestRender();
       void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
         .then(async () => {
