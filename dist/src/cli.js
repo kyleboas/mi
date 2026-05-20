@@ -23,6 +23,7 @@ import { appendThreadMessage, compactThread, createTempThread, getThread, listTh
 initTheme(process.env.PI_THEME, false);
 const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 5000);
 const PI_LOADER_INTERVAL_MS = 80;
+const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
 // Match pi's loader animation cadence. Flicker is handled by pi-tui's
 // differential renderer rather than by slowing Mi's animation down.
 const MI_AGENT_ANIMATION_MS = Number(process.env.MI_AGENT_ANIMATION_MS || PI_LOADER_INTERVAL_MS);
@@ -724,7 +725,7 @@ async function miAgentsCommand() {
     let optimisticTasks = [];
     let selected = 0;
     let closed = false;
-    const defaultAgentStatus = '^L full output • m multi-select • Esc clear task';
+    const defaultAgentStatus = '^L full output • ^M multi-select • Esc clear task';
     let status = defaultAgentStatus;
     let inputMode = 'normal';
     let inputBuffer = '';
@@ -899,7 +900,7 @@ async function miAgentsCommand() {
         ].join('\n\n')));
     }
     function multiSelectStatus() {
-        return `${selectedTaskKeys.size} selected • Enter toggle • Esc clear selected • m exit multi-select`;
+        return `${selectedTaskKeys.size} selected • Enter toggle • Esc clear selected • ^M exit multi-select`;
     }
     function toggleSelectedTaskForBulkClear() {
         const task = selectedTask();
@@ -1066,7 +1067,7 @@ async function miAgentsCommand() {
         resumeSessions = await listResumeSessions();
         resumeSelected = 0;
         resumeLoading = false;
-        status = resumeSessions.length > 0 ? 'm multi-select • Enter add session as task • Esc cancel' : 'No pi sessions found';
+        status = resumeSessions.length > 0 ? '^M multi-select • Enter add session as task • Esc cancel' : 'No pi sessions found';
         requestRender();
         if (resumeEnterPending && resumeSessions.length > 0) {
             resumeEnterPending = false;
@@ -1103,7 +1104,7 @@ async function miAgentsCommand() {
             selectedResumeKeys.delete(key);
         else
             selectedResumeKeys.add(key);
-        status = `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • m exit multi-select`;
+        status = `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • ^M exit multi-select`;
         requestRender();
     }
     async function addSelectedResumeSessions() {
@@ -1158,6 +1159,7 @@ async function miAgentsCommand() {
             : '';
         if (fullLastOutput && task) {
             lines.push(fgAccent(truncateText('mi-agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi-agents')))));
+            lines.push(fgThinking(undefined, '─'.repeat(width)));
             const outputHeight = Math.max(1, height - lines.length);
             const outputLines = renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
             const maxScroll = Math.max(0, outputLines.length - outputHeight);
@@ -1507,7 +1509,7 @@ async function miAgentsCommand() {
             return;
         }
         if (resumeMode && !inputBuffer) {
-            const keys = data.match(/\x1b\[5(?:;\d+)?~|\x1b\[6(?:;\d+)?~|\x1b\[[AB]|\x1bO[AB]|\r|\n|\x03|\x1b|./gs) || [];
+            const keys = data.match(/\x1b\[5(?:;\d+)?~|\x1b\[6(?:;\d+)?~|\x1b\[\d+;\d+u|\x1b\[[AB]|\x1bO[AB]|\r|\n|\x03|\x1b|./gs) || [];
             for (const key of keys) {
                 if (!resumeMode)
                     break;
@@ -1517,14 +1519,14 @@ async function miAgentsCommand() {
                     else
                         resumeMode = false;
                     resumeMultiSelectMode = false;
-                    status = resumeMode ? 'm multi-select • Enter add session as task • Esc cancel' : defaultAgentStatus;
+                    status = resumeMode ? '^M multi-select • Enter add session as task • Esc cancel' : defaultAgentStatus;
                     requestRender();
                 }
-                else if (key === 'm') {
+                else if (isCtrlMShortcut(key)) {
                     resumeMultiSelectMode = !resumeMultiSelectMode;
                     if (!resumeMultiSelectMode)
                         selectedResumeKeys.clear();
-                    status = resumeMultiSelectMode ? `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • m exit multi-select` : 'm multi-select • Enter add session as task • Esc cancel';
+                    status = resumeMultiSelectMode ? `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • ^M exit multi-select` : '^M multi-select • Enter add session as task • Esc cancel';
                     requestRender();
                 }
                 else if (resumeMultiSelectMode && key === ' ') {
@@ -1607,7 +1609,7 @@ async function miAgentsCommand() {
         }
         if (data === 'o' && !inputBuffer)
             void openSelectedInPi().catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
-        else if (data === 'm' && !inputBuffer) {
+        else if (isCtrlMShortcut(data) && !inputBuffer) {
             multiSelectMode = !multiSelectMode;
             if (!multiSelectMode)
                 selectedTaskKeys.clear();
@@ -1636,10 +1638,9 @@ async function miAgentsCommand() {
         else
             handleAgentEditorInput(data);
     }
-    // Use pi-tui's differential renderer instead of hand-written full-screen
-    // stdout redraws. This keeps tmux scrollback (no alternate screen) while
-    // only repainting changed rows, which avoids mi-agents flicker.
-    tui = startPiTuiScreen(new FunctionScreen(renderAgentLines, onData), { clearScreen: false });
+    // Use the alternate screen so stale rows cannot remain in terminal scrollback
+    // and look like duplicate tasks after section/status changes.
+    tui = startPiTuiScreen(new FunctionScreen(renderAgentLines, onData), { alternateScreen: true });
     await refresh();
     pollTimer = setInterval(() => void refresh(), MI_TASK_POLL_MS);
     animationTimer = setInterval(() => {
@@ -2018,10 +2019,16 @@ function isUpKey(data) {
 function isDownKey(data) {
     return matchesKey(data, 'down') || data.includes('\x1b[B') || data.includes('\x1bOB') || data.includes('\x1b[1;2B');
 }
+function isCtrlMShortcut(data) {
+    // In legacy terminals Ctrl-M is indistinguishable from Enter (\r), so do not
+    // treat raw CR/LF as the shortcut. In CSI-u/modifyOtherKeys terminals, accept
+    // both the literal m codepoint and the legacy Ctrl-M/CR codepoint with Ctrl.
+    return data !== '\r' && data !== '\n' && (matchesKey(data, 'ctrl+m') || /^(?:\x1b\[13;5(?::1)?u|\x1b\[27;5;13~)$/.test(data));
+}
 function splitTerminalInput(data) {
     if (data.includes('\x1b[200~') || data.includes('\x1b[201~'))
         return [data];
-    return data.match(/\x1b\[5(?:;\d+)?~|\x1b\[6(?:;\d+)?~|\x1b\[1;2Z|\x1b\[Z|\x1b\t|\x1b\[[ABCD]|\x1bO[ABCD]|\r|\n|\x03|\x0c|\x1b|[^\x1b\r\n\x03\x0c]+/gs) || [];
+    return data.match(/\x1b\[5(?:;\d+)?~|\x1b\[6(?:;\d+)?~|\x1b\[\d+;\d+u|\x1b\[1;2Z|\x1b\[Z|\x1b\t|\x1b\[[ABCD]|\x1bO[ABCD]|\r|\n|\x03|\x0c|\x1b|[^\x1b\r\n\x03\x0c]+/gs) || [];
 }
 function renderPiEditor(editor, width) {
     const rawLines = editor.render(width);
@@ -2064,6 +2071,8 @@ function startPiTuiScreen(component, options = {}) {
             return;
         stopped = true;
         originalStop();
+        // Mi does not handle mouse input; keep it disabled so tmux mouse-wheel scrollback works.
+        process.stdout.write(DISABLE_MOUSE_TRACKING_SEQUENCE);
         if (options.alternateScreen)
             process.stdout.write('\x1b[?1049l');
     };
@@ -2073,6 +2082,8 @@ function startPiTuiScreen(component, options = {}) {
         process.stdout.write('\x1b[?1049h\x1b[2J\x1b[H');
     if (options.clearScreen !== false)
         terminal.clearScreen();
+    // Reset stale mouse tracking from prior full-screen apps before pi-tui starts.
+    process.stdout.write(DISABLE_MOUSE_TRACKING_SEQUENCE);
     tui.start();
     return tui;
 }
