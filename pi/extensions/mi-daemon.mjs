@@ -21,6 +21,7 @@ const PI_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const ACTIVE_SESSION_WINDOW_MS = Number(process.env.MI_ACTIVE_PI_SESSION_WINDOW_MS || 7 * 24 * 60 * 60_000);
 const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 5000);
 const MI_MAIN_IDLE_MS = Number(process.env.MI_MAIN_IDLE_MS || 15000);
+const MI_DAEMON_LOCK_START_GRACE_MS = Number(process.env.MI_DAEMON_LOCK_START_GRACE_MS || 5000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const THREAD_INDEX_PATH = join(THREADS_DIR, "index.json");
@@ -84,7 +85,7 @@ function socketHealth(timeoutMs = 500) {
 
 async function acquireDaemonLock() {
   await mkdir(dirname(SOCKET_PATH), { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 20; attempt++) {
     try {
       daemonLockHandle = await open(LOCK_PATH, "wx");
       await daemonLockHandle.writeFile(String(process.pid));
@@ -95,6 +96,13 @@ async function acquireDaemonLock() {
       if (await socketHealth(2000)) {
         await log(`singleton exit; daemon already healthy at ${SOCKET_PATH}`);
         return false;
+      }
+      const lockStats = await stat(LOCK_PATH).catch(() => undefined);
+      const lockAgeMs = lockStats ? Date.now() - lockStats.mtimeMs : Number.POSITIVE_INFINITY;
+      if (lockOwner && existsSync(`/proc/${lockOwner}`) && lockAgeMs < MI_DAEMON_LOCK_START_GRACE_MS) {
+        await log(`waiting for daemon lock ${LOCK_PATH} owned by starting pid ${lockOwner}`);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
       }
       if (lockOwner && existsSync(`/proc/${lockOwner}`)) {
         await log(`removing unhealthy daemon lock ${LOCK_PATH} owned by pid ${lockOwner}`);
@@ -277,6 +285,7 @@ async function readPiSessionTask(file, stats) {
   let sessionName = "";
   let activeGoal;
   let lastAssistant = "";
+  let lastInput = "";
   let lastTimestamp = stats.mtime.toISOString();
   let busy = false;
   const raw = await readSessionSample(file, stats);
@@ -296,6 +305,8 @@ async function readPiSessionTask(file, stats) {
       activeGoal = record.data.goal;
     } else if (record.type === "message" && record.message?.role === "user") {
       busy = true;
+      const text = normalizeLastInputText(textFromMessage(record.message));
+      if (text) lastInput = text.slice(0, 500);
     } else if (record.type === "message" && record.message?.role === "toolResult") {
       busy = true;
     } else if (record.type === "message" && record.message?.role === "assistant") {
@@ -304,8 +315,13 @@ async function readPiSessionTask(file, stats) {
       if (text) lastAssistant = text.slice(0, 500);
     }
   }
-  const name = sessionName || activeGoal?.objective?.split("\n")[0]?.slice(0, 80) || basename(cwd) || "Mi session";
-  const progress = activeGoal?.objective ? activeGoal.objective.split("\n")[0].slice(0, 500) : lastAssistant || "Recent Mi session";
+  const sessionTitle = sessionName && !isGenericTaskName(normalizedNameText(sessionName)) ? sessionName : "";
+  const goalTitle = activeGoal?.objective?.split("\n")[0]?.slice(0, 80) || "";
+  const inputTitle = taskNameFromText(lastInput);
+  const name = sessionTitle || goalTitle || inputTitle || basename(cwd) || "Mi session";
+  const progress = activeGoal?.objective
+    ? activeGoal.objective.split("\n")[0].slice(0, 500)
+    : lastAssistant || (busy ? "Pi session is still running" : "Pi session finished without captured final output");
   return enrichTask({
     id: `pi-session:${sessionId || file}`,
     name,
@@ -321,6 +337,7 @@ async function readPiSessionTask(file, stats) {
     actualSessionFile: file,
     sessionId,
     sessionName: name,
+    lastInput,
     source: "pi-session",
   });
 }
@@ -402,19 +419,49 @@ function taskHasActiveWorker(task) {
   return taskDismissKeys(task).some((key) => activeWorkers.has(key));
 }
 
+function normalizedNameText(text) {
+  return String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
 function normalizedTaskName(task) {
-  return String(task?.sessionName || task?.name || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return normalizedNameText(task?.sessionName || task?.name || "");
 }
 
 function isGenericTaskName(name) {
   return !name || name === "kyle" || name === "mi session" || name === "recent mi session";
 }
 
+function normalizeLastInputText(text) {
+  return String(text || "")
+    .trim()
+    .replace(/^\/goal\s+/i, "")
+    .replace(/\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests\/checks run, PR URL if any, and what [^\n.]+ should do next\.$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function taskNameFromText(text) {
+  return normalizeLastInputText(text)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+}
+
+function normalizedLastInput(task) {
+  return normalizeLastInputText(task?.lastInput).toLowerCase().slice(0, 500);
+}
+
 function sameLogicalTask(a, b) {
   if (samePiSessionTask(a, b)) return true;
+  const sameCwd = String(a?.cwd || "") === String(b?.cwd || "");
   const aName = normalizedTaskName(a);
   const bName = normalizedTaskName(b);
-  if (aName && aName === bName && !isGenericTaskName(aName) && String(a?.cwd || "") === String(b?.cwd || "")) return true;
+  if (sameCwd && aName && aName === bName && !isGenericTaskName(aName)) return true;
+  const aLastInput = normalizedLastInput(a);
+  const bLastInput = normalizedLastInput(b);
+  if (sameCwd && aLastInput && aLastInput === bLastInput) return true;
   return false;
 }
 
@@ -467,6 +514,27 @@ function dedupePiSessionTasks(tasks) {
   return merged;
 }
 
+function firstTimestampMs(...values) {
+  for (const value of values) {
+    const ms = Date.parse(String(value || ""));
+    if (ms) return ms;
+  }
+  return 0;
+}
+
+function storedWorkingIsNewerThanScan(task, session) {
+  const taskWorkAt = firstTimestampMs(task.continuedAt, task.updatedAt, task.lastEventAt, task.startedAt);
+  const sessionAt = firstTimestampMs(session.finishedAt, session.updatedAt, session.lastEventAt, session.startedAt);
+  return taskWorkAt > sessionAt;
+}
+
+function betterMergedName(task, activeSession, field) {
+  const current = task?.[field];
+  const next = activeSession?.[field];
+  if ((!current || isGenericTaskName(normalizedNameText(current))) && next && !isGenericTaskName(normalizedNameText(next))) return next;
+  return current || next;
+}
+
 async function mergeOpenPiSessions(tasks, dismissed) {
   const sessions = await listPiSessionTasks();
   const visibleSessions = sessions.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
@@ -491,17 +559,22 @@ async function mergeOpenPiSessions(tasks, dismissed) {
     const storedWorking = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(taskStatus) && !task.finishedAt;
     const scannedComplete = ["complete", "completed", "done", "inactive"].includes(activeStatus) || activeSession.finishedAt;
     const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused");
-    const preserveStoredWorking = storedWorking && scannedComplete;
+    const preserveStoredWorking = storedWorking && scannedComplete && storedWorkingIsNewerThanScan(task, activeSession);
+    const preserveStoredState = preserveStoredTerminal || preserveStoredWorking;
     return {
       ...task,
-      status: (preserveStoredTerminal || preserveStoredWorking) ? task.status : (activeSession.status || task.status),
+      name: betterMergedName(task, activeSession, "name"),
+      sessionName: betterMergedName(task, activeSession, "sessionName"),
+      status: preserveStoredState ? task.status : (activeSession.status || task.status),
       needsUser: preserveStoredTerminal ? task.needsUser : (activeSession.needsUser ?? task.needsUser),
       needsUserReason: preserveStoredTerminal ? task.needsUserReason : (activeSession.needsUserReason || task.needsUserReason),
-      finishedAt: (preserveStoredTerminal || preserveStoredWorking) ? task.finishedAt : activeSession.finishedAt,
-      text: (preserveStoredTerminal || preserveStoredWorking) ? task.text : (activeSession.text || task.text),
-      progress: (preserveStoredTerminal || preserveStoredWorking) ? task.progress : (activeSession.progress || task.progress),
+      finishedAt: preserveStoredState ? task.finishedAt : activeSession.finishedAt,
+      text: preserveStoredState ? task.text : (activeSession.text || task.text),
+      progress: preserveStoredState ? task.progress : (activeSession.progress || task.progress),
+      lastInput: activeSession.lastInput || task.lastInput,
       lastEventAt: activeSession.lastEventAt || task.lastEventAt,
-      updatedAt: (preserveStoredTerminal || preserveStoredWorking) ? task.updatedAt : (activeSession.updatedAt || task.updatedAt),
+      updatedAt: preserveStoredState ? task.updatedAt : (activeSession.updatedAt || task.updatedAt),
+      openPiSession: activeSession.openPiSession || undefined,
     };
   });
   for (const session of visibleSessions) {
@@ -991,6 +1064,26 @@ async function finishTask({ task, worker, before, sessionFile, name, done, kind 
   }
 }
 
+function taskIsOpenIssue(task) {
+  const status = String(task?.status || "").toLowerCase();
+  if (task?.needsUser) return true;
+  if (["running", "waiting", "active", "queued", "thinking", "thinkingqueued", "paused", "error"].includes(status)) return true;
+  return !task?.finishedAt && !["complete", "completed", "done", "stopped"].includes(status);
+}
+
+function existingOpenIssueMessage(task, name) {
+  const status = String(task?.status || "open");
+  const reason = task?.needsUser ? `; needs ${miUserName()}: ${task.needsUserReason || "attention"}` : "";
+  const session = task?.sessionFile ? `\nOpen in /resume: ${task.sessionFile}` : "";
+  return `Not starting duplicate task: ${name}. Existing task is ${status}${reason}.${session}`;
+}
+
+async function findOpenDuplicateWorkerIssue({ name, cwd, message }) {
+  const probe = { name, sessionName: name, cwd, lastInput: message };
+  const tasks = await listAllTasks();
+  return tasks.find((task) => sameLogicalTask(task, probe) && taskIsOpenIssue(task));
+}
+
 async function runWorker(request) {
   const message = String(request.message || "").trim();
   if (!message) throw new Error("Message is empty");
@@ -998,6 +1091,12 @@ async function runWorker(request) {
   const cwd = String(request.cwd || HOME).trim();
   const model = String(request.model || MI_MODEL).trim();
   const sessionDir = request.sessionDir ? String(request.sessionDir).trim() : undefined;
+  const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message });
+  if (duplicate) {
+    const text = existingOpenIssueMessage(duplicate, name);
+    await log(`duplicate_worker_suppressed ${name} existing=${duplicate.id || duplicate.sessionName || duplicate.sessionFile || "unknown"}`);
+    return { text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
+  }
   log(`starting worker ${name} cwd=${cwd} model=${model}`);
   const worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1" } });
   const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1076,7 +1175,7 @@ async function continueWorker(request) {
   const name = task.sessionName || task.name || task.id;
   const activeWorker = workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
-    await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
+    await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
     void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
       .catch((error) => {
         if (activeWorker.expectedStop) return log(`worker_expected_stop ${name}`);
@@ -1090,7 +1189,7 @@ async function continueWorker(request) {
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
   const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
-  const updated = await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
+  const updated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
   if (request.background) {
     trackActiveWorker(updated, name, worker);
     void (async () => {

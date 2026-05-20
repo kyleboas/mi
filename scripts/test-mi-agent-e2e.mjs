@@ -187,12 +187,12 @@ assert.match(typedReplyPlain, /paused/, 'Esc after typed reply should render tas
 assert.match(typedReplyPlain, /stopped by Escape; needs User input/, 'Esc after typed reply should render needs-input reason');
 
 // /resume is a mi agents command: it opens a session picker, then Enter adds the selected pi session as a task without opening pi.
-await runAgentsAndSend('/resume\n\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('resume_session'));
+await runAgentsAndSend('/resume\n\r', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('resume_session'));
 let piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
 assert.equal(piCalls.length, 0, '/resume should not spawn pi');
 requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 assert.ok(requests.some((request) => request.type === 'list_pi_sessions'), '/resume should open the pi-session picker');
-assert.ok(requests.some((request) => request.type === 'resume_session' && ['pi-session-old', 'pi-session-two'].includes(request.id)), 'Enter should add the selected pi session as a task');
+assert.ok(requests.some((request) => request.type === 'resume_session' && ['pi-session-old', 'pi-session-two'].includes(request.id)), 'CR Enter should add the selected pi session as a task, not enter multi-select');
 
 // Other pi slash commands should be delegated to real pi with the selected session.
 await runAgentsAndSend('/model\n', async () => (await readFile(piLog, 'utf8').catch(() => '')).includes('/model'));
