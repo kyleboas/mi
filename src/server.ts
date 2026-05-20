@@ -1,20 +1,15 @@
 import 'dotenv/config';
-import cookieParser from 'cookie-parser';
 import express from 'express';
 import { basename } from 'node:path';
-import { authConfigured, clearSession, createSession, currentCsrf, requireAuth, validLoginPassword } from './auth.js';
 import { runFlueChat } from './flue.js';
 import { classify } from './policy.js';
 import { runPiReadOnly, runPiReadOnlyStream } from './pi.js';
 import { notify } from './notify.js';
 import { createApproval, isKilled, isPaused, logEvent, readApprovals, readRecentEvents, writeApprovals } from './state.js';
-import { requireTailnet, tailnetStatus } from './tailnet.js';
 import { cleanupUploads, consumeUpload, createUploadLink, UPLOAD_DIR, UPLOAD_MAX_BYTES } from './uploads.js';
 
 const app = express();
-app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
-app.use(requireTailnet);
 app.use((_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -22,9 +17,9 @@ app.use((_req, res, next) => {
 app.use('/uploads', express.static(UPLOAD_DIR, { immutable: true, maxAge: '7d', index: false }));
 app.use(express.static(new URL('./public', import.meta.url).pathname));
 
-app.get('/health', (req, res) => res.json({ ok: true, authConfigured: authConfigured(), tailnet: tailnetStatus(req) }));
+app.get('/health', (_req, res) => res.json({ ok: true, authConfigured: false, access: 'loopback-only' }));
 
-app.post('/api/upload-link', requireAuth, async (req, res) => {
+app.post('/api/upload-link', async (req, res) => {
   const base = `${req.protocol}://${req.get('host')}`;
   const link = await createUploadLink(process.env.MI_PUBLIC_BASE_URL || base);
   await logEvent('upload.link.created', { expiresAt: link.expiresAt, maxBytes: link.maxBytes });
@@ -47,22 +42,11 @@ app.put('/u/:token', express.raw({ type: '*/*', limit: UPLOAD_MAX_BYTES }), asyn
 
 setInterval(() => cleanupUploads().catch(() => undefined), 60 * 60 * 1000).unref();
 
-app.post('/api/login', (req, res) => {
-  const password = String(req.body?.password || '');
-  if (!validLoginPassword(password)) return res.status(401).json({ error: 'bad password' });
-  res.json(createSession(res));
-});
-
-app.post('/api/logout', (req, res) => {
-  clearSession(res, req.cookies?.assistant_session);
+app.get('/api/session', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/session', requireAuth, (req, res) => {
-  res.json({ ok: true, csrf: currentCsrf(req) });
-});
-
-app.post('/api/chat', requireAuth, async (req, res) => {
+app.post('/api/chat', async (req, res) => {
   if (await isKilled()) return res.status(423).json({ error: 'Mi is killed: remove state/KILL to resume' });
   const message = String(req.body?.message || '').trim();
   if (!message) return res.status(400).json({ error: 'message required' });
@@ -100,7 +84,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   return res.status(500).json({ error: `unhandled route: ${decision.mode}` });
 });
 
-app.post('/api/chat-stream', requireAuth, async (req, res) => {
+app.post('/api/chat-stream', async (req, res) => {
   if (await isKilled()) return res.status(423).json({ error: 'Mi is killed: remove state/KILL to resume' });
   const message = String(req.body?.message || '').trim();
   if (!message) return res.status(400).json({ error: 'message required' });
@@ -138,15 +122,15 @@ app.post('/api/chat-stream', requireAuth, async (req, res) => {
   res.end();
 });
 
-app.get('/api/approvals', requireAuth, async (_req, res) => {
+app.get('/api/approvals', async (_req, res) => {
   res.json(await readApprovals());
 });
 
-app.get('/api/events', requireAuth, async (_req, res) => {
+app.get('/api/events', async (_req, res) => {
   res.json(await readRecentEvents());
 });
 
-app.post('/api/approvals/:id/:action', requireAuth, async (req, res) => {
+app.post('/api/approvals/:id/:action', async (req, res) => {
   const id = String(req.params.id);
   const action = String(req.params.action);
   if (!['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'bad action' });
@@ -159,11 +143,14 @@ app.post('/api/approvals/:id/:action', requireAuth, async (req, res) => {
   res.json(item);
 });
 
-app.post('/api/notify-test', requireAuth, async (_req, res) => {
+app.post('/api/notify-test', async (_req, res) => {
   res.json(await notify('Mi test', 'Push notifications are wired.'));
 });
 
 const host = process.env.HOST || '127.0.0.1';
+if (!['127.0.0.1', '::1', 'localhost'].includes(host) && process.env.MI_ALLOW_NON_LOOPBACK !== 'true') {
+  throw new Error('Mi is unauthenticated and must bind to loopback. Set HOST=127.0.0.1 or MI_ALLOW_NON_LOOPBACK=true to override intentionally.');
+}
 const port = Number(process.env.PORT || 8787);
 app.listen(port, host, () => {
   console.log(`Mi listening on http://${host}:${port}`);

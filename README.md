@@ -1,88 +1,42 @@
 # Mi
 
-Mi is a tiny private assistant harness for running small AI workers from plain files.
+Mi is a small local assistant interface built around three surfaces only:
 
-```text
-assistant = instructions + trigger + tools + permissions
-```
+1. `mi` — the main Mi conversation.
+2. `mi agents` — the live background-agent view.
+3. the Mi pi extension — side-channel Mi commands inside pi.
 
-Mi is the event-started companion to pi:
+Everything else in this repo exists to support those surfaces.
 
-- pi starts when you ask.
-- Mi starts when something happens.
-
-The current implementation is a private iPhone-friendly scaffold for Mi:
-
-- Web chat/approvals: local web app, intended for Tailscale-only access.
-- Push: Pushover alert helper.
-- Chat/orchestration: Flue is the persistent conversation and proactive/headless layer, bound to loopback and reached only through Mi's Tailnet-only web app.
-- Execution: pi is the inspectable coding/execution worker backend for repo inspection, repair, branches, tests, and PR preparation.
-- Safety: risky actions are routed to approvals before execution.
-
-See `docs/mi.md` for the product concept and `docs/architecture.md` for the Flue/pi role split.
-
-## Product layers
-
-Mi core has five primitives only: Assistant, Trigger, Tool, Worker, and Run.
-
-Mi is split into two layers:
-
-1. **Assistant Builder**: creates, edits, and explains `assistants/*.md` files from user requests.
-2. **Assistant Runner**: reads those files and executes short-lived runs when a trigger fires.
-
-The Builder proposes reviewable file changes. The Runner executes existing assistant files; it must not silently rewrite its own runtime instructions.
-
-Safety model:
-- assistants are read-only by default
-- risky tools/permissions require approvals
-- runtime assistants cannot silently rewrite `assistants/*.md`
-- builder edits are reviewable file changes
-
-## Assistant files
-
-The Mi interface is Markdown assistants in `assistants/*.md` with frontmatter for triggers, tools, and permissions. See `docs/assistant-format.md` for the full v0 format.
-
-First demo assistant:
-- `assistants/production.md` watches GitHub Actions, Railway deployments/logs, Cloudflare status, and app health; it reports all-clear or starts at most one pi repair worker for likely code issues, behind approval gates.
-
-```md
----
-name: production
-triggers:
-  - every: 10m
-tools:
-  - github
-  - railway
-  - cloudflare
-  - pi
-permissions:
-  production:
-    deploy: false
-    mutate_dns: false
-    edit_secrets: false
-    merge_code: false
----
-# Production Assistant
-Watch production health.
-When something breaks, collect context, start one worker if appropriate, and report back.
-```
-
-## CLI
+## `mi`
 
 `mi` opens the main Mi conversation in pi. The durable Mi thread is stored locally in `state/threads/main.jsonl`, so background jobs can append messages while no terminal is open and the next `mi` run can show them through the pi extension.
 
-Primary commands:
-
 ```bash
-mi          # open Mi chat
-mi agents   # open the live background-agent view
+mi
 ```
 
-From this repo before install, use `npm run mi --` and `npm run mi -- agents`.
+From this repo before install:
 
-## mi agents
+```bash
+npm run mi --
+```
 
-`mi agents` opens the live worker view. It uses pi-tui rendering in the alternate screen so stale scrollback rows cannot look like duplicate tasks, resets stale mouse tracking so tmux wheel behavior recovers after exit, dedupes rows by pi session identity, and keeps visible tasks until they are cleared. Useful in-view commands:
+## `mi agents`
+
+`mi agents` opens the live background-agent view.
+
+```bash
+mi agents
+```
+
+From this repo before install:
+
+```bash
+npm run mi -- agents
+```
+
+Useful in-view commands:
 
 - `/new <prompt>` starts a new background task from the view.
 - Enter on normal text replies to the selected task; `/goal ...` is forwarded as task prompt text.
@@ -93,9 +47,9 @@ From this repo before install, use `npm run mi --` and `npm run mi -- agents`.
 - `^M` toggles multi-select clear mode; Esc clears selected rows or exits input modes.
 - `/mi <question>` asks Mi main about the selected task context without steering the worker.
 
-Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged mi agents view so tasks do not disappear unless cleared. The daemon ignores known noisy tacticsjournal research-pipeline pi sessions.
+Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged `mi agents` view so tasks do not disappear unless cleared.
 
-## Pi integration
+## Mi pi extension
 
 A global pi extension is installed at `~/.pi/agent/extensions/mi.ts`.
 
@@ -112,101 +66,18 @@ Inside pi, the Mi extension exposes a single slash command: `/mi`.
 
 `/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation. Bare `mi ...` input and standalone pi `/upload` are not registered by the extension; use `/mi` and `/mi upload` instead.
 
-Image uploads: `mi upload`, Mi `/upload`, and pi `/mi upload` create a 15-minute one-time link under `/u/<token>`. By default this uses the Mi web app local uploader (`MI_PUBLIC_BASE_URL`, `MI_UPLOAD_DIR`). For public Cloudflare uploads, deploy `workers/cloudflare-upload-worker.js` with R2 + KV (see `wrangler.upload.example.toml`) and set `MI_CLOUDFLARE_UPLOAD_BASE_URL` plus `MI_UPLOAD_SIGNING_SECRET` where `mi` runs. The Cloudflare path uses signed, short-lived, single-use tokens; accepts JPEG/PNG/GIF/WebP only; enforces the 10 MiB default size cap; verifies image magic bytes; has no list endpoint; and stores images at unguessable R2 keys.
+Image uploads: `mi upload`, Mi `/upload`, and pi `/mi upload` create a 15-minute one-time link under `/u/<token>`. By default this uses the local Mi uploader (`MI_PUBLIC_BASE_URL`, `MI_UPLOAD_DIR`). For public Cloudflare uploads, deploy `workers/cloudflare-upload-worker.js` with R2 + KV and set `MI_CLOUDFLARE_UPLOAD_BASE_URL` plus `MI_UPLOAD_SIGNING_SECRET` where `mi` runs.
 
-## Run web app
+## Development
 
 ```bash
-cd ~/assistant
-cp .env.example .env
-# edit .env and set ASSISTANT_TOKEN to a strong password/token
-npm run dev
+npm install
+npm run build
+npm test
 ```
 
-Open on the VPS:
+Security check:
 
 ```bash
-curl http://127.0.0.1:8787/health
-```
-
-Expose privately with Tailscale HTTPS:
-
-```bash
-tailscale serve --bg --https=443 http://127.0.0.1:8787
-```
-
-Then open the Tailscale HTTPS URL on iPhone. Do not use Tailscale Funnel for this control surface.
-
-Mi is Tailnet-only by default. The server accepts loopback and Tailscale `100.64.0.0/10` clients, plus optional `TAILNET_ALLOWED_IPS`. Public clients receive `403` even if the process is accidentally bound too broadly.
-
-## Validate v0
-
-```bash
-npm run validate:v0
-```
-
-Checks:
-- `mi check production` equivalent
-- manual production run
-- scheduled production run
-- Tailnet web health
-- read-only path
-- simulated failing CI approval path
-
-## Scheduled runs
-
-Manual production run works with:
-
-```bash
-npm run mi -- run production
-```
-
-Scheduled execution entrypoint:
-
-```bash
-npm run scheduled -- explain production
-npm run scheduled -- run production
-npm run scheduled:production
-```
-
-Example systemd files:
-- `mi-production.service.example`
-- `mi-production.timer.example`
-
-The production timer runs every 10 minutes. Pushover notifications are sent only when a scheduled result needs attention, and notification text is sanitized.
-
-## Proactive jobs
-
-Flue owns proactive/headless jobs. Run them manually or from systemd timers/cron:
-
-```bash
-npm run proactive:brief      # daily brief
-npm run proactive:approvals  # approval reminders
-npm run proactive:health     # Mi health check
-npm run proactive            # all proactive jobs
-```
-
-These jobs gather minimal server-side state, pass it to Flue agents when enabled, log results to `state/events.jsonl`, and send safe Pushover notifications when the result says notification is needed.
-
-Persistent Flue orchestration runs on loopback only:
-
-```bash
-npm run flue:dev      # foreground persistent Flue orchestrator on 127.0.0.1:3583
-npm run flue:status   # check local Flue health
-```
-
-The web app talks to Flue through `FLUE_URL=http://127.0.0.1:3583`; Flue is not a public control surface.
-
-## Safety
-
-The web app requires `ASSISTANT_TOKEN` / `ASSISTANT_PASSWORD` login even over Tailscale. Normal chat routes through Flue only when it is enabled behind the Tailnet-only boundary; otherwise it uses the pi-backed safe path. Local inspection routes to read-only pi. The pi bridge enforces `--tools read,grep,find,ls`, not just prompt instructions. Mi owns the decision to start work; pi performs coding/execution worker tasks. `pi.repair` is disabled by default with `PI_REPAIR_ENABLED=false` and must sit behind approval gates before code-changing runs. Requests that look like writes/deploys/merges/deletes create an approval card instead of executing.
-
-Pushover is notifications-only: alerts may say that attention or approval is needed, but should not contain secrets, public control links, or dangerous one-tap action links.
-
-Kill switches:
-
-```bash
-touch state/PAUSED  # disable chat execution, keep status available
-touch state/KILL    # refuse all chat execution
-rm state/PAUSED state/KILL
+npm audit --omit=dev
 ```

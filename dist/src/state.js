@@ -1,5 +1,6 @@
 import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { redactSecrets } from './redact.js';
 const stateDir = path.resolve('state');
 const eventsFile = path.join(stateDir, 'events.jsonl');
 const approvalsFile = path.join(stateDir, 'approvals.json');
@@ -10,7 +11,7 @@ export async function ensureState() {
 }
 export async function logEvent(type, data) {
     await ensureState();
-    await appendFile(eventsFile, JSON.stringify({ ts: new Date().toISOString(), type, data }) + '\n');
+    await appendFile(eventsFile, JSON.stringify({ ts: new Date().toISOString(), type, data: redactSecrets(data) }) + '\n');
 }
 export async function readApprovals() {
     await ensureState();
@@ -61,8 +62,8 @@ export async function createApproval(prompt, reason) {
         id: Math.random().toString(36).slice(2, 10),
         createdAt: new Date().toISOString(),
         status: 'pending',
-        prompt,
-        reason,
+        prompt: String(redactSecrets(prompt)),
+        reason: String(redactSecrets(reason)),
     };
     items.unshift(approval);
     await writeApprovals(items);
