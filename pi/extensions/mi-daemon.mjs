@@ -498,7 +498,7 @@ async function stopTask(request) {
   const tasks = await readTasks();
   const task = tasks.find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
-  const activeWorker = task ? (activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(task.sessionName)) : undefined;
+  const activeWorker = task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) : undefined;
   if (activeWorker && !activeWorker.proc.killed) {
     activeWorker.expectedStop = true;
     activeWorker.proc.kill();
@@ -781,7 +781,16 @@ async function runPrompt(message) {
 }
 
 function workerKeys(task, fallbackName) {
-  return [...new Set([task.id, task.name, task.sessionName, fallbackName].filter(Boolean))];
+  return [...new Set([
+    task.id,
+    task.name,
+    task.sessionName,
+    task.sessionId,
+    task.sessionFile,
+    task.actualSessionFile,
+    sessionFingerprint(task),
+    fallbackName,
+  ].filter(Boolean).map(String))];
 }
 function trackActiveWorker(task, fallbackName, worker) {
   for (const key of workerKeys(task, fallbackName)) activeWorkers.set(key, worker);
@@ -1011,7 +1020,7 @@ async function continueWorker(request) {
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (task.source === "pi-session") task = await upsertTask({ ...task, id: task.id || `pi-session:${task.sessionId || task.sessionFile}`, status: task.status === "active" ? "active" : "inactive" });
   const name = task.sessionName || task.name || task.id;
-  const activeWorker = activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(name) || activeWorkers.get(taskId);
+  const activeWorker = workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
     await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
     void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
@@ -1035,6 +1044,10 @@ async function continueWorker(request) {
       await appendMainThreadMessage(`Task updated: ${name}\n\nStatus: running\nOpen in /resume: ${task.sessionFile || sessionFile || "unknown"}`, "mi-task-status").catch(() => undefined);
       void finishTask({ task: updated, worker, before, sessionFile, name, done, kind: "Task updated" });
     })().catch(async (error) => {
+      if (worker.expectedStop) {
+        await log(`worker_expected_stop ${name}`);
+        return;
+      }
       await upsertTask({ ...updated, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message });
       untrackActiveWorker(updated, name);
       worker.proc.kill();

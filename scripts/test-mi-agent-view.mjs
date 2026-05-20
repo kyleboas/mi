@@ -39,6 +39,8 @@ assert.match(cli, /const detailBudget = Math\.max\(1, contentHeight - lines\.len
 assert.match(cli, /const visibleLines = outputLines\.slice\(fullLastOutputScroll, fullLastOutputScroll \+ outputHeight\)/, 'full last output mode uses an internal scroll window');
 assert.doesNotMatch(cli, /WHITE_CURSOR|RESET_CURSOR|\\x1b\]12|\\x1b\]112/, 'Mi does not override terminal cursor color; pi-tui owns cursor behavior');
 assert.match(cli, /function startPiTuiScreen\(component: Component & Focusable, options: \{ alternateScreen\?: boolean; clearScreen\?: boolean \} = \{\}\)[\s\S]*new ProcessTerminal\(\)[\s\S]*new TUI\(terminal\)/, 'Mi screens let pi-tui own default cursor behavior');
+assert.match(cli, /\?1049h\\x1b\[2J\\x1b\[3J\\x1b\[H/, 'alternate-screen startup clears stale scrollback so old task rows cannot look duplicated');
+assert.match(cli, /else process\.stdout\.write\('\\x1b\[3J'\)/, 'normal-screen TUI startup also clears previous stale scrollback');
 assert.match(cli, /const DISABLE_MOUSE_TRACKING_SEQUENCE = '\\x1b\[\?1000l\\x1b\[\?1002l\\x1b\[\?1003l\\x1b\[\?1006l\\x1b\[\?1015l'/, 'Mi has a local mouse tracking reset for tmux wheel scrollback');
 assert.match(cli, /Reset stale mouse tracking from prior full-screen apps before pi-tui starts[\s\S]*process\.stdout\.write\(DISABLE_MOUSE_TRACKING_SEQUENCE\)[\s\S]*tui\.start\(\)/, 'Mi disables stale mouse tracking before starting its TUI');
 assert.match(cli, /Mi does not handle mouse input; keep it disabled so tmux mouse-wheel scrollback works\.[\s\S]*process\.stdout\.write\(DISABLE_MOUSE_TRACKING_SEQUENCE\)[\s\S]*if \(options\.alternateScreen\)/, 'Mi disables mouse tracking again during TUI cleanup');
@@ -115,8 +117,9 @@ assert.match(cli, /inputMode === 'normal' && value[\s\S]*replyTarget = task;[\s\
 assert.match(cli, /pendingTaskUpdates\.set\(taskKey, runningUpdate\)[\s\S]*void sendTaskSocketRequest\(\{ type: 'continue_worker'[\s\S]*model: turn\.model/, 'agent replies immediately mark the task working and send in the background');
 assert.match(cli, /pendingTaskUpdateStartedAt = new Map<string, number>\(\)/, 'agent view remembers when a reply began');
 assert.match(cli, /text: undefined, error: undefined[\s\S]*continuedAt: new Date\(\)\.toISOString\(\)/, 'agent reply clears completed fields and immediately makes task working');
-assert.match(cli, /pendingTaskUpdateStartedAt\.set\(taskKey, Date\.now\(\)\)/, 'agent reply pins working overlay until a newer terminal update arrives');
-assert.match(cli, /terminalAt > pendingStartedAt[\s\S]*pendingTaskUpdates\.delete\(key\)/, 'agent reply overlay clears only after newer terminal daemon state');
+assert.match(cli, /pendingTaskUpdateStartedAt\.set\(taskKey, Date\.now\(\)\)/, 'agent reply pins working overlay while the daemon accepts the reply');
+assert.match(cli, /if \(terminal\) \{[\s\S]*pendingTaskUpdates\.delete\(key\)/, 'terminal daemon state always clears pending working overlays');
+assert.match(cli, /\.then\(async \(\) => \{[\s\S]*pendingTaskUpdates\.delete\(taskKey\)[\s\S]*await refresh\(\)/, 'daemon ack clears local pending working overlay before refresh');
 assert.match(cli, /setTimeout\(\(\) => void refresh\(\), 250\)/, 'agent reply refreshes after daemon ack and again shortly after');
 assert.match(cli, /const nextSelected = tasks\.findIndex[\s\S]*if \(nextSelected >= 0\) selected = nextSelected/, 'agent refresh keeps selected task selected when it moves sections');
 assert.doesNotMatch(cli, /Replying to \$\{taskName\(task\)\} with/, 'agent replies do not replace the help/status line with a verbose sending message');
@@ -286,8 +289,10 @@ assert.match(daemon, /status: busy \? "running" : "complete"/, 'daemon defaults 
 assert.match(daemon, /const ACTIVE_SESSION_WINDOW_MS = Number\(process\.env\.MI_ACTIVE_PI_SESSION_WINDOW_MS \|\| 7 \* 24 \* 60 \* 60_000\)/, 'daemon keeps stopped discovered sessions visible long enough to avoid surprising disappearance');
 assert.match(daemon, /if \(task\.needsKyle\) return \{ needsKyle: true/, 'daemon preserves explicit needsKyle flags during enrichment');
 assert.match(daemon, /\["complete", "completed", "done", "error", "stopped", "paused", "inactive"\]\.includes\(taskStatus\)/, 'daemon treats paused tasks as terminal when merging stale busy sessions');
-assert.match(daemon, /activeWorker\.expectedStop = true;[\s\S]*activeWorker\.proc\.kill\(\)/, 'daemon marks stop_task worker exits as expected before SIGTERM');
+assert.match(daemon, /function workerKeys\(task, fallbackName\)[\s\S]*task\.sessionId[\s\S]*task\.sessionFile[\s\S]*sessionFingerprint\(task\)/, 'daemon tracks active workers by task and session identity');
+assert.match(daemon, /const activeWorker = task \? workerKeys\(task, name\)\.map[\s\S]*activeWorker\.expectedStop = true;[\s\S]*activeWorker\.proc\.kill\(\)/, 'daemon marks stop_task worker exits as expected before SIGTERM');
 assert.match(daemon, /if \(worker\.expectedStop\)[\s\S]*worker_expected_stop[\s\S]*return/, 'daemon does not overwrite paused stopped tasks with SIGTERM errors');
+assert.match(daemon, /\}\)\(\)\.catch\(async \(error\) => \{[\s\S]*if \(worker\.expectedStop\)[\s\S]*return;[\s\S]*status: "error"/, 'daemon ignores expected SIGTERM during background continue startup');
 assert.match(daemon, /status: "paused", needsKyle: true, needsKyleReason: "stopped by Escape", finishedAt: undefined[\s\S]*stopped by Escape; needs \$\{miUserName\(\)\} input/, 'daemon stop_task parks stopped workers in needs input');
 assert.match(daemon, /explicitSessionFiles\.has\(entry\.file\)/, 'daemon always includes explicitly open pi session files in the scan');
 assert.doesNotMatch(daemon, /const closeStartWindowMs|entry\.delta <= closeStartWindowMs|activeTaskIds/, 'daemon does not keep stale sessions stuck working through fuzzy process matching or status overrides');
