@@ -71,10 +71,11 @@ When something breaks, collect context, start one worker if appropriate, and rep
 
 `mi` opens the main Mi conversation in pi. The durable Mi thread is stored locally in `state/threads/main.jsonl`, so background jobs can append messages while no terminal is open and the next `mi` run can show them through the pi extension.
 
-Conversation commands:
+Conversation and worker commands:
 
 ```bash
 npm run mi --                         # open Mi main in pi
+npm run mi -- agents                  # open the live mi-agents background worker view
 npm run mi -- raw                     # open the minimal fallback conversation
 npm run mi -- --once "message"        # send one message to main and exit
 npm run mi -- inbox                   # show main + temporary conversations
@@ -82,6 +83,9 @@ npm run mi -- temp "React RSC review" # create/open a focused temporary conversa
 npm run mi -- chat temp-react-rsc-review # reopen an existing temporary conversation
 npm run mi -- compact main            # summarize/archive old read messages
 npm run mi -- upload                  # create a temporary one-time image upload link
+npm run mi -- task "fix checkout" -- "inspect the checkout failure and open a PR"
+npm run mi -- task reply "fix checkout" -- "also add a regression test"
+npm run mi -- task list               # list background worker tasks
 ```
 
 Assistant file commands:
@@ -105,12 +109,32 @@ mi temp "React RSC review"
 mi chat temp-react-rsc-review
 mi compact main
 mi upload                             # create a temporary one-time image upload link
+mi agents                             # live background worker view
+mi task "fix checkout" -- "inspect the checkout failure and open a PR"
+mi task reply "fix checkout" -- "also add a regression test"
+mi task list
 mi make "Create an inbox assistant" --name inbox
 mi run inbox
 mi edit inbox "Also ignore newsletters"
 mi check inbox
 mi logs inbox
 ```
+
+## Background workers and mi-agents
+
+`mi task <name> -- <prompt>` starts a background pi worker through RPC and records it in Mi task state. Prompts are sent as written by default; start the prompt with `/goal` when you want pi's explicit standing-goal behavior. `mi task reply <task-id-or-name> -- <message>` continues the same worker/session. If the worker is still active, Mi queues the reply as a steer; otherwise it resumes the saved pi session.
+
+`mi agents` opens the live worker view. It uses pi-tui rendering without the alternate screen so tmux scrollback remains available, dedupes rows by pi session identity, and keeps visible tasks until they are cleared. Useful keys/commands:
+
+- `/new <prompt>` starts a new background task from the view.
+- Enter on normal text replies to the selected task; `/goal ...` is forwarded as task prompt text.
+- `/resume` opens a picker for recent/default pi sessions so they can be added to the task list.
+- `/model` opens a pi-style model picker; Shift+Tab cycles thinking level.
+- `^L` toggles full-output mode; arrows/PageUp/PageDown scroll that output.
+- `m` toggles multi-select clear mode; Esc clears selected rows or exits input modes.
+- `/mi <question>` asks Mi main about the selected task context without steering the worker.
+
+Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged mi-agents view so tasks do not disappear unless cleared. The daemon ignores known noisy tacticsjournal research-pipeline pi sessions.
 
 ## Pi integration
 
@@ -129,7 +153,7 @@ Inside pi:
 
 `/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation.
 
-Image uploads are served by the Mi web app. `mi upload`, Mi `/upload`, and pi `/upload` create a 15-minute one-time link under `/u/<token>`. The browser uploader accepts JPEG/PNG/GIF/WebP only, enforces a 10 MiB default size cap, writes sanitized filenames under `state/uploads/files`, returns a `/uploads/<file>` URL, and hourly cleanup prunes expired tokens plus files older than 7 days. Set `MI_PUBLIC_BASE_URL`, `MI_UPLOAD_MAX_BYTES`, `MI_UPLOAD_TTL_MS`, `MI_UPLOAD_RETENTION_MS`, or `MI_UPLOAD_DIR` to match deployment.
+Image uploads: `mi upload`, Mi `/upload`, and pi `/upload` create a 15-minute one-time link under `/u/<token>`. By default this uses the Mi web app local uploader (`MI_PUBLIC_BASE_URL`, `MI_UPLOAD_DIR`). For public Cloudflare uploads, deploy `workers/cloudflare-upload-worker.js` with R2 + KV (see `wrangler.upload.example.toml`) and set `MI_CLOUDFLARE_UPLOAD_BASE_URL` plus `MI_UPLOAD_SIGNING_SECRET` where `mi` runs. The Cloudflare path uses signed, short-lived, single-use tokens; accepts JPEG/PNG/GIF/WebP only; enforces the 10 MiB default size cap; verifies image magic bytes; has no list endpoint; and stores images at unguessable R2 keys.
 
 ## Run web app
 

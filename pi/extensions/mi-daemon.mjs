@@ -13,27 +13,81 @@ const SESSION_DIR = process.env.MI_SESSION_DIR || join(HOME, ".pi", "agent", "se
 const PI_BIN = process.env.MI_PI_BIN || join(HOME, ".nvm", "versions", "node", "v24.15.0", "bin", "pi");
 const MI_MODEL = process.env.MI_MODEL || "openai-codex/gpt-5.5:low";
 const LOG_PATH = join(RUNTIME_DIR, "mi-daemon.log");
+const LOCK_PATH = join(RUNTIME_DIR, "mi-daemon.lock");
 const TASKS_PATH = join(HOME, "mi", "state", "tasks.json");
 const DISMISSED_TASKS_PATH = join(HOME, "mi", "state", "dismissed-tasks.json");
 const PI_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const ACTIVE_SESSION_WINDOW_MS = Number(process.env.MI_ACTIVE_PI_SESSION_WINDOW_MS || 7 * 24 * 60 * 60_000);
 const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 5000);
+const MI_MAIN_IDLE_MS = Number(process.env.MI_MAIN_IDLE_MS || 15000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const THREAD_INDEX_PATH = join(THREADS_DIR, "index.json");
+const TACTICSJOURNAL_RESEARCH_PIPELINE_CWD = join(HOME, "code", "tacticsjournal", "research", "pipeline");
 
 let piProc;
+let daemonLockHandle;
 let buffer = "";
 let nextId = 1;
 const pending = new Map();
 const promptQueue = [];
 const activeWorkers = new Map();
 let activePrompt;
+let piIdleTimer;
 let piSessionTaskCache = { at: 0, tasks: [] };
 
 async function log(line) {
   await mkdir(RUNTIME_DIR, { recursive: true });
   await appendFile(LOG_PATH, `${new Date().toISOString()} ${line}\n`).catch(() => undefined);
+}
+
+function socketHealth(timeoutMs = 500) {
+  return new Promise((resolve) => {
+    if (!existsSync(SOCKET_PATH)) return resolve(false);
+    const socket = net.createConnection(SOCKET_PATH);
+    let data = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve(false);
+    }, timeoutMs);
+    socket.on("connect", () => socket.write(`${JSON.stringify({ type: "health" })}\n`));
+    socket.on("data", (chunk) => {
+      data += chunk.toString("utf8");
+      if (!data.includes("\n")) return;
+      clearTimeout(timer);
+      socket.end();
+      try { resolve(JSON.parse(data.slice(0, data.indexOf("\n"))).ok === true); } catch { resolve(false); }
+    });
+    socket.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+async function acquireDaemonLock() {
+  await mkdir(dirname(SOCKET_PATH), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      daemonLockHandle = await open(LOCK_PATH, "wx");
+      await daemonLockHandle.writeFile(String(process.pid));
+      return true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const lockOwner = (await readFile(LOCK_PATH, "utf8").catch(() => "")).trim();
+      if (await socketHealth(2000)) {
+        await log(`singleton exit; daemon already healthy at ${SOCKET_PATH}`);
+        return false;
+      }
+      if (lockOwner && existsSync(`/proc/${lockOwner}`)) {
+        await log(`removing unhealthy daemon lock ${LOCK_PATH} owned by pid ${lockOwner}`);
+        try { process.kill(Number(lockOwner), "SIGTERM"); } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      await rm(LOCK_PATH, { force: true }).catch(() => undefined);
+    }
+  }
+  return false;
 }
 
 async function readTasks() {
@@ -57,12 +111,31 @@ async function writeDismissedTaskKeys(keys) {
   await rename(tmp, DISMISSED_TASKS_PATH);
 }
 
+function sessionFingerprint(task) {
+  const direct = task?.sessionId ? String(task.sessionId) : "";
+  if (direct) return direct;
+  const path = String(task?.sessionFile || task?.actualSessionFile || "");
+  const match = path.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i);
+  return match?.[1] || "";
+}
+
 function taskDismissKeys(task) {
-  return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, task?.sessionName, task?.name].filter(Boolean).map(String);
+  return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, sessionFingerprint(task), task?.sessionName, task?.name].filter(Boolean).map(String);
+}
+
+function taskPersistentDismissKeys(task) {
+  const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
+  if (isPiSession) return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId].filter(Boolean).map(String);
+  return taskDismissKeys(task);
 }
 
 function isTaskDismissed(task, dismissed) {
-  return taskDismissKeys(task).some((key) => dismissed.has(key));
+  return taskPersistentDismissKeys(task).some((key) => dismissed.has(key));
+}
+
+function isExcludedPiSessionTask(task) {
+  const cwd = String(task?.cwd || "").replace(/\/+$/, "");
+  return task?.source === "pi-session" && cwd === TACTICSJOURNAL_RESEARCH_PIPELINE_CWD;
 }
 
 async function walkSessionFiles(dir = PI_SESSIONS_DIR, files = []) {
@@ -81,10 +154,22 @@ function textFromMessage(message) {
   if (typeof content === "string") return content.trim();
   if (!Array.isArray(content)) return "";
   return content
-    .map((part) => typeof part === "string" ? part : part?.type === "text" ? part.text || "" : part?.type === "toolCall" ? `tool: ${part.name || "unknown"}` : "")
+    .map((part) => typeof part === "string" ? part : part?.type === "text" ? part.text || "" : "")
     .filter(Boolean)
     .join(" ")
     .trim();
+}
+
+function assistantMessageHasText(message) {
+  return Boolean(textFromMessage(message));
+}
+
+function assistantMessageIsBusy(message) {
+  const content = message?.content;
+  if (!Array.isArray(content)) return false;
+  if (content.some((part) => part?.type === "toolCall")) return true;
+  if (assistantMessageHasText(message)) return false;
+  return content.some((part) => part?.type === "thinking");
 }
 
 function parseProcStat(text) {
@@ -167,7 +252,7 @@ async function readSessionSample(file, stats) {
 }
 
 async function readPiSessionTask(file, stats) {
-  if (file.startsWith(SESSION_DIR)) return undefined;
+  if (file.startsWith(SESSION_DIR) || file.includes("/sessions/mi-main/")) return undefined;
   if (Date.now() - stats.mtimeMs > ACTIVE_SESSION_WINDOW_MS) return undefined;
   let sessionId = "";
   let cwd = HOME;
@@ -176,6 +261,7 @@ async function readPiSessionTask(file, stats) {
   let activeGoal;
   let lastAssistant = "";
   let lastTimestamp = stats.mtime.toISOString();
+  let busy = false;
   const raw = await readSessionSample(file, stats);
   if (!raw) return undefined;
   for (const line of raw.split("\n")) {
@@ -191,23 +277,28 @@ async function readPiSessionTask(file, stats) {
       sessionName = record.name || sessionName;
     } else if (record.type === "custom" && record.customType === "pi-goal" && record.data?.goal) {
       activeGoal = record.data.goal;
+    } else if (record.type === "message" && record.message?.role === "user") {
+      busy = true;
+    } else if (record.type === "message" && record.message?.role === "toolResult") {
+      busy = true;
     } else if (record.type === "message" && record.message?.role === "assistant") {
       const text = textFromMessage(record.message);
+      busy = assistantMessageIsBusy(record.message) || !text;
       if (text) lastAssistant = text.slice(0, 500);
     }
   }
-  const status = String(activeGoal?.status || "").toLowerCase();
   const name = sessionName || activeGoal?.objective?.split("\n")[0]?.slice(0, 80) || basename(cwd) || "Mi session";
   const progress = activeGoal?.objective ? activeGoal.objective.split("\n")[0].slice(0, 500) : lastAssistant || "Recent Mi session";
   return enrichTask({
     id: `pi-session:${sessionId || file}`,
     name,
     cwd,
-    status: "inactive",
+    status: busy ? "running" : "complete",
     startedAt: startedAt || stats.birthtime.toISOString(),
     updatedAt: lastTimestamp || stats.mtime.toISOString(),
     lastEventAt: stats.mtime.toISOString(),
-    finishedAt: stats.mtime.toISOString(),
+    finishedAt: busy ? undefined : (lastTimestamp || stats.mtime.toISOString()),
+    text: busy ? undefined : lastAssistant,
     progress,
     sessionFile: file,
     actualSessionFile: file,
@@ -217,66 +308,87 @@ async function readPiSessionTask(file, stats) {
   });
 }
 
+function inferOpenPiSessionFiles(tasks, activeProcesses) {
+  const explicit = new Set(activeProcesses.map((proc) => proc.sessionFile).filter(Boolean));
+  const inferred = new Set(explicit);
+  const assigned = new Set(explicit);
+  const interactiveProcesses = activeProcesses
+    .filter((proc) => !proc.sessionFile)
+    .sort((a, b) => b.startedAtMs - a.startedAtMs);
+  const candidates = tasks
+    .filter((task) => task.sessionFile && task.cwd)
+    .sort((a, b) => (Date.parse(b.lastEventAt || b.updatedAt || b.startedAt || 0) || 0) - (Date.parse(a.lastEventAt || a.updatedAt || a.startedAt || 0) || 0));
+  for (const proc of interactiveProcesses) {
+    const match = candidates.find((task) => {
+      if (assigned.has(task.sessionFile)) return false;
+      if (task.cwd !== proc.cwd) return false;
+      const startedAt = Date.parse(task.startedAt || "") || 0;
+      return startedAt >= proc.startedAtMs - 60_000;
+    });
+    if (!match) continue;
+    inferred.add(match.sessionFile);
+    assigned.add(match.sessionFile);
+  }
+  return inferred;
+}
+
 async function listPiSessionTasks() {
   const now = Date.now();
   if (now - piSessionTaskCache.at < PI_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const activeProcesses = await listActivePiProcesses();
-  const activeByCwd = new Map();
-  for (const proc of activeProcesses) {
-    const list = activeByCwd.get(proc.cwd) || [];
-    list.push(proc);
-    activeByCwd.set(proc.cwd, list);
-  }
   const files = await walkSessionFiles();
   const withStats = [];
   for (const file of files) {
     try { withStats.push({ file, stats: await stat(file) }); } catch {}
   }
   withStats.sort((a, b) => b.stats.mtimeMs - a.stats.mtimeMs);
-  const tasks = [];
-  for (const { file, stats } of withStats.slice(0, 40)) {
+  const explicitSessionFiles = new Set(activeProcesses.map((proc) => proc.sessionFile).filter(Boolean));
+  const selected = [];
+  const selectedFiles = new Set();
+  for (const entry of withStats) {
+    if (selected.length < 80 || explicitSessionFiles.has(entry.file)) {
+      selected.push(entry);
+      selectedFiles.add(entry.file);
+    }
+  }
+  for (const file of explicitSessionFiles) {
+    if (selectedFiles.has(file)) continue;
+    try { selected.push({ file, stats: await stat(file) }); } catch {}
+  }
+  const parsedTasks = [];
+  for (const { file, stats } of selected) {
     const task = await readPiSessionTask(file, stats);
-    if (task) tasks.push(task);
+    if (task) parsedTasks.push(task);
   }
-  const activeTaskIds = new Set();
-  const matchedTaskIds = new Set();
-  for (const proc of activeProcesses) {
-    if (!proc.sessionFile) continue;
-    const match = tasks.find((task) => !matchedTaskIds.has(task.id) && (task.sessionFile === proc.sessionFile || task.actualSessionFile === proc.sessionFile));
-    if (match) {
-      matchedTaskIds.add(match.id);
-      activeTaskIds.add(match.id);
-    }
-  }
-  const closeStartWindowMs = 10 * 60_000;
-  for (const [cwd, procs] of activeByCwd) {
-    for (const proc of procs) {
-      const candidates = tasks
-        .filter((task) => task.cwd === cwd && !matchedTaskIds.has(task.id))
-        .map((task) => ({ task, delta: Math.abs(proc.startedAtMs - (Date.parse(task.startedAt || "") || 0)) }))
-        .filter((entry) => entry.delta <= closeStartWindowMs)
-        .sort((a, b) => a.delta - b.delta || Date.parse(b.task.updatedAt || b.task.lastEventAt || "") - Date.parse(a.task.updatedAt || a.task.lastEventAt || ""));
-      const match = candidates[0]?.task;
-      if (match) {
-        matchedTaskIds.add(match.id);
-        activeTaskIds.add(match.id);
-      }
-    }
-  }
-  const marked = tasks.map((task) => activeTaskIds.has(task.id)
-    ? { ...task, status: "active", finishedAt: undefined }
-    : { ...task, status: "inactive", finishedAt: task.finishedAt || task.lastEventAt || task.updatedAt });
-  piSessionTaskCache = { at: now, tasks: marked };
-  return marked;
+  const openSessionFiles = inferOpenPiSessionFiles(parsedTasks, activeProcesses);
+  const tasks = parsedTasks.map((task) => openSessionFiles.has(task.sessionFile) ? { ...task, openPiSession: true } : task);
+  piSessionTaskCache = { at: now, tasks };
+  return tasks;
 }
 
 function taskHasActiveWorker(task) {
   return taskDismissKeys(task).some((key) => activeWorkers.has(key));
 }
 
+function normalizedTaskName(task) {
+  return String(task?.sessionName || task?.name || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function isGenericTaskName(name) {
+  return !name || name === "kyle" || name === "mi session" || name === "recent mi session";
+}
+
+function sameLogicalTask(a, b) {
+  if (samePiSessionTask(a, b)) return true;
+  const aName = normalizedTaskName(a);
+  const bName = normalizedTaskName(b);
+  if (aName && aName === bName && !isGenericTaskName(aName) && String(a?.cwd || "") === String(b?.cwd || "")) return true;
+  return false;
+}
+
 function reconcileStoredTask(task) {
   const status = String(task.status || "").toLowerCase();
-  if (["running", "queued", "thinking", "thinkingqueued"].includes(status) && !taskHasActiveWorker(task)) {
+  if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status) && !taskHasActiveWorker(task)) {
     const lastActiveAt = Date.parse(task.continuedAt || task.lastEventAt || task.updatedAt || task.startedAt || 0) || 0;
     if (Date.now() - lastActiveAt < 120000) return task;
     const finishedAt = task.finishedAt || task.lastEventAt || task.updatedAt || new Date().toISOString();
@@ -285,15 +397,81 @@ function reconcileStoredTask(task) {
   return task;
 }
 
+function piSessionMatchKeys(task) {
+  return [task?.sessionFile, task?.actualSessionFile, task?.sessionId, sessionFingerprint(task), task?.id].filter(Boolean).map(String);
+}
+
+function samePiSessionTask(a, b) {
+  const aKeys = new Set(piSessionMatchKeys(a));
+  return piSessionMatchKeys(b).some((key) => aKeys.has(key));
+}
+
+function dedupePiSessionTasks(tasks) {
+  const merged = [];
+  for (const task of tasks) {
+    const index = merged.findIndex((entry) => sameLogicalTask(entry, task));
+    if (index === -1) {
+      merged.push(task);
+      continue;
+    }
+    const previous = merged[index];
+    const previousTime = Date.parse(previous.updatedAt || previous.lastEventAt || previous.finishedAt || previous.startedAt || 0) || 0;
+    const nextTime = Date.parse(task.updatedAt || task.lastEventAt || task.finishedAt || task.startedAt || 0) || 0;
+    const newer = nextTime >= previousTime ? task : previous;
+    const older = newer === task ? previous : task;
+    merged[index] = enrichTask({
+      ...older,
+      ...newer,
+      lastInput: newer.lastInput || older.lastInput,
+      text: newer.text || older.text,
+      progress: newer.progress || older.progress,
+      sessionFile: newer.sessionFile || older.sessionFile,
+      actualSessionFile: newer.actualSessionFile || older.actualSessionFile,
+      sessionId: newer.sessionId || older.sessionId,
+    });
+  }
+  return merged;
+}
+
+async function mergeOpenPiSessions(tasks, dismissed) {
+  const sessions = await listPiSessionTasks();
+  const visibleSessions = sessions.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
+  const merged = tasks.map((task) => {
+    const activeSession = visibleSessions.find((session) => sameLogicalTask(task, session));
+    if (!activeSession) return task;
+    const taskStatus = String(task.status || "").toLowerCase();
+    const activeStatus = String(activeSession.status || "").toLowerCase();
+    const terminalTask = task.finishedAt || ["complete", "completed", "done", "error", "stopped", "inactive"].includes(taskStatus);
+    const liveTrackedWorker = taskHasActiveWorker(task);
+    const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus) && !liveTrackedWorker;
+    return {
+      ...task,
+      status: terminalTask && staleBusySession ? task.status : (activeSession.status || task.status),
+      finishedAt: terminalTask && staleBusySession ? task.finishedAt : activeSession.finishedAt,
+      text: activeSession.text || task.text,
+      progress: activeSession.progress || task.progress,
+      lastEventAt: activeSession.lastEventAt || task.lastEventAt,
+      updatedAt: activeSession.updatedAt || task.updatedAt,
+    };
+  });
+  for (const session of visibleSessions) {
+    if (!merged.some((task) => sameLogicalTask(task, session))) merged.push(session);
+  }
+  return dedupePiSessionTasks(merged);
+}
+
 async function listAllTasks() {
   const dismissed = await readDismissedTaskKeys();
   const rawTasks = await readTasks();
   const reconciledRawTasks = rawTasks.map(reconcileStoredTask);
   if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
-  const tasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed));
-  const taskKeys = new Set(tasks.flatMap((task) => [task.sessionFile, task.actualSessionFile]).filter(Boolean));
-  const sessions = (await listPiSessionTasks()).filter((task) => !taskKeys.has(task.sessionFile) && !taskKeys.has(task.actualSessionFile) && !isTaskDismissed(task, dismissed));
-  return [...tasks, ...sessions];
+  const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
+  const mergedTasks = await mergeOpenPiSessions(storedTasks, dismissed);
+  // Anything that appears in mi agents should stay there until Kyle clears it.
+  // Discovered/open pi sessions used to disappear after the recent-session window;
+  // persist the merged view so refreshes and daemon restarts keep the task row.
+  if (JSON.stringify(reconciledRawTasks) !== JSON.stringify(mergedTasks)) await writeTasks(mergedTasks);
+  return mergedTasks;
 }
 
 async function stopTask(request) {
@@ -325,11 +503,36 @@ async function dismissTask(request) {
   return { text: `Removed ${match?.sessionName || match?.name || requested[0]} from task list` };
 }
 
-async function resumePiSessions() {
-  await writeDismissedTaskKeys(new Set());
+async function listPiSessionsForResume() {
   piSessionTaskCache = { at: 0, tasks: [] };
-  const sessions = await listPiSessionTasks();
-  return { text: `Added ${sessions.length} Mi session${sessions.length === 1 ? "" : "s"} to task list`, count: sessions.length };
+  return (await listPiSessionTasks()).filter((task) => !isExcludedPiSessionTask(task));
+}
+
+async function resumePiSession(request) {
+  const requested = [request.taskId, request.id, request.sessionFile, request.actualSessionFile, request.sessionId, request.sessionName, request.name].filter(Boolean).map(String);
+  if (requested.length === 0) throw new Error("session id required");
+  const sessions = await listPiSessionsForResume();
+  const session = sessions.find((task) => taskDismissKeys(task).some((key) => requested.includes(key)));
+  if (!session) throw new Error(`Session not found: ${requested[0]}`);
+  const dismissed = await readDismissedTaskKeys();
+  for (const key of taskPersistentDismissKeys(session)) dismissed.delete(key);
+  await writeDismissedTaskKeys(dismissed);
+  piSessionTaskCache = { at: 0, tasks: [] };
+  const task = await upsertTask(session);
+  return { text: `Added ${task.sessionName || task.name || requested[0]} as task`, task };
+}
+
+async function resumePiSessions() {
+  const sessions = await listPiSessionsForResume();
+  const activeSessions = sessions.filter((task) => ["active", "running"].includes(String(task.status || "").toLowerCase()));
+  const dismissed = await readDismissedTaskKeys();
+  for (const task of activeSessions) {
+    for (const key of taskPersistentDismissKeys(task)) dismissed.delete(key);
+    await upsertTask(task);
+  }
+  await writeDismissedTaskKeys(dismissed);
+  piSessionTaskCache = { at: 0, tasks: [] };
+  return { text: `Restored ${activeSessions.length} active Mi session${activeSessions.length === 1 ? "" : "s"}; past dismissed sessions stay hidden`, count: activeSessions.length };
 }
 
 async function writeTasks(tasks) {
@@ -364,7 +567,8 @@ function enrichTask(task) {
 
 async function upsertTask(task) {
   const tasks = await readTasks();
-  const index = tasks.findIndex((entry) => entry.id === task.id);
+  const taskIsPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
+  const index = tasks.findIndex((entry) => entry.id === task.id || sameLogicalTask(entry, task));
   const previous = index >= 0 ? tasks[index] : undefined;
   const next = enrichTask({ ...task, updatedAt: new Date().toISOString() });
   const merged = index >= 0 ? enrichTask({ ...previous, ...next }) : next;
@@ -433,7 +637,19 @@ async function mirrorSessionToHome(sessionFile) {
   return linkPath;
 }
 
+function scheduleStopPi() {
+  if (piIdleTimer) clearTimeout(piIdleTimer);
+  if (!piProc || piProc.killed || activePrompt || promptQueue.length > 0 || pending.size > 0) return;
+  piIdleTimer = setTimeout(() => {
+    piIdleTimer = undefined;
+    if (!piProc || piProc.killed || activePrompt || promptQueue.length > 0 || pending.size > 0) return;
+    log("stopping idle Mi main pi");
+    piProc.kill();
+  }, MI_MAIN_IDLE_MS);
+}
+
 function startPi() {
+  if (piIdleTimer) { clearTimeout(piIdleTimer); piIdleTimer = undefined; }
   if (piProc && !piProc.killed) return;
   log(`starting ${PI_BIN} --mode rpc --session-dir ${SESSION_DIR} --model ${MI_MODEL}`);
   piProc = spawn(PI_BIN, ["--mode", "rpc", "--session-dir", SESSION_DIR, "--model", MI_MODEL], {
@@ -449,7 +665,7 @@ function startPi() {
     for (const entry of pending.values()) entry.reject(new Error("Mi main pi process exited"));
     pending.clear();
     piProc = undefined;
-    setTimeout(startPi, 1000);
+    if (activePrompt || promptQueue.length > 0 || pending.size > 0) setTimeout(startPi, 1000);
   });
 }
 
@@ -467,11 +683,16 @@ function messageText(message) {
   return "";
 }
 
+function isNonFinalAssistantText(text) {
+  const normalized = String(text || "").trim().toLowerCase();
+  return normalized === "queued goal continuation is no longer active.";
+}
+
 function lastAssistantText(messages = []) {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role === "assistant") {
       const text = messageText(messages[i]);
-      if (text) return text;
+      if (text && !isNonFinalAssistantText(text)) return text;
     }
   }
   return "";
@@ -503,11 +724,13 @@ function onStdout(chunk) {
       if (!entry) continue;
       pending.delete(payload.id);
       payload.success ? entry.resolve(payload.data ?? payload) : entry.reject(new Error(payload.error || "Mi RPC failed"));
+      scheduleStopPi();
     } else if (payload.type === "agent_end" && activePrompt) {
       const entry = activePrompt;
       activePrompt = undefined;
       entry.resolve(lastAssistantText(payload.messages) || "Mi completed without text.");
       maybeStartNextPrompt();
+      scheduleStopPi();
     }
   }
 }
@@ -659,14 +882,14 @@ function isSlashCommand(message) {
   return /^\/[A-Za-z][\w:-]*(?:\s|$)/.test(String(message || "").trim());
 }
 
-function workerInputMessage(message, useGoal = "1") {
+function workerInputMessage(message, useGoal = "0") {
   return isSlashCommand(message) ? String(message || "").trim() : wrapWorkerMessage(message, useGoal);
 }
 
-function wrapWorkerMessage(message, useGoal = "1") {
-  return String(useGoal) === "0" || message.trim().startsWith("/goal")
-    ? message
-    : `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next.`;
+function wrapWorkerMessage(message, useGoal = "0") {
+  return String(useGoal) === "1" && !message.trim().startsWith("/goal")
+    ? `/goal ${message}\n\nWhen done, provide a concise final summary with concrete outcome, files changed, tests/checks run, PR URL if any, and what Kyle should do next.`
+    : message;
 }
 
 function installTaskHeartbeat(worker, task) {
@@ -732,6 +955,7 @@ async function runWorker(request) {
       sessionId: before.sessionId,
       sessionName: before.sessionName || name,
       model: before.model,
+      lastInput: message,
     });
     installTaskHeartbeat(worker, task);
     const done = worker.waitAgentEnd();
@@ -764,8 +988,9 @@ async function continueWorker(request) {
   const name = task.sessionName || task.name || task.id;
   const activeWorker = activeWorkers.get(task.id) || activeWorkers.get(task.name) || activeWorkers.get(name) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
-    await activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" });
-    await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued" });
+    await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
+    void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
+      .catch((error) => upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message }));
     await appendMainThreadMessage(`Task updated: ${name}\n\nStatus: running\nFollow-up queued.`, "mi-task-status").catch(() => undefined);
     return { text: `Queued message for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
   }
@@ -774,18 +999,28 @@ async function continueWorker(request) {
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
   const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
+  const updated = await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
+  if (request.background) {
+    trackActiveWorker(updated, name, worker);
+    void (async () => {
+      const before = await worker.rpc({ type: "get_state" });
+      installTaskHeartbeat(worker, updated);
+      const done = worker.waitAgentEnd();
+      await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
+      await appendMainThreadMessage(`Task updated: ${name}\n\nStatus: running\nOpen in /resume: ${task.sessionFile || sessionFile || "unknown"}`, "mi-task-status").catch(() => undefined);
+      void finishTask({ task: updated, worker, before, sessionFile, name, done, kind: "Task updated" });
+    })().catch(async (error) => {
+      await upsertTask({ ...updated, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message });
+      untrackActiveWorker(updated, name);
+      worker.proc.kill();
+    });
+    return { text: `Sent follow-up to background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+  }
   try {
     const before = await worker.rpc({ type: "get_state" });
-    const updated = await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued" });
     installTaskHeartbeat(worker, updated);
     const done = worker.waitAgentEnd();
     await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
-    if (request.background) {
-      trackActiveWorker(updated, name, worker);
-      await appendMainThreadMessage(`Task updated: ${name}\n\nStatus: running\nOpen in /resume: ${task.sessionFile || sessionFile || "unknown"}`, "mi-task-status").catch(() => undefined);
-      void finishTask({ task: updated, worker, before, sessionFile, name, done, kind: "Task updated" });
-      return { text: `Sent follow-up to background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
-    }
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
     const text = lastAssistantText(end.messages) || "Worker completed without text.";
@@ -888,6 +1123,17 @@ async function handle(socket, request) {
     socket.end(JSON.stringify({ ok: true, ...result }) + "\n");
     return;
   }
+  if (request.type === "list_pi_sessions") {
+    socket.end(JSON.stringify({ ok: true, sessions: await listPiSessionsForResume() }) + "\n");
+    return;
+  }
+
+  if (request.type === "resume_session") {
+    const result = await resumePiSession(request);
+    socket.end(JSON.stringify({ ok: true, ...result }) + "\n");
+    return;
+  }
+
   if (request.type === "resume_sessions") {
     const result = await resumePiSessions();
     socket.end(JSON.stringify({ ok: true, ...result }) + "\n");
@@ -896,10 +1142,10 @@ async function handle(socket, request) {
   throw new Error(`Unknown request type: ${request.type}`);
 }
 
-await mkdir(dirname(SOCKET_PATH), { recursive: true });
+if (!(await acquireDaemonLock())) process.exit(0);
 if (existsSync(SOCKET_PATH)) await rm(SOCKET_PATH, { force: true });
 await mkdir(SESSION_DIR, { recursive: true });
-startPi();
+// Keep the daemon lightweight: Mi main pi starts lazily on prompt/state/model requests.
 
 const server = net.createServer((socket) => {
   let data = "";
@@ -919,5 +1165,7 @@ process.on("SIGTERM", async () => {
   piProc?.kill();
   for (const worker of activeWorkers.values()) worker.proc?.kill();
   await rm(SOCKET_PATH, { force: true }).catch(() => undefined);
+  await rm(LOCK_PATH, { force: true }).catch(() => undefined);
+  await daemonLockHandle?.close().catch(() => undefined);
   process.exit(0);
 });

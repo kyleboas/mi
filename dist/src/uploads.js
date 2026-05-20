@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 const ROOT = process.env.MI_ROOT || process.cwd();
@@ -28,15 +28,37 @@ async function writeTokens(tokens) {
     await mkdir(dirname(TOKEN_PATH), { recursive: true });
     await writeFile(TOKEN_PATH, JSON.stringify(tokens, null, 2));
 }
+function cloudflareUploadConfig() {
+    const baseUrl = process.env.MI_CLOUDFLARE_UPLOAD_BASE_URL || process.env.MI_UPLOAD_CLOUDFLARE_BASE_URL;
+    const secret = process.env.MI_UPLOAD_SIGNING_SECRET || process.env.MI_CLOUDFLARE_UPLOAD_SECRET;
+    return baseUrl && secret ? { baseUrl: baseUrl.replace(/\/$/, ''), secret } : undefined;
+}
+function signUploadToken(payload, secret) {
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = createHmac('sha256', secret).update(body).digest('base64url');
+    return `${body}.${signature}`;
+}
 export async function createUploadLink(baseUrl = uploadPublicBaseUrl()) {
+    const now = Date.now();
+    const cloudflare = cloudflareUploadConfig();
+    if (cloudflare) {
+        const token = signUploadToken({
+            v: 1,
+            n: randomBytes(18).toString('base64url'),
+            iat: now,
+            exp: now + UPLOAD_TTL_MS,
+            max: UPLOAD_MAX_BYTES,
+            types: Object.keys(IMAGE_TYPES),
+        }, cloudflare.secret);
+        return { token, expiresAt: new Date(now + UPLOAD_TTL_MS).toISOString(), maxBytes: UPLOAD_MAX_BYTES, url: `${cloudflare.baseUrl}/u/${token}`, provider: 'cloudflare' };
+    }
     await cleanupUploads().catch(() => undefined);
     const token = randomBytes(24).toString('base64url');
-    const now = Date.now();
     const record = { token, createdAt: new Date(now).toISOString(), expiresAt: new Date(now + UPLOAD_TTL_MS).toISOString(), used: false };
     const tokens = (await readTokens()).filter((item) => Date.parse(item.expiresAt) > now && !item.used);
     tokens.push(record);
     await writeTokens(tokens);
-    return { token, expiresAt: record.expiresAt, maxBytes: UPLOAD_MAX_BYTES, url: `${baseUrl}/u/${token}` };
+    return { token, expiresAt: record.expiresAt, maxBytes: UPLOAD_MAX_BYTES, url: `${baseUrl}/u/${token}`, provider: 'local' };
 }
 export function safeImageName(original, contentType) {
     const clean = basename(original || '').replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '').slice(0, 80);

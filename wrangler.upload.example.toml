@@ -1,0 +1,23 @@
+name = "mi-upload"
+main = "workers/cloudflare-upload-worker.js"
+compatibility_date = "2026-05-19"
+
+# Route this Worker to a public HTTPS hostname, then set:
+#   MI_CLOUDFLARE_UPLOAD_BASE_URL=https://upload.example.com
+#   MI_UPLOAD_SIGNING_SECRET=<same secret in Worker>
+# in the environment where `mi upload` runs.
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "mi-upload-images"
+
+[[kv_namespaces]]
+binding = "USED_UPLOAD_TOKENS"
+id = "replace-with-kv-namespace-id"
+
+[vars]
+# Public URL used for returned /i/<key> image references. Defaults to request origin.
+# MI_UPLOAD_PUBLIC_BASE_URL = "https://upload.example.com"
+
+# Secret must be configured with wrangler secret, not committed:
+#   wrangler secret put MI_UPLOAD_SIGNING_SECRET

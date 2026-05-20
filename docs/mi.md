@@ -85,6 +85,45 @@ mi logs <assistant>
 
 From this repo before install, use `npm run mi -- ...`.
 
+Mi chat UI slash commands are reserved for useful in-context actions. `/inbox` is intentionally hidden there because Mi already opens on the durable main inbox and temporary threads are legacy/troubleshooting state; use `/tasks` for actionable background worker status or `mi inbox`/`mi threads` from a shell when inspecting thread files.
+
+## Background pi workers
+
+Mi can launch and continue separate pi conversations as background workers:
+
+```bash
+mi agents
+mi task <name> [--cwd <path>] -- <task prompt>
+mi task reply <task-id-or-name> -- <follow-up prompt>
+mi task list
+```
+
+`mi task` runs pi in RPC mode from the requested cwd and stores worker sessions in the default pi session store (`~/.pi/agent/sessions`) so they remain visible in normal pi `/resume`. Prompts and follow-ups are sent as written by default. Use an explicit `/goal ...` prompt only when you want pi standing-goal behavior.
+
+For Mi background tasks, `mi task reply <task-id-or-name> -- <message>` uses the same steering semantics as pi's normal queued messages while a task is active: Mi queues the message into the active RPC worker with `streamingBehavior: "steer"`. This lets the current worker incorporate the queued steer instead of creating another worker on the same task. If no active worker is tracked, Mi falls back to resuming the saved task session.
+
+## mi-agents live view
+
+`mi agents` is the live terminal view for background workers and discovered pi sessions. It uses pi-tui's differential renderer without the alternate screen, so it avoids flicker while preserving tmux scrollback. The view dedupes rows by task/session identity, parses pi session UUIDs from session filenames, and persists visible tasks until Kyle clears them.
+
+Key behavior:
+
+- Normal typed text replies to the selected task. New tasks are explicit via `/new <prompt>`.
+- `/goal ...` is treated as task prompt text, not as a local mi-agents slash command.
+- `/resume` opens a picker for recent/default pi sessions; selected sessions are persisted into the Mi task list.
+- `/model` opens a pi-style model picker for new tasks and replies; Shift+Tab cycles thinking level.
+- `^L` opens full-output mode for the selected task. Arrow keys and PageUp/PageDown scroll the output; `^L` exits it.
+- `m` toggles multi-select clear mode. Enter/Space toggles a row; Esc clears selected rows.
+- `/mi <question>` asks Mi main about the selected task context and stays in that side-chat until Ctrl-C.
+- `/upload` creates a short-lived image upload link.
+
+Daemon behavior:
+
+- Discovered/open pi sessions are merged with stored tasks and remain visible until cleared.
+- Stale busy session state does not overwrite a terminal stored task result when no live Mi worker exists.
+- Dismissed task/session keys are persisted.
+- Known noisy tacticsjournal research-pipeline pi sessions are excluded from the list.
+
 ## Role of Tailscale
 
 The Mi web UI remains private and Tailnet-only. Tailscale is the only remote control surface; there is no public webhook/control UI. Persistent Flue orchestration binds to loopback and is reached through Mi, not directly. Pushover is only for safe notifications, not a control plane.

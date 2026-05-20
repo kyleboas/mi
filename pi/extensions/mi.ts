@@ -1,5 +1,13 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { Input, Key, matchesKey, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@mariozechner/pi-tui";
+import {
+	AssistantMessageComponent,
+	CustomEditor,
+	getMarkdownTheme,
+	UserMessageComponent,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type KeybindingsManager,
+} from "@mariozechner/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth, type Component, type Focusable, type TUI } from "@mariozechner/pi-tui";
 import { execFile, spawn } from "node:child_process";
 import net from "node:net";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -278,8 +286,23 @@ async function handleBringIn(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
 	await notify(ctx, "Brought recent Mi context into this pi conversation.", "success");
 }
 
+type MiTheme = { fg: (style: any, text: string) => string; bg?: (style: any, text: string) => string };
+
+function miEditorTheme(theme: MiTheme) {
+	return {
+		borderColor: (text: string) => theme.fg("borderMuted", text),
+		selectList: {
+			selectedPrefix: (text: string) => theme.fg("accent", text),
+			selectedText: (text: string) => theme.fg("accent", text),
+			description: (text: string) => theme.fg("muted", text),
+			scrollInfo: (text: string) => theme.fg("muted", text),
+			noMatch: (text: string) => theme.fg("muted", text),
+		},
+	};
+}
+
 class MiThreadPanel implements Component, Focusable {
-	private input = new Input();
+	private editor: CustomEditor;
 	private transcript: Array<{ role: "user" | "assistant"; text: string }> = [];
 	private seenMessageIds = new Set<string>();
 	private pending = false;
@@ -300,17 +323,24 @@ class MiThreadPanel implements Component, Focusable {
 
 	set focused(value: boolean) {
 		this._focused = value;
-		this.input.focused = value;
+		this.editor.focused = value;
 	}
 
-	constructor(initial: string, private done: () => void, private theme: { fg: (style: any, text: string) => string; bg?: (style: any, text: string) => string }) {
-		this.input.onSubmit = (value) => {
+	constructor(
+		initial: string,
+		private done: () => void,
+		private theme: MiTheme,
+		tui: TUI,
+		keybindings: KeybindingsManager,
+	) {
+		this.editor = new CustomEditor(tui, miEditorTheme(theme), keybindings);
+		this.editor.onSubmit = (value) => {
 			const text = value.trim();
 			if (!text) return;
-			this.input.setValue("");
+			this.editor.setText("");
+			this.editor.addToHistory(text);
 			this.enqueue(text);
 		};
-		this.input.onEscape = () => this.close();
 		void this.load(initial);
 		this.threadPollTimer = setInterval(() => void this.pollThread(), 2000);
 	}
@@ -421,14 +451,19 @@ class MiThreadPanel implements Component, Focusable {
 		}
 		if (matchesKey(data, Key.pageUp)) this.scrollOffset += 10;
 		else if (matchesKey(data, Key.pageDown)) this.scrollOffset = Math.max(0, this.scrollOffset - 10);
-		else this.input.handleInput(data);
+		else this.editor.handleInput(data);
 		this.invalidate();
 		this.requestRender?.();
 	}
 
-	private userLine(text: string, width: number) {
-		const padded = truncateToWidth(`  ${text}`, width).padEnd(width, " ");
-		return this.theme.bg ? this.theme.bg("userMessageBg", padded) : this.theme.fg("muted", padded);
+	private renderUserMessage(text: string, width: number) {
+		return new UserMessageComponent(text, getMarkdownTheme()).render(width);
+	}
+
+	private renderAssistantMessage(text: string, width: number) {
+		const trimmed = text.trim();
+		if (!trimmed) return [];
+		return new AssistantMessageComponent({ content: [{ type: "text", text: trimmed }] } as any, false, getMarkdownTheme()).render(width);
 	}
 
 	private statusLine(width: number) {
@@ -440,20 +475,13 @@ class MiThreadPanel implements Component, Focusable {
 
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		const innerWidth = Math.max(20, width - 4);
 		const body: string[] = [];
 		for (const item of this.transcript) {
-			if (item.role === "user") {
-				body.push(this.userLine("", width));
-				for (const line of wrapTextWithAnsi(item.text, innerWidth)) body.push(this.userLine(line, width));
-				body.push(this.userLine("", width), "");
-			} else {
-				body.push(...wrapTextWithAnsi(item.text, innerWidth));
-				body.push("");
-			}
+			if (item.role === "user") body.push(...this.renderUserMessage(item.text, width));
+			else body.push(...this.renderAssistantMessage(item.text, width));
 		}
 		if (this.pending) body.push(this.workingLine(), "");
-		const inputLines = this.input.render(Math.max(10, width));
+		const inputLines = this.editor.render(Math.max(10, width));
 		const viewport = Math.max(1, 18 - Math.max(0, inputLines.length - 1));
 		const maxOffset = Math.max(0, body.length - viewport);
 		const offset = Math.min(this.scrollOffset, maxOffset);
@@ -475,13 +503,13 @@ class MiThreadPanel implements Component, Focusable {
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
-		this.input.invalidate();
+		this.editor.invalidate();
 	}
 }
 
 async function showMiThread(initial: string, ctx: ExtensionCommandContext) {
 	await ctx.ui.custom<void>((_tui, _theme, _keybindings, done) => {
-		const panel = new MiThreadPanel(initial, done, _theme);
+		const panel = new MiThreadPanel(initial, done, _theme, _tui, _keybindings);
 		panel.setRequestRender(() => _tui.requestRender());
 		return panel;
 	});
@@ -497,7 +525,7 @@ export default function miExtension(pi: ExtensionAPI) {
 		pi.on("before_agent_start", async (event) => ({
 			systemPrompt:
 				event.systemPrompt +
-				"\n\nMi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under `/home/kyle/mi/` (for example `/home/kyle/mi/TODO.md`, `/home/kyle/mi/goals.md`, or task-specific `.md` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send `prompt` commands, queue `steer`/`follow_up`, inspect `get_state`/`get_messages`, `abort` if needed, and `new_session` for fresh threads. Keep worker conversations visible in normal `/resume` by using the default pi session store: run `pi --mode rpc` from the relevant project cwd, or explicitly `pi --mode rpc --session-dir /home/kyle/.pi/agent/sessions`. Do not create worker sessions under nested custom session dirs like `/home/kyle/.pi/agent/sessions/mi-workers/...` unless the user asks for hidden/isolated sessions. Set helpful session names with `set_session_name` so they are easy to find in `/resume`. If useful, write small Node/shell supervisor scripts under /home/kyle/.pi/agent/mi/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available.",
+				"\n\nMi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under `/home/kyle/mi/` (for example `/home/kyle/mi/TODO.md`, `/home/kyle/mi/goals.md`, or task-specific `.md` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send `prompt` commands, queue `steer`/`follow_up`, inspect `get_state`/`get_messages`, `abort` if needed, and `new_session` for fresh threads. Keep worker conversations visible in normal `/resume` by using the default pi session store: run `pi --mode rpc` from the relevant project cwd, or explicitly `pi --mode rpc --session-dir /home/kyle/.pi/agent/sessions`. Do not create worker sessions under nested custom session dirs like `/home/kyle/.pi/agent/sessions/mi-workers/...` unless the user asks for hidden/isolated sessions. Set helpful session names with `set_session_name` so they are easy to find in `/resume`. If useful, write small Node/shell supervisor scripts under /home/kyle/.pi/agent/mi/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available. When Kyle asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring manual cron syntax. Mi crons live in `/home/kyle/mi/state/crons.json` and are managed with `mi cron add <name> --every 1h [--cwd <path>] -- <command>`, `mi cron list`, `mi cron tick`, and `mi cron remove <name>`. Ask only for missing repo/path, cadence, health command, and alert behavior. When Kyle gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with `mi task <name> [--cwd <path>] -- <task prompt>`. Name it clearly. Mi task sends the prompt as written by default; Kyle may still start a task prompt with `/goal` when he wants explicit standing-goal behavior. This command returns after the worker starts; do not wait for the task to finish before replying to Kyle. Worker sessions use `/home/kyle/.pi/agent/sessions` so Kyle can see them in `/resume`. Use `mi task list` to inspect background task status. When Kyle responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: `mi task reply <task-id-or-name> -- <follow-up prompt>`. Follow-ups are sent as written too; if Kyle starts the follow-up with `/goal`, it is forwarded as a pi slash command. Escalate to Kyle when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs Kyle review/merge.",
 		}));
 
 		// Socket/UI clients own thread persistence. Do not mirror raw Mi-main
