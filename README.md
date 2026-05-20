@@ -87,6 +87,7 @@ From this repo before install, use `npm run mi --` and `npm run mi -- agents`.
 - `/new <prompt>` starts a new background task from the view.
 - Enter on normal text replies to the selected task; `/goal ...` is forwarded as task prompt text.
 - `/resume` opens a picker for recent/default pi sessions so they can be added to the task list.
+- `/open` opens the selected background agent in pi.
 - `/model` opens a pi-style model picker; Shift+Tab cycles thinking level.
 - `^L` toggles full-output mode; arrows/PageUp/PageDown scroll that output.
 - `^M` toggles multi-select clear mode; Esc clears selected rows or exits input modes.
@@ -98,20 +99,20 @@ Mi discovers pi sessions from the default pi session store (`~/.pi/agent/session
 
 A global pi extension is installed at `~/.pi/agent/extensions/mi.ts`.
 
-Inside pi:
+Inside pi, the Mi extension exposes a single slash command: `/mi`.
 
 ```bash
+/mi             # open the Mi side-channel thread
 /mi <message>   # send a side-channel message to Mi main without sending it to the current pi agent turn
 /mi read        # show unread or recent Mi messages
 /mi inbox       # show Mi threads
 /mi bring-in    # explicitly inject recent Mi context into the current pi conversation
-/upload        # create a temporary image upload link and insert it into this conversation
-/mi upload     # same upload helper through the Mi extension
+/mi upload      # create a temporary image upload link and insert it into this conversation
 ```
 
-`/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation.
+`/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation. Bare `mi ...` input and standalone pi `/upload` are not registered by the extension; use `/mi` and `/mi upload` instead.
 
-Image uploads: `mi upload`, Mi `/upload`, and pi `/upload` create a 15-minute one-time link under `/u/<token>`. By default this uses the Mi web app local uploader (`MI_PUBLIC_BASE_URL`, `MI_UPLOAD_DIR`). For public Cloudflare uploads, deploy `workers/cloudflare-upload-worker.js` with R2 + KV (see `wrangler.upload.example.toml`) and set `MI_CLOUDFLARE_UPLOAD_BASE_URL` plus `MI_UPLOAD_SIGNING_SECRET` where `mi` runs. The Cloudflare path uses signed, short-lived, single-use tokens; accepts JPEG/PNG/GIF/WebP only; enforces the 10 MiB default size cap; verifies image magic bytes; has no list endpoint; and stores images at unguessable R2 keys.
+Image uploads: `mi upload`, Mi `/upload`, and pi `/mi upload` create a 15-minute one-time link under `/u/<token>`. By default this uses the Mi web app local uploader (`MI_PUBLIC_BASE_URL`, `MI_UPLOAD_DIR`). For public Cloudflare uploads, deploy `workers/cloudflare-upload-worker.js` with R2 + KV (see `wrangler.upload.example.toml`) and set `MI_CLOUDFLARE_UPLOAD_BASE_URL` plus `MI_UPLOAD_SIGNING_SECRET` where `mi` runs. The Cloudflare path uses signed, short-lived, single-use tokens; accepts JPEG/PNG/GIF/WebP only; enforces the 10 MiB default size cap; verifies image magic bytes; has no list endpoint; and stores images at unguessable R2 keys.
 
 ## Run web app
 
