@@ -385,11 +385,11 @@ async function listPiSessionTasks() {
     if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
       return enrichTask({
         ...task,
-        status: "inactive",
-        needsUser: false,
-        needsUserReason: undefined,
-        finishedAt: task.finishedAt || task.lastEventAt || task.updatedAt || new Date().toISOString(),
-        progress: task.progress || "interactive pi session stopped",
+        status: "paused",
+        needsUser: true,
+        needsUserReason: "interactive pi session stopped before replying",
+        finishedAt: undefined,
+        progress: task.progress || `stopped; needs ${miUserName()} input`,
       });
     }
     return task;
@@ -421,10 +421,12 @@ function sameLogicalTask(a, b) {
 function reconcileStoredTask(task) {
   const status = String(task.status || "").toLowerCase();
   if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status) && !taskHasActiveWorker(task)) {
-    const lastActiveAt = Date.parse(task.continuedAt || task.lastEventAt || task.updatedAt || task.startedAt || 0) || 0;
-    if (Date.now() - lastActiveAt < 120000) return task;
-    const finishedAt = task.finishedAt || task.lastEventAt || task.updatedAt || new Date().toISOString();
-    return { ...task, status: "inactive", finishedAt, progress: task.progress || "worker is no longer running" };
+    // A task that has entered Working must stay Working until an authoritative
+    // terminal event updates it: finishTask() writes complete with final output,
+    // worker failure writes error, and stop_task writes paused/needsUser.
+    // Do not infer "inactive" from a missing in-memory worker: the daemon may
+    // have restarted, or a session scan may lag behind the actual worker.
+    return { ...task, status: task.status || "running", finishedAt: undefined };
   }
   return task;
 }
@@ -486,17 +488,20 @@ async function mergeOpenPiSessions(tasks, dismissed) {
       };
     }
     const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus);
+    const storedWorking = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(taskStatus) && !task.finishedAt;
+    const scannedComplete = ["complete", "completed", "done", "inactive"].includes(activeStatus) || activeSession.finishedAt;
     const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused");
+    const preserveStoredWorking = storedWorking && scannedComplete;
     return {
       ...task,
-      status: preserveStoredTerminal ? task.status : (activeSession.status || task.status),
+      status: (preserveStoredTerminal || preserveStoredWorking) ? task.status : (activeSession.status || task.status),
       needsUser: preserveStoredTerminal ? task.needsUser : (activeSession.needsUser ?? task.needsUser),
       needsUserReason: preserveStoredTerminal ? task.needsUserReason : (activeSession.needsUserReason || task.needsUserReason),
-      finishedAt: preserveStoredTerminal ? task.finishedAt : activeSession.finishedAt,
-      text: preserveStoredTerminal ? task.text : (activeSession.text || task.text),
-      progress: preserveStoredTerminal ? task.progress : (activeSession.progress || task.progress),
+      finishedAt: (preserveStoredTerminal || preserveStoredWorking) ? task.finishedAt : activeSession.finishedAt,
+      text: (preserveStoredTerminal || preserveStoredWorking) ? task.text : (activeSession.text || task.text),
+      progress: (preserveStoredTerminal || preserveStoredWorking) ? task.progress : (activeSession.progress || task.progress),
       lastEventAt: activeSession.lastEventAt || task.lastEventAt,
-      updatedAt: preserveStoredTerminal ? task.updatedAt : (activeSession.updatedAt || task.updatedAt),
+      updatedAt: (preserveStoredTerminal || preserveStoredWorking) ? task.updatedAt : (activeSession.updatedAt || task.updatedAt),
     };
   });
   for (const session of visibleSessions) {
@@ -523,15 +528,18 @@ async function stopTask(request) {
   const requested = [request.taskId, request.id, request.sessionFile, request.actualSessionFile, request.sessionId, request.sessionName, request.name].filter(Boolean).map(String);
   if (requested.length === 0) throw new Error("taskId required");
   const tasks = await readTasks();
-  const task = tasks.find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
+  const sessions = await listPiSessionTasks();
+  const task = [...tasks, ...sessions].find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
   const activeWorker = task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) : undefined;
+  if (task) {
+    await upsertTask({ ...task, status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined, error: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: new Date().toISOString() });
+  }
   if (activeWorker && !activeWorker.proc.killed) {
     activeWorker.expectedStop = true;
     activeWorker.proc.kill();
   }
   if (task) {
-    await upsertTask({ ...task, status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: new Date().toISOString() });
     untrackActiveWorker(task, name);
   }
   return { text: `Stopped ${name}; moved to needs input` };
@@ -594,7 +602,7 @@ function extractPrUrls(text) {
 
 function detectNeedsUser(task) {
   const status = String(task.status || "").toLowerCase();
-  if (task.needsUser && task.needsUserReason === "stopped by Escape") return { needsUser: true, needsUserReason: "stopped by Escape" };
+  if (task.needsUser) return { needsUser: true, needsUserReason: task.needsUserReason || "requested" };
   if (status === "error") return { needsUser: true, needsUserReason: task.needsUserReason || "error" };
   return { needsUser: false, needsUserReason: undefined };
 }
@@ -945,6 +953,7 @@ function installTaskHeartbeat(worker, task) {
   let assistantText = "";
   let lastWrite = 0;
   worker.onEvent((event) => {
+    if (worker.expectedStop) return;
     const summary = summarizeWorkerEvent(event);
     if (!summary) return;
     if (event.type === "message_update") {
@@ -1041,9 +1050,14 @@ async function runWorker(request) {
     return { text, sessionFile: await mirrorSessionToHome(after.sessionFile || before.sessionFile), sessionId: after.sessionId || before.sessionId, sessionName: after.sessionName || name, model: after.model || before.model };
   } catch (error) {
     if (request.background && task) {
-      await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error) });
+      if (worker.expectedStop) {
+        await log(`worker_expected_stop ${name}`);
+      } else {
+        await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error) });
+      }
       untrackActiveWorker(task, name);
     }
+    if (worker.expectedStop) return { text: `Stopped ${name}; moved to needs input`, taskId: task?.id, sessionFile: task?.sessionFile, sessionId: task?.sessionId, sessionName: name };
     throw error;
   } finally {
     if (!request.background) worker.proc.kill();
@@ -1064,7 +1078,10 @@ async function continueWorker(request) {
   if (activeWorker && !activeWorker.proc.killed) {
     await upsertTask({ ...task, status: "running", finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
     void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
-      .catch((error) => upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message }));
+      .catch((error) => {
+        if (activeWorker.expectedStop) return log(`worker_expected_stop ${name}`);
+        return upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message });
+      });
     await appendMainThreadMessage(`Task updated: ${name}\n\nStatus: running\nFollow-up queued.`, "mi-task-status").catch(() => undefined);
     return { text: `Queued message for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
   }

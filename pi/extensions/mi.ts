@@ -582,23 +582,8 @@ Mi-specific capability note: You are the persistent Mi main agent. Store every M
 		}
 	}
 
-	pi.on("input", async (event, ctx) => {
-		if (event.source !== "interactive") return { action: "continue" };
-		const match = event.text.match(/^mi(?:\s+|$)([\s\S]*)/i);
-		if (!match) return { action: "continue" };
-		await handleMiArgs(match[1] || "", ctx);
-		return { action: "handled" };
-	});
-
-	pi.registerCommand("upload", {
-		description: "Create a temporary one-time image upload link and insert it into this conversation.",
-		async handler(_args: string, ctx: ExtensionCommandContext) {
-			await handleUpload(pi, ctx);
-		},
-	});
-
 	pi.registerCommand("mi", {
-		description: "Ask Mi a quick side question without adding it to the main assistant context; /mi read; /mi bring-in; /mi upload.",
+		description: "Open Mi, ask Mi, or run Mi subcommands: read, inbox, bring-in, upload.",
 		getArgumentCompletions(prefix) {
 			return ["read", "inbox", "bring-in", "upload"].filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
 		},
