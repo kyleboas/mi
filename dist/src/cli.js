@@ -821,8 +821,13 @@ async function miAgentsCommand() {
         syncingAgentEditor = false;
         requestRender();
     }
+    function taskRenderSignature(task) {
+        return [stableTaskKey(task), task.status, task.needsUser, task.needsUserReason, task.error, task.progress, task.text, task.finishedAt, task.updatedAt].map((value) => String(value ?? '')).join('\u001f');
+    }
     async function refresh() {
+        let forceFullRender = false;
         try {
+            const beforeRenderSignature = tasks.map(taskRenderSignature).join('\u001e');
             const selectedKey = selectedTask() ? stableTaskKey(selectedTask()) : '';
             const listedTasks = dedupeTasksByStableKey((await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task))));
             optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic) || taskName(task) === taskName(optimistic)));
@@ -846,15 +851,16 @@ async function miAgentsCommand() {
                     selected = nextSelected;
             }
             clampTaskSelection();
+            forceFullRender = beforeRenderSignature !== tasks.map(taskRenderSignature).join('\u001e');
             status = inputMode === 'normal' && !agentSubmitting ? (multiSelectMode ? multiSelectStatus() : defaultAgentStatus) : status;
         }
         catch (error) {
             status = error instanceof Error ? error.message : String(error);
         }
-        requestRender();
+        requestRender(forceFullRender);
     }
-    function requestRender() {
-        tui?.requestRender();
+    function requestRender(force = false) {
+        tui?.requestRender?.(force);
     }
     function selectedTask() {
         return selected >= 0 ? tasks[selected] : undefined;
@@ -1067,6 +1073,13 @@ async function miAgentsCommand() {
             pendingName = '';
             replyTarget = undefined;
             await openResumeMenu();
+            return true;
+        }
+        if (value === '/open') {
+            inputMode = 'normal';
+            pendingName = '';
+            replyTarget = undefined;
+            await openSelectedInPi();
             return true;
         }
         if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(value))) {
@@ -1282,17 +1295,22 @@ async function miAgentsCommand() {
             const prUrls = extractPrUrlsFromTask(task);
             if (prUrls.length > 0)
                 lines.push(fgDim(truncateText(`PR: ${prUrls.join(' ')}`, width)));
-            if (isTaskNeedsInput(task)) {
-                lines.push('');
-                lines.push(...renderPiAssistantMessage(taskNeedsInputQuestion(task), width).slice(0, Math.max(1, contentHeight - lines.length)));
-            }
             const lastInput = taskLastInput(task);
             if (lastInput) {
                 lines.push('');
                 lines.push(...renderPiUserMessage(lastInput, width).slice(0, Math.max(1, Math.min(4, contentHeight - lines.length))));
             }
             if (isTaskNeedsInput(task)) {
-                // Needs-input details and PR links are rendered above the last user input.
+                lines.push('');
+                if (!task.error && task.needsUserReason === 'stopped by Escape' && task.sessionFile) {
+                    const activity = readSessionActivitySteps(task.sessionFile, task, 12);
+                    const body = activity.length > 0 ? activity.map((line) => truncateText(line, width)) : renderPiAssistantMessage(taskNeedsInputQuestion(task), width);
+                    lines.push(...body.slice(0, Math.max(1, contentHeight - lines.length)));
+                }
+                else {
+                    const errorText = task.error || taskNeedsInputQuestion(task);
+                    lines.push(...renderPiAssistantMessage(errorText, width).slice(0, Math.max(1, contentHeight - lines.length)));
+                }
             }
             else if (isTaskActive(task) && task.sessionFile) {
                 const activity = readSessionActivitySteps(task.sessionFile, task, 12);
@@ -1662,6 +1680,11 @@ async function miAgentsCommand() {
             const task = selectedTask();
             if (task) {
                 if (isTaskNeedsInput(task)) {
+                    if (task.needsUserReason === 'stopped by Escape') {
+                        status = `${taskName(task)} is already in needs input`;
+                        requestRender();
+                        return;
+                    }
                     const key = stableTaskKey(task);
                     if (key) {
                         dismissedTaskKeys.add(key);
@@ -1708,9 +1731,7 @@ async function miAgentsCommand() {
             requestRender();
             return;
         }
-        if (data === 'o' && !inputBuffer)
-            void openSelectedInPi().catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
-        else if (isCtrlMShortcut(data) && !inputBuffer)
+        if (isCtrlMShortcut(data) && !inputBuffer)
             toggleMultiSelectMode();
         else if (multiSelectMode && !inputBuffer && (data === ' ' || data.includes('\r') || data.includes('\n')))
             toggleSelectedTaskForBulkClear();
@@ -2119,7 +2140,7 @@ function renderPiLastOutputMessage(text, width) {
 function renderMiTranscriptItem(item, width) {
     return item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiAssistantMessage(item.text, width);
 }
-const PI_SLASH_COMMANDS = ['/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/quit', '/mi', '/upload'];
+const PI_SLASH_COMMANDS = ['/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/open', '/quit', '/mi', '/upload'];
 const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/settings': 'Open settings menu',
     '/model': 'Select Mi model',
@@ -2141,6 +2162,7 @@ const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/new': 'Start a new Mi background agent',
     '/compact': 'Manually compact the session context',
     '/resume': 'Add an existing pi session as a task',
+    '/open': 'Open the selected agent in Pi',
     '/reload': 'Reload keybindings, extensions, skills, prompts, and themes',
     '/quit': 'Quit',
     '/mi': 'Chat with Mi about the selected task',
@@ -2210,7 +2232,7 @@ async function getModelAutocompleteItems(argumentPrefix) {
         description: model.provider,
     }));
 }
-const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/upload', '/resume', '/model', '/models', '/scoped-models']);
+const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/upload', '/resume', '/open', '/model', '/models', '/scoped-models']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 function slashCommandName(value) {
     return value.match(/^\/\S+/)?.[0] || '';
@@ -2979,7 +3001,17 @@ async function miTuiCommand(initial = '') {
         }
         else if (selectedAgentIndex >= 0 || agentListFocused) {
             const task = selectedAgent();
-            if (task) {
+            if (task && isTaskActive(task)) {
+                task.status = 'paused';
+                task.needsUser = true;
+                task.needsUserReason = 'stopped by Escape';
+                task.finishedAt = undefined;
+                task.progress = `stopped by Escape; needs ${miUserName()} input`;
+                task.updatedAt = new Date().toISOString();
+                statusMessage = `Stopped ${taskName(task)}; moved to needs input`;
+                void stopTaskInList(task).then(() => refreshCompactAgents()).catch((error) => { statusMessage = error instanceof Error ? error.message : String(error); requestRender(); });
+            }
+            else if (task) {
                 const key = stableTaskKey(task);
                 if (key)
                     dismissedCompactAgentKeys.add(key);
