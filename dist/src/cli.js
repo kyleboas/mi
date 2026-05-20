@@ -29,6 +29,20 @@ const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?
 const MI_AGENT_ANIMATION_MS = Number(process.env.MI_AGENT_ANIMATION_MS || PI_LOADER_INTERVAL_MS);
 const MI_WORKING_RENDER_MS = Number(process.env.MI_WORKING_RENDER_MS || PI_LOADER_INTERVAL_MS);
 const MI_SESSION_TAIL_BYTES = Number(process.env.MI_SESSION_TAIL_BYTES || 256 * 1024);
+let resolveModelScopeModule;
+let scopedModelsSelectorModule;
+async function resolvePiModelScope(patterns, modelRegistry) {
+    if (patterns.length === 0)
+        return [];
+    resolveModelScopeModule ||= import(new URL('./core/model-resolver.js', await import.meta.resolve('@mariozechner/pi-coding-agent')).href);
+    const { resolveModelScope } = await resolveModelScopeModule;
+    return resolveModelScope(patterns, modelRegistry);
+}
+async function getScopedModelsSelectorComponent() {
+    scopedModelsSelectorModule ||= import(new URL('./modes/interactive/components/scoped-models-selector.js', await import.meta.resolve('@mariozechner/pi-coding-agent')).href);
+    const { ScopedModelsSelectorComponent } = await scopedModelsSelectorModule;
+    return ScopedModelsSelectorComponent;
+}
 function usage() {
     return `Mi - tiny private assistant harness
 
@@ -805,12 +819,14 @@ async function miAgentsCommand() {
             optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic) || taskName(task) === taskName(optimistic)));
             tasks = dedupeTasksByStableKey([...optimisticTasks, ...listedTasks]).map((task) => {
                 const key = stableTaskKey(task);
-                const terminal = ['complete', 'error', 'stopped'].includes(String(task.status || '').toLowerCase());
-                const pendingStartedAt = pendingTaskUpdateStartedAt.get(key) || 0;
-                const terminalAt = Date.parse(task.finishedAt || task.updatedAt || '') || 0;
-                if (terminal && (!pendingStartedAt || terminalAt > pendingStartedAt)) {
-                    pendingTaskUpdates.delete(key);
-                    pendingTaskUpdateStartedAt.delete(key);
+                const terminal = ['complete', 'error', 'stopped', 'paused'].includes(String(task.status || '').toLowerCase());
+                if (terminal) {
+                    const pendingStartedAt = pendingTaskUpdateStartedAt.get(key) || 0;
+                    const terminalAt = Date.parse(task.finishedAt || task.updatedAt || task.continuedAt || '') || 0;
+                    if (terminalAt > pendingStartedAt) {
+                        pendingTaskUpdates.delete(key);
+                        pendingTaskUpdateStartedAt.delete(key);
+                    }
                 }
                 const update = pendingTaskUpdates.get(key);
                 return update ? { ...task, ...update } : task;
@@ -1004,15 +1020,24 @@ async function miAgentsCommand() {
             requestRender();
             return true;
         }
-        if (value === '/model' || value.startsWith('/model ')) {
-            const modelQuery = value.slice('/model'.length).trim();
-            if (modelQuery) {
-                agentModelSpec = agentModelWithThinking(modelQuery, agentThinkingLevel);
-                updateAgentEditorBorderColor();
-                status = `Model: ${agentModelSpec}`;
+        if (value === '/scoped-models') {
+            if (tui) {
+                status = 'Loading scoped models...';
+                requestRender();
+                agentModelPicker = await createExactPiScopedModelsSelector(tui, () => {
+                    agentModelPicker = undefined;
+                    status = defaultAgentStatus;
+                    requestRender();
+                }, (message) => { status = message; });
+                status = 'Configure scoped models';
             }
-            else if (tui) {
-                agentModelPicker = createExactPiModelSelector(tui, modelFromSpec(agentModelBase()), (model) => {
+            requestRender();
+            return true;
+        }
+        if (value === '/model' || value.startsWith('/model ') || value === '/models' || value.startsWith('/models ')) {
+            const modelQuery = value.replace(/^\/models?\b/, '').trim();
+            if (tui) {
+                agentModelPicker = await createExactPiModelSelector(tui, modelFromSpec(agentModelBase()), (model) => {
                     agentModelSpec = agentModelWithThinking(modelRef(model), agentThinkingLevel);
                     agentModelPicker = undefined;
                     updateAgentEditorBorderColor();
@@ -1022,7 +1047,7 @@ async function miAgentsCommand() {
                     agentModelPicker = undefined;
                     status = defaultAgentStatus;
                     requestRender();
-                });
+                }, modelQuery || undefined);
                 status = 'Select model';
             }
             requestRender();
@@ -1422,6 +1447,10 @@ async function miAgentsCommand() {
             requestRender();
             void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
                 .then(async () => {
+                if (taskKey) {
+                    pendingTaskUpdates.delete(taskKey);
+                    pendingTaskUpdateStartedAt.delete(taskKey);
+                }
                 await refresh();
                 setTimeout(() => void refresh(), 250);
             })
@@ -1605,7 +1634,19 @@ async function miAgentsCommand() {
             }
             const task = selectedTask();
             if (task) {
-                if (isTaskActive(task)) {
+                if (isTaskNeedsInput(task)) {
+                    const key = stableTaskKey(task);
+                    if (key) {
+                        dismissedTaskKeys.add(key);
+                        pendingTaskUpdates.delete(key);
+                        pendingTaskUpdateStartedAt.delete(key);
+                    }
+                    tasks = tasks.filter((entry) => stableTaskKey(entry) !== key);
+                    clampTaskSelection();
+                    status = `Removed ${taskName(task)} from list`;
+                    void dismissTaskFromList(task).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
+                }
+                else if (isTaskActive(task)) {
                     task.status = 'paused';
                     task.needsKyle = true;
                     task.needsKyleReason = 'stopped by Escape';
@@ -1613,6 +1654,11 @@ async function miAgentsCommand() {
                     task.progress = 'stopped by Escape; needs Kyle input';
                     task.updatedAt = new Date().toISOString();
                     status = `Stopped ${taskName(task)}; moved to needs input`;
+                    const taskKey = stableTaskKey(task);
+                    if (taskKey) {
+                        pendingTaskUpdates.set(taskKey, { status: 'paused', needsKyle: true, needsKyleReason: 'stopped by Escape', finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: task.updatedAt });
+                        pendingTaskUpdateStartedAt.delete(taskKey);
+                    }
                     clampTaskSelection();
                     void stopTaskInList(task).then(() => refresh()).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
                 }
@@ -1971,8 +2017,54 @@ function handlePiStyleModelPickerInput(picker, data) {
         updateModelPickerFilter(picker, picker.filter + data);
     return {};
 }
-function createExactPiModelSelector(tui, currentModel, onSelect, onCancel) {
-    const selector = new ModelSelectorComponent(tui, currentModel, SettingsManager.create(process.cwd()), ModelRegistry.create(AuthStorage.create()), [], onSelect, onCancel);
+function addPiSelectorPageKeys(selector, tui, stateKey = 'filteredModels') {
+    const originalHandleInput = selector.handleInput.bind(selector);
+    selector.handleInput = (data) => {
+        if (isPageUpKey(data) || isPageDownKey(data)) {
+            const state = selector;
+            const items = state[stateKey] || [];
+            if (items.length > 0) {
+                const page = 10;
+                const delta = isPageUpKey(data) ? -page : page;
+                state.selectedIndex = Math.max(0, Math.min(items.length - 1, (state.selectedIndex || 0) + delta));
+                state.updateList?.();
+                tui.requestRender();
+            }
+            return;
+        }
+        originalHandleInput(data);
+    };
+    return selector;
+}
+async function createExactPiModelSelector(tui, currentModel, onSelect, onCancel, initialSearchInput) {
+    const settingsManager = SettingsManager.create(process.cwd());
+    const modelRegistry = ModelRegistry.create(AuthStorage.create());
+    modelRegistry.refresh();
+    const scopedModels = await getPiScopedModels(settingsManager, modelRegistry);
+    const selector = new ModelSelectorComponent(tui, currentModel, settingsManager, modelRegistry, scopedModels, onSelect, onCancel, initialSearchInput);
+    addPiSelectorPageKeys(selector, tui, 'filteredModels');
+    selector.focused = true;
+    return selector;
+}
+async function createExactPiScopedModelsSelector(tui, onCancel, onStatus) {
+    const settingsManager = SettingsManager.create(process.cwd());
+    const modelRegistry = ModelRegistry.create(AuthStorage.create());
+    modelRegistry.refresh();
+    const allModels = await modelRegistry.getAvailable();
+    const scopedModels = await getPiScopedModels(settingsManager, modelRegistry);
+    const enabledModelIds = scopedModels.length > 0 ? scopedModels.map((scoped) => modelRef(scoped.model)) : undefined;
+    const ScopedModelsSelectorComponent = await getScopedModelsSelectorComponent();
+    const selector = new ScopedModelsSelectorComponent({ allModels, enabledModelIds }, {
+        onChange: () => { modelAutocompleteCache = undefined; },
+        onPersist: (enabledIds) => {
+            settingsManager.setEnabledModels(enabledIds === null ? undefined : enabledIds);
+            modelAutocompleteCache = undefined;
+            onStatus('Scoped models saved');
+            tui.requestRender();
+        },
+        onCancel,
+    });
+    addPiSelectorPageKeys(selector, tui, 'filteredItems');
     selector.focused = true;
     return selector;
 }
@@ -2000,10 +2092,11 @@ function renderPiLastOutputMessage(text, width) {
 function renderMiTranscriptItem(item, width) {
     return item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiAssistantMessage(item.text, width);
 }
-const PI_SLASH_COMMANDS = ['/settings', '/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/changelog', '/hotkeys', '/fork', '/clone', '/tree', '/login', '/logout', '/new', '/compact', '/resume', '/reload', '/quit', '/mi', '/upload'];
+const PI_SLASH_COMMANDS = ['/settings', '/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/changelog', '/hotkeys', '/fork', '/clone', '/tree', '/login', '/logout', '/new', '/compact', '/resume', '/reload', '/quit', '/mi', '/upload'];
 const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/settings': 'Open settings menu',
     '/model': 'Select Mi model',
+    '/models': 'Select Mi model',
     '/scoped-models': 'Enable/disable models for Ctrl+P cycling',
     '/export': 'Export session (HTML default, or specify path: .html/.jsonl)',
     '/import': 'Import and resume a session from a JSONL file',
@@ -2026,10 +2119,45 @@ const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/mi': 'Chat with Mi about the selected task',
     '/upload': 'Create an image upload link',
 };
+let modelAutocompleteCache;
+async function getPiScopedModels(settingsManager = SettingsManager.create(process.cwd()), modelRegistry = ModelRegistry.create(AuthStorage.create())) {
+    const patterns = settingsManager.getEnabledModels?.() || [];
+    return resolvePiModelScope(patterns, modelRegistry);
+}
+async function getModelAutocompleteItems(argumentPrefix) {
+    const now = Date.now();
+    if (!modelAutocompleteCache || now - modelAutocompleteCache.loadedAt > 30_000) {
+        const settingsManager = SettingsManager.create(process.cwd());
+        const registry = ModelRegistry.create(AuthStorage.create());
+        registry.refresh();
+        const scopedModels = await getPiScopedModels(settingsManager, registry);
+        const scoped = scopedModels.map((scopedModel) => scopedModel.model);
+        modelAutocompleteCache = { loadedAt: now, models: scoped.length > 0 ? scoped : await registry.getAvailable() };
+    }
+    const models = modelAutocompleteCache.models.map((model) => ({
+        ...model,
+        ref: modelRef(model),
+    }));
+    return fuzzyFilter(models, argumentPrefix, ({ id, provider, ref, name }) => `${id} ${provider} ${ref} ${name || ''}`)
+        .slice(0, 20)
+        .map((model) => ({
+        value: model.ref,
+        label: model.id,
+        description: model.provider,
+    }));
+}
+const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/upload', '/resume', '/model', '/models', '/scoped-models']);
+function slashCommandName(value) {
+    return value.match(/^\/\S+/)?.[0] || '';
+}
+function isMiLocalSlashCommand(value) {
+    return MI_LOCAL_SLASH_COMMANDS.has(slashCommandName(value));
+}
 function createPiSlashAutocompleteProvider(commands = PI_SLASH_COMMANDS) {
     const slashCommands = commands.map((command) => ({
         name: command.replace(/^\//, ''),
         description: PI_SLASH_COMMAND_DESCRIPTIONS[command],
+        ...((command === '/model' || command === '/models') ? { argumentHint: '<model>', getArgumentCompletions: getModelAutocompleteItems } : {}),
     }));
     return new CombinedAutocompleteProvider(slashCommands, process.cwd());
 }
@@ -2122,9 +2250,11 @@ function startPiTuiScreen(component, options = {}) {
     tui.addChild(component);
     tui.setFocus(component);
     if (options.alternateScreen)
-        process.stdout.write('\x1b[?1049h\x1b[2J\x1b[H');
+        process.stdout.write('\x1b[?1049h\x1b[2J\x1b[3J\x1b[H');
     if (options.clearScreen !== false)
         terminal.clearScreen();
+    else
+        process.stdout.write('\x1b[3J');
     // Reset stale mouse tracking from prior full-screen apps before pi-tui starts.
     process.stdout.write(DISABLE_MOUSE_TRACKING_SEQUENCE);
     tui.start();
@@ -2310,7 +2440,7 @@ async function miTuiCommand(initial = '') {
     let inputLine = '';
     const editorTui = { terminal: { rows: process.stdout.rows || 24 }, requestRender() { requestRender(); } };
     const inputEditor = new Editor(editorTui, piEditorTheme(miThinkingLevel));
-    inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/model', '/quit', '/upload']));
+    inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/settings', '/model', '/models', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/changelog', '/hotkeys', '/fork', '/clone', '/tree', '/login', '/logout', '/compact', '/reload', '/quit', '/upload']));
     inputEditor.focused = true;
     inputEditor.onChange = (text) => { inputLine = text; };
     let pending = false;
@@ -2639,6 +2769,14 @@ async function miTuiCommand(initial = '') {
         }
         requestRender();
     }
+    async function openPiFromMi(value) {
+        cleanup();
+        await new Promise((resolve, reject) => {
+            const child = spawn(process.env.PI_CMD || 'pi', [value], { cwd: HOME, env: process.env, stdio: 'inherit' });
+            child.on('error', reject);
+            child.on('close', () => resolve());
+        });
+    }
     function submitInput() {
         const text = inputLine.trim();
         if (!text)
@@ -2659,11 +2797,29 @@ async function miTuiCommand(initial = '') {
             });
             return;
         }
-        if (text === '/model') {
+        if (text === '/scoped-models') {
+            statusMessage = 'Loading scoped models...';
+            requestRender();
+            void (async () => {
+                modelPicker = await createExactPiScopedModelsSelector(tui, () => {
+                    modelPicker = undefined;
+                    statusMessage = `tmux scrollback for history • Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
+                    requestRender();
+                }, (message) => { statusMessage = message; });
+                statusMessage = 'Configure scoped models';
+                requestRender();
+            })().catch((error) => {
+                statusMessage = error instanceof Error ? error.message : String(error);
+                requestRender();
+            });
+            return;
+        }
+        if (text === '/model' || text.startsWith('/model ') || text === '/models' || text.startsWith('/models ')) {
+            const modelQuery = text.replace(/^\/models?\b/, '').trim();
             statusMessage = 'Loading models...';
             requestRender();
             void (async () => {
-                modelPicker = createExactPiModelSelector(tui, miState?.model, (model) => {
+                modelPicker = await createExactPiModelSelector(tui, miState?.model, (model) => {
                     const modelSpec = modelRef(model);
                     modelPicker = undefined;
                     statusMessage = `Switching to ${modelSpec}...`;
@@ -2675,7 +2831,7 @@ async function miTuiCommand(initial = '') {
                     modelPicker = undefined;
                     statusMessage = `tmux scrollback for history • Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
                     requestRender();
-                });
+                }, modelQuery || undefined);
                 statusMessage = 'Select model';
                 requestRender();
             })().catch((error) => {
@@ -2684,13 +2840,11 @@ async function miTuiCommand(initial = '') {
             });
             return;
         }
-        if (text.startsWith('/model ')) {
-            const modelSpec = text.slice('/model'.length).trim();
-            statusMessage = `Switching to ${modelSpec}...`;
-            requestRender();
-            void setMiModelThinking(modelSpec, miThinkingLevel)
-                .then((state) => { miState = state; statusMessage = `Model: ${modelSpec}${miThinkingLevel ? ` ${miThinkingLevel}` : ''}`; requestRender(); })
-                .catch((error) => { statusMessage = error instanceof Error ? error.message : String(error); requestRender(); });
+        if (text.startsWith('/') && !isMiLocalSlashCommand(text)) {
+            void openPiFromMi(text).catch((error) => {
+                statusMessage = error instanceof Error ? error.message : String(error);
+                requestRender();
+            });
             return;
         }
         void applyPiCycle(text)
