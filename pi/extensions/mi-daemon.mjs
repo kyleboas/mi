@@ -42,7 +42,7 @@ function miUserName() {
   if (envName) return envName;
   try {
     const preferences = readFileSync(MI_PREFERENCES_PATH, "utf8");
-    const match = preferences.match(/^\s*-\s*User(?:'s)?(?: display)? name:\s*(.+?)\s*$/im);
+    const match = preferences.match(/^\s*-\s*(?:User(?:'s)?(?: display)? name|Name):\s*(.+?)\s*$/im);
     const name = match?.[1]?.trim().replace(/[.。]+$/, "");
     if (name) return name;
   } catch {}

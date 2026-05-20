@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
 import { notify } from './notify.js';
 import { appendThreadMessage } from './threads.js';
 
@@ -18,7 +19,7 @@ export type MiCron = {
   lastOutput?: string;
 };
 
-const HOME = process.env.HOME || '/home/kyle';
+const HOME = process.env.HOME || homedir();
 const STATE_DIR = join(HOME, 'mi', 'state');
 const CRONS_PATH = join(STATE_DIR, 'crons.json');
 const LOG_PATH = join(STATE_DIR, 'cron-runs.jsonl');
