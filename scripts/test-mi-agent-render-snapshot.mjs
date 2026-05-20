@@ -24,7 +24,7 @@ for (let i = 1; i <= 8; i++) {
   });
 }
 tasks.push({ id: 'paused-1', name: 'render-paused-01', status: 'paused', needsUser: true, needsUserReason: 'stopped by Escape', progress: 'stopped', updatedAt: iso(9000) });
-tasks.push({ id: 'done-1', name: 'render-done-01', status: 'complete', text: 'done', finishedAt: iso(10000), updatedAt: iso(10000) });
+tasks.push({ id: 'done-1', name: 'render-done-01', status: 'complete', text: Array.from({ length: 12 }, (_, index) => `done line ${String(index + 1).padStart(2, '0')}`).join('\n'), finishedAt: iso(10000), updatedAt: iso(10000) });
 
 try {
   await writeFile(tasksPath, JSON.stringify(tasks, null, 2));
@@ -62,7 +62,36 @@ try {
     }
   }
 
+  const identityTasksPath = join(root, 'identity-tasks.json');
+  await writeFile(identityTasksPath, JSON.stringify([
+    { id: 'generic-a', name: 'kyle', sessionName: 'kyle', cwd: '/repo-a', status: 'complete', text: 'a', finishedAt: iso(14000), updatedAt: iso(14000) },
+    { id: 'generic-b', name: 'kyle', sessionName: 'kyle', cwd: '/repo-b', status: 'complete', text: 'b', finishedAt: iso(15000), updatedAt: iso(15000) },
+    { id: 'stored-duplicate', name: 'render-logical-duplicate', sessionName: 'render-logical-duplicate', cwd: '/repo-c', status: 'running', progress: 'stored copy', lastInput: 'same prompt', updatedAt: iso(16000) },
+    { id: 'pi-session:logical-duplicate', source: 'pi-session', name: 'render-logical-duplicate', sessionName: 'render-logical-duplicate', cwd: '/repo-c', status: 'running', progress: 'session copy', lastInput: 'same prompt', sessionFile: '/tmp/logical-duplicate.jsonl', updatedAt: iso(17000) },
+  ], null, 2));
+  const identityResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: identityTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: 'pageDown',
+      MI_AGENT_RENDER_TEST_ROWS: '16',
+      MI_AGENT_RENDER_TEST_COLS: '80',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(identityResult.status, 0, identityResult.stderr || identityResult.stdout);
+  const identityInitial = JSON.parse(identityResult.stdout).frames[0];
+  const identityRows = visible(identityInitial).filter((line) => /^\s*(?:→\s*)?[●○✓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ]\s+/.test(line));
+  assert.equal(identityRows.filter((line) => line.includes(' kyle ')).length, 2, 'generic same-name sessions in different cwd are not over-deduped');
+  assert.equal(identityRows.filter((line) => line.includes('render-logical-duplicate')).length, 1, 'logical duplicate rows are merged before rendering');
+
   assert.equal(snapshot.frames[1].selectedTask, 'render-done-01', 'PageDown moves selection through task rows');
+  const doneVisible = visible(snapshot.frames[1]).join('\n');
+  assert.ok(doneVisible.includes('done line 01'), 'normal detail view shows the top of final output');
+  assert.ok(!doneVisible.includes('done line 12'), 'normal detail view does not jump to the bottom of long final output');
   assert.equal(snapshot.frames[2].selectedTask, 'render-run-05', 'PageUp moves selection back through task rows');
 
   const firstEsc = snapshot.frames[3];
@@ -110,6 +139,9 @@ try {
   assert.ok(fullVisible.includes('full output line 30'), 'latest output is present before the footer');
   assert.ok(fullVisible.indexOf('last user input before output') < fullVisible.indexOf('full output line 01'), 'last input renders before output');
   const fullLines = visible(fullFrame);
+  const finalOutputLines = fullLines.filter((line) => line.includes('full output line'));
+  assert.ok(finalOutputLines.length > 0, 'full output lines are visible');
+  assert.ok(finalOutputLines.every((line) => !line.startsWith(' ')), 'final output lines have no leading indentation');
   const lastInputLine = fullLines.findIndex((line) => line.includes('last user input before output'));
   const firstOutputLine = fullLines.findIndex((line) => line.includes('full output line 01'));
   assert.ok(firstOutputLine > lastInputLine + 1 && fullLines.slice(lastInputLine + 1, firstOutputLine).some((line) => line.trim() === ''), 'blank line separates last input from full output');
@@ -119,6 +151,32 @@ try {
   assert.equal(fullSnapshot.frames[3].selectedTask, 'render-full-output', 'PageUp switches back to the previous task in full output mode');
   const withInput = visible(fullSnapshot.frames[4]).join('\n');
   assert.ok(withInput.includes('reply text'), 'input remains visible and usable in full output mode');
+
+  const pasteTasksPath = join(root, 'paste-tasks.json');
+  await writeFile(pasteTasksPath, JSON.stringify([
+    { id: 'paste-1', name: 'render-paste-target', status: 'paused', needsUser: true, needsUserReason: 'needs reply', progress: 'waiting', updatedAt: iso(13000) },
+  ], null, 2));
+  const pasteResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: pasteTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: 'paste:first line\\nsecond line',
+      MI_AGENT_RENDER_TEST_ROWS: '14',
+      MI_AGENT_RENDER_TEST_COLS: '80',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(pasteResult.status, 0, pasteResult.stderr || pasteResult.stdout);
+  const pasteSnapshot = JSON.parse(pasteResult.stdout);
+  const pasteFrame = pasteSnapshot.frames[1];
+  const pasteVisible = visible(pasteFrame).join('\n');
+  assert.equal(pasteFrame.inputMode, 'reply', 'multiline paste starts a reply instead of submitting');
+  assert.match(pasteFrame.status, /Reply to render-paste-target/);
+  assert.ok(pasteVisible.includes('first line'), 'first pasted line remains in input');
+  assert.ok(pasteVisible.includes('second line'), 'second pasted line remains in input');
 
   console.log('Mi agent render snapshot checks passed.');
 } finally {

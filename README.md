@@ -61,12 +61,9 @@ Inside pi, the Mi extension exposes a single slash command: `/mi`.
 /mi read        # show unread or recent Mi messages
 /mi inbox       # show Mi threads
 /mi bring-in    # explicitly inject recent Mi context into the current pi conversation
-/mi upload      # create a temporary image upload link and insert it into this conversation
 ```
 
-`/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation. Bare `mi ...` input and standalone pi `/upload` are not registered by the extension; use `/mi` and `/mi upload` instead.
-
-Image uploads: `mi upload`, Mi `/upload`, and pi `/mi upload` create a 15-minute one-time link under `/u/<token>`. By default this uses the local Mi uploader (`MI_PUBLIC_BASE_URL`, `MI_UPLOAD_DIR`). For public Cloudflare uploads, deploy `workers/cloudflare-upload-worker.js` with R2 + KV and set `MI_CLOUDFLARE_UPLOAD_BASE_URL` plus `MI_UPLOAD_SIGNING_SECRET` where `mi` runs.
+`/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation. Bare `mi ...` input is not registered by the extension; use `/mi` instead.
 
 ## Development
 

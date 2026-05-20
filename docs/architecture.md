@@ -22,27 +22,20 @@ Mi has two product layers:
 
 The current private implementation uses these runtime components under the two product layers:
 
-1. **Web app**
-   - Private iPhone-friendly chat surface.
-   - Runs behind Tailscale.
-   - Enforces a Tailnet-only control surface: loopback, Tailscale `100.64.0.0/10`, or explicit `TAILNET_ALLOWED_IPS`.
-   - Handles login, routing, approvals, and notification triggers.
-
-2. **Flue**
+1. **Flue**
    - Persistent chat and orchestration layer.
    - Runs as a long-lived local orchestrator on loopback (`127.0.0.1:3583` by default).
-   - Is reached through Mi's Tailnet-only web app, not exposed as a public webhook/control UI.
+   - Runs locally and is not exposed as a public webhook/control UI.
    - Owns scheduled or event-driven assistant behavior such as daily briefs, reminders, and health-watch prompts.
    - Can spawn temporary Flue agents for short background jobs, checks, summaries, and worker tasks.
    - Should not directly perform risky local mutations from chat.
 
-3. **pi**
+2. **pi**
    - Inspectable local execution cockpit and coding/execution worker backend.
    - Mi decides when and why work starts; pi handles repo inspection, code repair, branch/test work, and PR preparation.
    - Used when a request needs local context or tools: files, repos, wiki, service status, logs, or machine inspection.
    - `pi.inspect` is read-only and constrained to safe read/search tools.
    - `pi.repair` is defined as the code-changing worker but disabled by default; it requires approval before enabling.
-   - Web-triggered pi runs are read-only by default and constrained to safe read/search tools.
 
 ## Core primitives
 
@@ -58,7 +51,7 @@ These primitives live in `src/primitives.ts`. Run records are written to `state/
 
 ## Routing policy
 
-The current web routing classifier returns one of three modes:
+The current routing classifier returns one of three modes:
 
 - `flue-chat`: greetings, simple conversation, planning, drafting, writing prose, messaging drafts, summarization of user-provided text, and general questions.
 - `pi-read-only`: requests that combine an inspection action (`check`, `inspect`, `read`, `search`, `status`, `summarize`, `find`, `list`, `show`) with a local target (`repo`, `service`, `wiki`, `file`, `log`, `process`, `health`, `server`, `app`, `project`).
@@ -66,7 +59,7 @@ The current web routing classifier returns one of three modes:
 
 ## Safety model
 
-Safety is enforced in `src/safety.ts` and at the web/runner boundaries:
+Safety is enforced in `src/safety.ts` and at runner boundaries:
 
 - Assistants are read-only by default.
 - Tools or permissions that imply write/deploy/merge/delete/DNS/secret changes require approval.
@@ -77,6 +70,4 @@ Safety is enforced in `src/safety.ts` and at the web/runner boundaries:
 
 ## Safety boundary
 
-Flue decides and orchestrates. pi inspects and executes under visible constraints. The web app remains the private Tailnet-only control surface and approval gate.
-
-There is no public webhook/control UI in Mi. Pushover is notifications-only and must not carry secrets, public control links, or dangerous action links.
+Flue decides and orchestrates. pi inspects and executes under visible constraints. There is no public webhook/control UI in Mi. Pushover is notifications-only and must not carry secrets, public control links, or dangerous action links.

@@ -8,9 +8,9 @@ import {
 	type KeybindingsManager,
 } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, type Component, type Focusable, type TUI } from "@mariozechner/pi-tui";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import net from "node:net";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -27,6 +27,9 @@ const MI_TASKS_DIR = join(HOME, "mi");
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, "preferences.md");
 const PI_SESSION_DIR = join(HOME, ".pi", "agent", "sessions");
 const MI_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const MI_THREAD_PANEL_MESSAGE_LIMIT = Number(process.env.MI_THREAD_PANEL_MESSAGE_LIMIT || 50);
+const MI_THREAD_POLL_MESSAGE_LIMIT = Number(process.env.MI_THREAD_POLL_MESSAGE_LIMIT || 50);
+const MI_THREAD_POLL_INTERVAL_MS = Number(process.env.MI_THREAD_POLL_INTERVAL_MS || 10000);
 
 function miUserName() {
 	const envName = process.env.MI_USER_NAME?.trim();
@@ -125,26 +128,46 @@ async function appendMessage(threadId: string, role: ThreadRole, text: string, o
 	return message;
 }
 
+function parseMessageLines(text: string, limit?: number) {
+	const lines = text.trim().split("\n").filter(Boolean);
+	const selected = typeof limit === "number" ? lines.slice(-limit) : lines;
+	return selected.map((line) => JSON.parse(line) as ThreadMessage);
+}
+
 async function readMessages(threadId = MAIN_THREAD_ID, limit?: number) {
 	await ensureMainThread();
+	const path = threadPath(threadId);
 	try {
-		const messages = (await readFile(threadPath(threadId), "utf8"))
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => JSON.parse(line) as ThreadMessage);
-		return typeof limit === "number" ? messages.slice(-limit) : messages;
+		if (typeof limit !== "number") return parseMessageLines(await readFile(path, "utf8"));
+
+		const handle = await open(path, "r");
+		try {
+			const { size } = await handle.stat();
+			let bytes = Math.min(size, 64 * 1024);
+			while (true) {
+				const start = Math.max(0, size - bytes);
+				const buffer = Buffer.alloc(size - start);
+				await handle.read(buffer, 0, buffer.length, start);
+				const text = buffer.toString("utf8");
+				const lines = text.trim().split("\n").filter(Boolean);
+				if (start === 0 || lines.length > limit) return parseMessageLines(start === 0 ? text : lines.slice(1).join("\n"), limit);
+				bytes = Math.min(size, bytes * 2);
+			}
+		} finally {
+			await handle.close();
+		}
 	} catch {
 		return [];
 	}
 }
 
-async function markRead(threadId = MAIN_THREAD_ID) {
+async function markRead(threadId = MAIN_THREAD_ID, rewriteMessages = false) {
 	await ensureMainThread();
 	const threads = await readIndex();
 	const record = threads.find((thread) => thread.id === threadId);
 	if (record) record.unread = 0;
 	await writeIndex(threads);
+	if (!rewriteMessages) return;
 
 	const messages = await readMessages(threadId);
 	if (messages.length === 0) return;
@@ -198,7 +221,7 @@ async function handleRead(ctx: ExtensionCommandContext) {
 	const unread = messages.filter((message) => message.unread);
 	const shown = unread.length > 0 ? unread : messages.slice(-8);
 	await notify(ctx, formatMessages(shown), unread.length > 0 ? "info" : "success");
-	await markRead(MAIN_THREAD_ID);
+	await markRead(MAIN_THREAD_ID, true);
 }
 
 async function handleInbox(ctx: ExtensionCommandContext) {
@@ -277,21 +300,6 @@ async function sendToMiMain(message: string): Promise<string> {
 	return await requestMi(miPrompt(message));
 }
 
-async function createUploadLinkViaMiCli() {
-	return await new Promise<string>((resolve, reject) => {
-		execFile("mi", ["upload"], { cwd: MI_ROOT, env: process.env, timeout: 10000 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(stderr.trim() || error.message));
-			else resolve(stdout.trim());
-		});
-	});
-}
-
-async function handleUpload(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
-	const text = await createUploadLinkViaMiCli();
-	pi.sendUserMessage(`Temporary image upload link for this conversation:\n\n${text}\n\nUpload an image, then paste the returned image URL/reference here.`);
-	await notify(ctx, "Created image upload link and inserted it into the conversation.", "success");
-}
-
 async function handleBringIn(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
 	const messages = await readMessages(MAIN_THREAD_ID, 12);
 	if (messages.length === 0) {
@@ -359,7 +367,7 @@ class MiThreadPanel implements Component, Focusable {
 			this.enqueue(text);
 		};
 		void this.load(initial);
-		this.threadPollTimer = setInterval(() => void this.pollThread(), 2000);
+		this.threadPollTimer = setInterval(() => void this.pollThread(), MI_THREAD_POLL_INTERVAL_MS);
 	}
 
 	setRequestRender(requestRender: () => void) {
@@ -367,7 +375,7 @@ class MiThreadPanel implements Component, Focusable {
 	}
 
 	private async load(initial: string) {
-		const messages = await readMessages(MAIN_THREAD_ID);
+		const messages = await readMessages(MAIN_THREAD_ID, MI_THREAD_PANEL_MESSAGE_LIMIT);
 		this.seenMessageIds = new Set(messages.map((message) => message.id));
 		this.transcript = messages
 			.filter((message) => message.role === "user" || message.role === "assistant")
@@ -388,7 +396,7 @@ class MiThreadPanel implements Component, Focusable {
 
 	private async pollThread() {
 		if (this.closed) return;
-		const messages = await readMessages(MAIN_THREAD_ID).catch(() => []);
+		const messages = await readMessages(MAIN_THREAD_ID, MI_THREAD_POLL_MESSAGE_LIMIT).catch(() => []);
 		const fresh = messages.filter((message) => !this.seenMessageIds.has(message.id) && (message.role === "user" || message.role === "assistant"));
 		if (fresh.length === 0) return;
 		for (const message of fresh) {
@@ -570,11 +578,6 @@ Mi-specific capability note: You are the persistent Mi main agent. Store every M
 				await handleBringIn(pi, ctx);
 				return;
 			}
-			if (trimmed === "upload") {
-				await handleUpload(pi, ctx);
-				return;
-			}
-
 			await showMiThread(trimmed, ctx);
 		} catch (error) {
 			ctx.ui.setStatus("mi", undefined);
@@ -583,9 +586,9 @@ Mi-specific capability note: You are the persistent Mi main agent. Store every M
 	}
 
 	pi.registerCommand("mi", {
-		description: "Open Mi, ask Mi, or run Mi subcommands: read, inbox, bring-in, upload.",
+		description: "Open Mi, ask Mi, or run Mi subcommands: read, inbox, bring-in.",
 		getArgumentCompletions(prefix) {
-			return ["read", "inbox", "bring-in", "upload"].filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
+			return ["read", "inbox", "bring-in"].filter((item) => item.startsWith(prefix.trim())).map((item) => ({ value: item, label: item }));
 		},
 		async handler(args: string, ctx: ExtensionCommandContext) {
 			await handleMiArgs(args, ctx);

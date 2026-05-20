@@ -37,7 +37,7 @@ assert.match(cli, /const maxInputLines = Math\.max\(1, height - 4\)[\s\S]*const 
 assert.match(cli, /while \(lines\.length < contentHeight\) lines\.push\(''\);\n    lines\.push\(\.\.\.footerLines\)/, 'agent view places footer after full detail content for scrollback');
 assert.match(cli, /startPiTuiScreen\(new FunctionScreen\(renderAgentLines, onData\), \{ alternateScreen: true \}\)/, 'mi agents uses alternate screen so stale scrollback rows cannot look like duplicate tasks');
 assert.match(cli, /stale rows cannot remain in terminal scrollback/, 'agent view documents why alternate screen is needed');
-assert.match(cli, /const maxCollapsedActivityLines = Math\.max\(1, Math\.min\(6, Math\.floor\(contentHeight \* 0\.35\)\)\)[\s\S]*const collapsedDetailBudget = \(\) => Math\.max\(1, Math\.min\(maxCollapsedActivityLines, remainingContentLines\(\)\)\)/, 'agent view caps collapsed activity to the visible info pane');
+assert.match(cli, /const maxCollapsedActivityLines = Math\.max\(1, Math\.min\(12, Math\.floor\(contentHeight \* 0\.5\)\)\)[\s\S]*const collapsedDetailBudget = \(\) => Math\.max\(1, Math\.min\(maxCollapsedActivityLines, remainingContentLines\(\)\)\)/, 'agent view caps collapsed activity to the visible info pane while allowing more final output');
 assert.match(cli, /if \(lines\.length > contentHeight\) lines\.splice\(contentHeight\);[\s\S]*lines\.push\(\.\.\.footerLines\)/, 'agent view keeps the input footer visible in collapsed mode');
 assert.match(cli, /activity\.map\(\(line\) => truncateText\(line, width\)\)\.slice\(-collapsedDetailBudget\(\)\)/, 'agent view shows newest collapsed activity');
 assert.match(cli, /const lastInput = taskLastInput\(task\)[\s\S]*renderPiUserMessage\(lastInput, width\)[\s\S]*render the last input, then the whole output above the normal[\s\S]*lines\.push\(\.\.\.outputLines\)[\s\S]*lines\.push\(\.\.\.footerLines\)/, 'full last output mode renders last input above full output and relies on terminal scrollback');
@@ -52,7 +52,7 @@ assert.match(cli, /Mi does not handle mouse input; keep it disabled so tmux mous
 assert.match(cli, /const PI_SLASH_COMMANDS = \['\/model'[\s\S]*'\/resume'[\s\S]*'\/quit'[\s\S]*'\/mi'/, 'agent view has pi-ordered slash command candidates plus mi overrides');
 assert.match(cli, /function createPiSlashAutocompleteProvider\(commands = PI_SLASH_COMMANDS\)[\s\S]*new CombinedAutocompleteProvider\(slashCommands, process\.cwd\(\)\)/, 'Mi slash autocomplete uses pi-tui CombinedAutocompleteProvider');
 assert.match(cli, /agentEditor\.setAutocompleteProvider\(createPiSlashAutocompleteProvider\(\)\)/, 'agent view lets the real pi Editor render slash command autocomplete');
-assert.match(cli, /inputEditor\.setAutocompleteProvider\(createPiSlashAutocompleteProvider\(\[[^\]]*'\/quit'[^\]]*'\/upload'[^\]]*\]\)\)/, 'main Mi input also uses pi-style slash command autocomplete');
+assert.match(cli, /inputEditor\.setAutocompleteProvider\(createPiSlashAutocompleteProvider\(\[[^\]]*'\/quit'[^\]]*'\/detect'[^\]]*\]\)\)/, 'main Mi input also uses pi-style slash command autocomplete');
 assert.doesNotMatch(cli, /function editorAutocompletePage|editorAutocompletePage\(/, 'Mi does not override pi Editor PageUp/PageDown behavior for slash autocomplete');
 assert.match(cli, /function splitTerminalInput\(data: string\)[\s\S]*\\x1b\\\[5\(\?:;\\d\+\)\?~[\s\S]*\\x1b\\\[6\(\?:;\\d\+\)\?~/, 'Mi splits combined terminal key chunks before dispatch');
 assert.match(cli, /const keyParts = splitTerminalInput\(data\);[\s\S]*for \(const keyPart of keyParts\) onData\(keyPart\)/, 'mi agents dispatches combined PageUp/PageDown chunks one key at a time');
@@ -88,7 +88,6 @@ assert.match(cli, /Timed out waiting for Mi main[\s\S]*rm\(MI_SOCKET_PATH, \{ fo
 assert.match(cli, /agentEditor\.onSubmit = \(value\) => \{[\s\S]*void submitAgentInput\(\)/, 'agent input submits through the pi Editor onSubmit path');
 assert.match(cli, /value === '\/quit'[\s\S]*close\(\)/, 'agent view slash quit exits');
 assert.match(cli, /if \(value === '\/goal' \|\| value\.startsWith\('\/goal '\)\) return false;[\s\S]*await runSlashCommandInPi\(value\)/, 'agent view treats /goal as worker prompt text instead of opening pi');
-assert.match(cli, /value === '\/upload'[\s\S]*createUploadLink/, 'agent view slash upload creates upload links');
 assert.match(cli, /let btwAnswer = ''/, 'agent view stores /mi answers for display');
 assert.match(cli, /let miChatTask: MiTask \| undefined/, 'agent view tracks the active /mi chat task');
 assert.match(cli, /async function askMiAboutTask\(task: MiTask, question: string\)[\s\S]*sendToMiMain\(\[[\s\S]*Selected task context:/, 'agent view /mi uses Mi main to answer only about selected task context');
@@ -112,9 +111,9 @@ assert.match(cli, /if \(resumeMultiSelectMode\) void addSelectedResumeSessions/,
 assert.doesNotMatch(cli, /const task = replyTarget \|\| selectedTask\(\)[\s\S]*type: 'continue_worker'[\s\S]*useGoal: '0'/, 'agent view no longer approximates pi slash commands through worker RPC');
 assert.match(cli, /taskId = task\.id \|\| task\.sessionFile \|\| task\.sessionName \|\| task\.name/, 'agent view can reply to discovered session tasks by session file');
 assert.match(cli, /const pendingTaskUpdates = new Map<string, Partial<MiTask>>\(\)/, 'agent view tracks pending task updates during async replies');
-assert.match(cli, /function taskIdentityKeys\(task: MiTask\)[\s\S]*task\.sessionId[\s\S]*sessionFingerprint\(task\)[\s\S]*task\.name/, 'agent view builds broad task identity keys to catch partial duplicate rows');
+assert.match(cli, /function taskIdentityKeys\(task: MiTask\)[\s\S]*task\.sessionId[\s\S]*sessionFingerprint\(task\)[\s\S]*task\.actualSessionFile/, 'agent view builds hard task identity keys to catch partial duplicate rows');
 assert.match(cli, /function stableTaskKey\(task: MiTask\)[\s\S]*task\.source === 'pi-session'[\s\S]*Boolean\(task\.sessionFile \|\| task\.actualSessionFile \|\| task\.sessionId\)[\s\S]*task\.sessionId \|\| sessionFingerprint\(task\) \|\| task\.sessionFile/, 'agent view keys pi sessions by stable session identity to avoid duplicates');
-assert.match(cli, /function tasksSameIdentity\(a: MiTask, b: MiTask\)[\s\S]*taskIdentityKeys\(b\)\.some/, 'agent view matches duplicate rows across id/session/name fields');
+assert.match(cli, /function tasksSameIdentity\(a: MiTask, b: MiTask\)[\s\S]*taskIdentityKeys\(b\)\.some[\s\S]*sameCwd[\s\S]*!isGenericTaskName[\s\S]*normalizedTaskLastInput/, 'agent view matches duplicate rows across hard ids or same cwd plus non-generic name/input');
 assert.match(cli, /function mergeTaskIdentity\(previous: MiTask, next: MiTask\)/, 'agent view merges duplicate row data instead of dropping session details');
 assert.match(cli, /function dedupeTasksByStableKey\(list: MiTask\[\]\)[\s\S]*tasksSameIdentity\(entry, task\)/, 'agent view dedupes visible rows by broad stable identity');
 assert.match(cli, /const listedTasks = dedupeTasksByStableKey\(\(await listTasks\(\)\)/, 'agent refresh dedupes daemon task list before rendering');
@@ -142,10 +141,10 @@ assert.match(cli, /if \(command === 'detect-approval'\) return detectApprovalCom
 assert.match(cli, /const defaultAgentStatus = '\^L full output • \^M multi-select • Esc clear task'/, 'agent view keeps Ctrl-L full output hint above input');
 assert.doesNotMatch(cli, /cwd: \$\{task\.cwd\}/, 'agent view does not show cwd in selected task detail');
 assert.doesNotMatch(cli, /task steps/, 'agent view does not show task step headings');
-assert.match(cli, /else \{\n        const finalOutput = taskFinalOutput\(task\);\n        lines\.push\(''\);\n        const outputBudget[\s\S]*renderPiLastOutputMessage\(finalOutput \|\| 'No result yet\.', width\)/, 'agent view shows completed last output with one spacer and no label');
+assert.match(cli, /else \{\n        const finalOutput = taskFinalOutput\(task\);\n        lines\.push\(''\);\n        const outputBudget = Math\.max\(1, remainingContentLines\(\)\);\n        lines\.push\(\.\.\.renderPiLastOutputMessage\(finalOutput \|\| 'No result yet\.', width\)\.slice\(0, outputBudget\)\)/, 'agent view shows completed final output from the top using all remaining space above input');
 assert.match(cli, /isTaskNeedsInput\(task\)[\s\S]*!task\.error && task\.needsUserReason === 'stopped by Escape'[\s\S]*readSessionActivitySteps\(task\.sessionFile, task, 12\)[\s\S]*const errorText = task\.error \|\| taskNeedsInputQuestion\(task\)[\s\S]*renderPiAssistantMessage\(errorText, width\)/, 'agent view keeps activity for Esc-paused tasks and shows error/question for error needs-input tasks');
 assert.match(cli, /isTaskActive\(task\) && task\.sessionFile[\s\S]*readSessionActivitySteps[\s\S]*lines\.push\(''\);/, 'agent view shows activity when selected task is working without a label');
-assert.match(cli, /function renderPiLastOutputMessage\(text: string, width: number\)[\s\S]*\.replace\(\/\^\(\(\?:\\x1b\\\[\[0-9;\]\*m\)\*\)\\s\+\//, 'agent view removes leading indentation from rendered last output');
+assert.match(cli, /function stripLeadingVisibleWhitespace\(line: string\)[\s\S]*const osc = rest\.match[\s\S]*const csi = rest\.match[\s\S]*if \(\/\\s\/\.test\(line\[index\] \|\| ''\)\)[\s\S]*function renderPiLastOutputMessage\(text: string, width: number\)[\s\S]*interleaved with the padding on the final line[\s\S]*\.map\(stripLeadingVisibleWhitespace\)/, 'agent view removes leading indentation from rendered last output, including when ANSI/OSC markers are interleaved on the final line');
 assert.match(cli, /function normalizeLastInputText\(text: string\)[\s\S]*replace\(\/\^\\\/goal/, 'agent view unwraps Mi goal prompt boilerplate from last input');
 assert.match(cli, /function readSessionLastUserInput\(sessionFile: string\)[\s\S]*record\.message\?\.role !== 'user'/, 'agent view can read the last user input from a session');
 assert.match(cli, /function taskLastInput\(task: MiTask\)[\s\S]*task\.lastInput[\s\S]*readSessionLastUserInput\(task\.sessionFile\)/, 'agent view prefers Mi-sent last input metadata and falls back to session user input');
@@ -258,7 +257,7 @@ assert.match(daemon, /MI_DAEMON_LOCK_START_GRACE_MS[\s\S]*waiting for daemon loc
 assert.match(daemon, /removing unhealthy daemon lock[\s\S]*process\.kill\(Number\(lockOwner\), "SIGTERM"\)/, 'daemon recovers when a lock-owning process exists but the socket is unhealthy');
 assert.match(daemon, /file\.startsWith\(SESSION_DIR\) \|\| file\.includes\("\/sessions\/mi-main\/"\)/, 'daemon excludes mi-chat/mi-main sessions from mi agents');
 assert.match(daemon, /starts lazily on prompt\/state\/model requests/, 'daemon does not eagerly spawn Mi main pi on startup');
-assert.match(daemon, /const MI_MAIN_IDLE_MS = Number\(process\.env\.MI_MAIN_IDLE_MS \|\| 15000\)/, 'daemon stops idle Mi main pi quickly');
+assert.match(daemon, /const MI_MAIN_IDLE_MS = Number\(process\.env\.MI_MAIN_IDLE_MS \|\| 120000\)/, 'daemon keeps Mi main pi warm briefly to avoid repeated cold starts');
 assert.match(daemon, /function scheduleStopPi\(\)[\s\S]*stopping idle Mi main pi/, 'daemon has idle shutdown for Mi main pi');
 assert.match(cli, /Do not fetch model state on startup/, 'main Mi TUI avoids starting Mi main pi just to draw the footer');
 assert.match(daemon, /if \(request\.background\)[\s\S]*Started background task/, 'daemon returns immediately for background workers');
@@ -274,7 +273,7 @@ assert.match(daemon, /if \(request\.type === "list_pi_sessions"\)/, 'daemon rout
 assert.match(daemon, /if \(request\.type === "resume_session"\)/, 'daemon routes adding one selected pi session');
 assert.match(daemon, /if \(request\.type === "resume_sessions"\)/, 'daemon still supports bulk active-session resume requests');
 assert.match(daemon, /const storedTasks = reconciledRawTasks\.filter\(\(task\) => !isTaskDismissed\(task, dismissed\)/, 'daemon lists stored tasks after dismissed filtering');
-assert.match(daemon, /if \(openPiSession\) return \{ \.\.\.task, status: "running", finishedAt: undefined, openPiSession: true \}/, 'daemon marks an open interactive pi session as working');
+assert.match(daemon, /if \(openPiSession && \["running", "active", "queued", "thinking", "thinkingqueued"\]\.includes\(status\)\)[\s\S]*status: "running", finishedAt: undefined, openPiSession: true/, 'daemon marks open interactive pi sessions as working only while the latest session state is busy');
 assert.match(daemon, /status: "paused",[\s\S]*needsUser: true,[\s\S]*interactive pi session stopped before replying/, 'daemon marks naturally stopped busy interactive pi sessions as needs input');
 assert.match(daemon, /if \(liveTrackedWorker\) \{[\s\S]*\.\.\.task,[\s\S]*sessionFile: task\.sessionFile \|\| activeSession\.sessionFile/, 'daemon preserves live tracked worker status over passive session scans');
 assert.match(daemon, /const staleBusySession = \["running", "active", "queued", "thinking", "thinkingqueued"\]\.includes\(activeStatus\)/, 'daemon detects stale busy pi sessions');
@@ -314,6 +313,8 @@ assert.match(daemon, /status: busy \? "running" : "complete"/, 'daemon defaults 
 assert.match(daemon, /const ACTIVE_SESSION_WINDOW_MS = Number\(process\.env\.MI_ACTIVE_PI_SESSION_WINDOW_MS \|\| 7 \* 24 \* 60 \* 60_000\)/, 'daemon keeps stopped discovered sessions visible long enough to avoid surprising disappearance');
 assert.match(daemon, /if \(task\.needsUser\) return \{ needsUser: true,[\s\S]*status === "error"[\s\S]*return \{ needsUser: false/, 'daemon marks explicit needs-user tasks and failed tasks as needs input');
 assert.match(daemon, /async function findOpenDuplicateWorkerIssue[\s\S]*sameLogicalTask\(task, probe\)[\s\S]*taskIsOpenIssue\(task\)/, 'daemon suppresses duplicate workers for the same open issue');
+assert.match(daemon, /const startingWorkerKeys = new Set\(\)/, 'daemon reserves in-flight worker starts');
+assert.match(daemon, /startingWorkerKeys\.has\(startKey\)[\s\S]*Not starting duplicate task[\s\S]*startingWorkerKeys\.add\(startKey\)/, 'daemon suppresses concurrent duplicate starts before both can upsert');
 assert.match(daemon, /task\?\.needsUser[\s\S]*\["running", "waiting", "active", "queued", "thinking", "thinkingqueued", "paused", "error"\]/, 'daemon treats needs-user/running/error tasks as open issues');
 assert.match(daemon, /function existingOpenIssueMessage[\s\S]*needs \$\{miUserName\(\)\}[\s\S]*Existing task is \$\{status\}\$\{reason\}/, 'duplicate suppression explains when an existing task is waiting for input');
 assert.match(daemon, /\["complete", "completed", "done", "error", "stopped", "paused", "inactive"\]\.includes\(taskStatus\)/, 'daemon treats paused tasks as terminal when merging stale busy sessions');

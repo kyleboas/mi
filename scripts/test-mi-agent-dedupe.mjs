@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -14,6 +14,31 @@ const tasksPath = join(home, 'mi', 'state', 'tasks.json');
 const sessionsRoot = join(home, '.pi', 'agent', 'sessions', '--home-test--');
 await mkdir(sessionsRoot, { recursive: true });
 await mkdir(join(home, 'mi', 'state'), { recursive: true });
+
+const fakePiJsPath = join(root, 'fake-pi.js');
+const fakePiPath = join(root, 'fake-pi');
+await writeFile(fakePiJsPath, `
+let sessionId = 'fake-' + Math.random().toString(36).slice(2);
+let sessionName = 'fake';
+const sessionFile = ${JSON.stringify(root)} + '/fake-' + sessionId + '.jsonl';
+process.stdin.on('data', (chunk) => {
+  for (const line of chunk.toString('utf8').trim().split(/\\n/)) {
+    if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.type === 'set_session_name') {
+      sessionName = request.name || sessionName;
+      console.log(JSON.stringify({ type: 'response', id: request.id, success: true, data: {} }));
+    } else if (request.type === 'get_state') {
+      console.log(JSON.stringify({ type: 'response', id: request.id, success: true, data: { sessionFile, sessionId, sessionName, model: {} } }));
+    } else if (request.type === 'prompt') {
+      console.log(JSON.stringify({ type: 'response', id: request.id, success: true, data: {} }));
+      setTimeout(() => console.log(JSON.stringify({ type: 'agent_end', messages: [{ role: 'assistant', content: [{ type: 'text', text: 'done' }] }] })), 500);
+    }
+  }
+});
+`);
+await writeFile(fakePiPath, `#!/bin/sh\nexec ${process.execPath} ${fakePiJsPath} "$@"\n`);
+await chmod(fakePiPath, 0o755);
 
 function iso(offsetMs = 0) {
   return new Date(Date.UTC(2026, 0, 1, 0, 0, 0) + offsetMs).toISOString();
@@ -40,12 +65,12 @@ async function writeTasks(tasks) {
   await writeFile(tasksPath, JSON.stringify(tasks, null, 2));
 }
 
-async function request(type) {
+async function request(type, payload = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let data = '';
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('timeout')); }, 5000);
-    socket.on('connect', () => socket.write(`${JSON.stringify({ type })}\n`));
+    socket.on('connect', () => socket.write(`${JSON.stringify({ type, ...payload })}\n`));
     socket.on('data', (chunk) => {
       data += chunk.toString('utf8');
       if (!data.includes('\n')) return;
@@ -73,7 +98,7 @@ const daemon = spawn(process.execPath, [new URL('../pi/extensions/mi-daemon.mjs'
     HOME: home,
     MI_RUNTIME_DIR: runtime,
     MI_SOCKET_PATH: socketPath,
-    MI_PI_BIN: process.execPath,
+    MI_PI_BIN: fakePiPath,
     MI_ACTIVE_PI_SESSION_WINDOW_MS: String(365 * 24 * 60 * 60_000),
     MI_PI_SESSION_SCAN_CACHE_MS: '0',
   },
@@ -135,7 +160,18 @@ try {
   assert.equal(rows.length, 2, 'generic session names were incorrectly merged');
   assert.deepEqual(new Set(rows.map((t) => t.cwd)), new Set(['/repo-a', '/repo-b']), 'generic session rows lost their cwd identity');
 
-  // 7. A freshly queued follow-up must not be overwritten by the previous completed scan.
+  // 7. Concurrent duplicate starts must be suppressed before both requests can upsert.
+  await writeTasks([]);
+  const [firstStart, secondStart] = await Promise.all([
+    request('run_worker', { name: 'same-start', cwd: home, message: 'same prompt', background: true }),
+    request('run_worker', { name: 'same-start', cwd: home, message: 'same prompt', background: true }),
+  ]);
+  assert.equal([firstStart, secondStart].filter((result) => /^Started background task/.test(result.text || '')).length, 1, 'concurrent duplicate starts both launched workers');
+  assert.equal([firstStart, secondStart].filter((result) => /Not starting duplicate task/.test(result.text || '')).length, 1, 'concurrent duplicate start was not reported as suppressed');
+  rows = (await request('list_tasks')).tasks;
+  assert.equal(rows.filter((t) => t.name === 'same-start').length, 1, 'concurrent duplicate start persisted duplicate task rows');
+
+  // 8. A freshly queued follow-up must not be overwritten by the previous completed scan.
   await writeTasks([{ id: 'task-new-followup', name: 'new-followup', sessionName: 'new-followup', cwd: '/repo', status: 'running', sessionId: uuid(10), sessionFile: await sessionFile({ id: uuid(10), name: 'new-followup', cwd: '/repo', finalText: 'old complete', at: iso(6000) }), continuedAt: iso(7000), updatedAt: iso(7000), lastInput: 'new prompt' }]);
   rows = (await request('list_tasks')).tasks;
   const followup = rows.find((t) => t.id === 'task-new-followup' || t.sessionId === uuid(10));

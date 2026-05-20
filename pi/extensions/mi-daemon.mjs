@@ -20,7 +20,7 @@ const MI_PREFERENCES_PATH = join(HOME, "mi", "preferences.md");
 const PI_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const ACTIVE_SESSION_WINDOW_MS = Number(process.env.MI_ACTIVE_PI_SESSION_WINDOW_MS || 7 * 24 * 60 * 60_000);
 const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 5000);
-const MI_MAIN_IDLE_MS = Number(process.env.MI_MAIN_IDLE_MS || 15000);
+const MI_MAIN_IDLE_MS = Number(process.env.MI_MAIN_IDLE_MS || 120000);
 const MI_DAEMON_LOCK_START_GRACE_MS = Number(process.env.MI_DAEMON_LOCK_START_GRACE_MS || 5000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
@@ -34,6 +34,7 @@ let nextId = 1;
 const pending = new Map();
 const promptQueue = [];
 const activeWorkers = new Map();
+const startingWorkerKeys = new Set();
 let activePrompt;
 let piIdleTimer;
 let piSessionTaskCache = { at: 0, tasks: [] };
@@ -357,7 +358,8 @@ function inferOpenPiSessionFiles(tasks, activeProcesses) {
       if (assigned.has(task.sessionFile)) return false;
       if (task.cwd !== proc.cwd) return false;
       const startedAt = Date.parse(task.startedAt || "") || 0;
-      return startedAt >= proc.startedAtMs - 60_000;
+      const lastEventAt = Date.parse(task.lastEventAt || task.updatedAt || "") || 0;
+      return startedAt >= proc.startedAtMs - 60_000 || lastEventAt >= proc.startedAtMs - 60_000;
     });
     if (!match) continue;
     inferred.add(match.sessionFile);
@@ -398,7 +400,9 @@ async function listPiSessionTasks() {
   const tasks = parsedTasks.map((task) => {
     const openPiSession = openSessionFiles.has(task.sessionFile);
     const status = String(task.status || "").toLowerCase();
-    if (openPiSession) return { ...task, status: "running", finishedAt: undefined, openPiSession: true };
+    if (openPiSession && ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
+      return { ...task, status: "running", finishedAt: undefined, openPiSession: true };
+    }
     if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
       return enrichTask({
         ...task,
@@ -451,6 +455,10 @@ function taskNameFromText(text) {
 
 function normalizedLastInput(task) {
   return normalizeLastInputText(task?.lastInput).toLowerCase().slice(0, 500);
+}
+
+function logicalTaskStartKey({ name, cwd, message }) {
+  return [String(cwd || ""), normalizedNameText(name), normalizeLastInputText(message).toLowerCase().slice(0, 500)].join("\u001f");
 }
 
 function sameLogicalTask(a, b) {
@@ -1091,30 +1099,38 @@ async function runWorker(request) {
   const cwd = String(request.cwd || HOME).trim();
   const model = String(request.model || MI_MODEL).trim();
   const sessionDir = request.sessionDir ? String(request.sessionDir).trim() : undefined;
-  const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message });
-  if (duplicate) {
-    const text = existingOpenIssueMessage(duplicate, name);
-    await log(`duplicate_worker_suppressed ${name} existing=${duplicate.id || duplicate.sessionName || duplicate.sessionFile || "unknown"}`);
-    return { text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
+  const startKey = logicalTaskStartKey({ name, cwd, message });
+  if (startingWorkerKeys.has(startKey)) {
+    await log(`duplicate_worker_start_suppressed ${name}`);
+    return { text: `Not starting duplicate task: ${name}. Existing task is already starting.`, sessionName: name };
   }
-  log(`starting worker ${name} cwd=${cwd} model=${model}`);
-  const worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1" } });
-  const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  let task = request.background
-    ? await upsertTask({
-      id: taskId,
-      name,
-      cwd,
-      status: "running",
-      progress: "starting worker",
-      startedAt: new Date().toISOString(),
-      sessionName: name,
-      model,
-      lastInput: message,
-    })
-    : undefined;
-  if (task) trackActiveWorker(task, name, worker);
+  startingWorkerKeys.add(startKey);
+  let worker;
+  let task;
   try {
+    const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message });
+    if (duplicate) {
+      const text = existingOpenIssueMessage(duplicate, name);
+      await log(`duplicate_worker_suppressed ${name} existing=${duplicate.id || duplicate.sessionName || duplicate.sessionFile || "unknown"}`);
+      return { text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
+    }
+    log(`starting worker ${name} cwd=${cwd} model=${model}`);
+    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1" } });
+    const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    task = request.background
+      ? await upsertTask({
+        id: taskId,
+        name,
+        cwd,
+        status: "running",
+        progress: "starting worker",
+        startedAt: new Date().toISOString(),
+        sessionName: name,
+        model,
+        lastInput: message,
+      })
+      : undefined;
+    if (task) trackActiveWorker(task, name, worker);
     await worker.rpc({ type: "set_session_name", name });
     const before = await worker.rpc({ type: "get_state" });
     const visibleSessionFile = await mirrorSessionToHome(before.sessionFile);
@@ -1149,17 +1165,18 @@ async function runWorker(request) {
     return { text, sessionFile: await mirrorSessionToHome(after.sessionFile || before.sessionFile), sessionId: after.sessionId || before.sessionId, sessionName: after.sessionName || name, model: after.model || before.model };
   } catch (error) {
     if (request.background && task) {
-      if (worker.expectedStop) {
+      if (worker?.expectedStop) {
         await log(`worker_expected_stop ${name}`);
       } else {
         await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error) });
       }
       untrackActiveWorker(task, name);
     }
-    if (worker.expectedStop) return { text: `Stopped ${name}; moved to needs input`, taskId: task?.id, sessionFile: task?.sessionFile, sessionId: task?.sessionId, sessionName: name };
+    if (worker?.expectedStop) return { text: `Stopped ${name}; moved to needs input`, taskId: task?.id, sessionFile: task?.sessionFile, sessionId: task?.sessionId, sessionName: name };
     throw error;
   } finally {
-    if (!request.background) worker.proc.kill();
+    startingWorkerKeys.delete(startKey);
+    if (!request.background) worker?.proc.kill();
   }
 }
 

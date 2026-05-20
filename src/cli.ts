@@ -18,7 +18,6 @@ import { checkAssistant, runAssistant } from './runner.js';
 import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
 import { readRecentEvents, logEvent } from './state.js';
-import { createUploadLink } from './uploads.js';
 import {
   appendThreadMessage,
   compactThread,
@@ -72,7 +71,6 @@ Usage:
   mi threads                      List Mi conversations
   mi temp <title>                 Create/open a temporary conversation
   mi compact [thread]             Compact old read messages in a thread
-  mi upload                       Create a temporary one-time image upload link
   mi detect [approve|reject|skip|needs-more-evidence]  Review detect candidates one by one
   mi detect-approval [next|approve <id>|reject <id>]  Review pending detect trends
   mi agents                       Open mi agents live background agent view
@@ -229,13 +227,6 @@ async function tempCommand(args: string[]) {
   }
   const thread = await createTempThread(title);
   await chatCommand(thread.id);
-}
-
-async function uploadCommand() {
-  const link = await createUploadLink();
-  console.log(`Upload image: ${link.url}`);
-  console.log(`Expires: ${link.expiresAt}`);
-  console.log(`Max bytes: ${link.maxBytes}`);
 }
 
 type DetectApprovalItem = {
@@ -507,12 +498,12 @@ async function nextDetectReviewText(excludeId?: number, options: { refresh?: boo
   if (excludeId) queue = queue.filter((payload) => detectReviewPayloadId(payload) !== excludeId);
   if (queue.length === 0) queue = fetchDetectReviewCandidates(excludeId ? [excludeId] : []);
 
-  const payload = queue[0];
+  const [payload, ...remainingQueue] = queue;
   if (!payload?.candidate?.id) {
     await clearDetectReviewState();
     return 'No pending detect candidates are ready for review.';
   }
-  await saveDetectReviewState({ currentId: detectReviewPayloadId(payload), queue });
+  await saveDetectReviewState({ currentId: detectReviewPayloadId(payload), queue: remainingQueue });
   return formatDetectReviewCandidate(payload);
 }
 
@@ -939,7 +930,7 @@ function sessionFingerprint(task: MiTask) {
 }
 
 function taskIdentityKeys(task: MiTask) {
-  return [...new Set([task.id, task.sessionId, sessionFingerprint(task), task.sessionFile, task.actualSessionFile, task.sessionName, task.name].filter(Boolean).map(String))];
+  return [...new Set([task.id, task.sessionId, sessionFingerprint(task), task.sessionFile, task.actualSessionFile].filter(Boolean).map(String))];
 }
 
 function stableTaskKey(task: MiTask) {
@@ -948,9 +939,33 @@ function stableTaskKey(task: MiTask) {
   return task.id || task.sessionFile || task.sessionName || task.name || '';
 }
 
+function normalizedTaskName(task: MiTask) {
+  return String(task.sessionName || task.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isGenericTaskName(name: string) {
+  return !name || name === 'kyle' || name === 'mi session' || name === 'recent mi session';
+}
+
+function taskCwdKey(task: MiTask) {
+  return String(task.cwd || '').replace(/\/+$/, '');
+}
+
+function normalizedTaskLastInput(task: MiTask) {
+  return normalizeLastInputText(task.lastInput || '').toLowerCase().slice(0, 500);
+}
+
 function tasksSameIdentity(a: MiTask, b: MiTask) {
   const aKeys = new Set(taskIdentityKeys(a));
-  return taskIdentityKeys(b).some((key) => aKeys.has(key));
+  if (taskIdentityKeys(b).some((key) => aKeys.has(key))) return true;
+  const sameCwd = taskCwdKey(a) === taskCwdKey(b);
+  if (!sameCwd) return false;
+  const aName = normalizedTaskName(a);
+  const bName = normalizedTaskName(b);
+  if (aName && aName === bName && !isGenericTaskName(aName)) return true;
+  const aLastInput = normalizedTaskLastInput(a);
+  const bLastInput = normalizedTaskLastInput(b);
+  return Boolean(aLastInput && aLastInput === bLastInput);
 }
 
 function mergeTaskIdentity(previous: MiTask, next: MiTask) {
@@ -1134,7 +1149,7 @@ async function miAgentsCommand() {
       const beforeRenderSignature = tasks.map(taskRenderSignature).join('\u001e');
       const selectedKey = selectedTask() ? stableTaskKey(selectedTask()!) : '';
       const listedTasks = dedupeTasksByStableKey((await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task))));
-      optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic) || taskName(task) === taskName(optimistic)));
+      optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic)));
       tasks = dedupeTasksByStableKey([...optimisticTasks, ...listedTasks]).map((task) => {
         const key = stableTaskKey(task);
         const terminal = ['complete', 'error', 'stopped', 'paused'].includes(String(task.status || '').toLowerCase());
@@ -1329,12 +1344,6 @@ async function miAgentsCommand() {
       status = 'New task';
       requestRender();
       if (prompt) void submitAgentInput();
-      return true;
-    }
-    if (value === '/upload') {
-      const link = await createUploadLink();
-      status = `Upload image: ${link.url} expires ${link.expiresAt}`;
-      requestRender();
       return true;
     }
     if (value === '/detect' || value.startsWith('/detect ')) {
@@ -1600,7 +1609,7 @@ async function miAgentsCommand() {
       }
     }
     if (!fullLastOutput) lines.push(fgThinking(undefined, '─'.repeat(width)));
-    const maxCollapsedActivityLines = Math.max(1, Math.min(6, Math.floor(contentHeight * 0.35)));
+    const maxCollapsedActivityLines = Math.max(1, Math.min(12, Math.floor(contentHeight * 0.5)));
     const remainingContentLines = () => Math.max(0, contentHeight - lines.length);
     const collapsedDetailBudget = () => Math.max(1, Math.min(maxCollapsedActivityLines, remainingContentLines()));
     const detailBudget = collapsedDetailBudget();
@@ -1640,8 +1649,8 @@ async function miAgentsCommand() {
       } else {
         const finalOutput = taskFinalOutput(task);
         lines.push('');
-        const outputBudget = collapsedDetailBudget();
-        lines.push(...renderPiLastOutputMessage(finalOutput || 'No result yet.', width).slice(-outputBudget));
+        const outputBudget = Math.max(1, remainingContentLines());
+        lines.push(...renderPiLastOutputMessage(finalOutput || 'No result yet.', width).slice(0, outputBudget));
       }
     }
     if (lines.length > contentHeight) lines.splice(contentHeight);
@@ -1827,7 +1836,28 @@ async function miAgentsCommand() {
     requestRender();
   }
 
+  function isAgentTextPasteInput(data: string) {
+    return data.includes('\x1b[200~') || (data.length > 1 && data.includes('\n') && /[^\r\n]/.test(data) && !data.includes('\x1b'));
+  }
+
+  function handleAgentTextPasteInput(data: string) {
+    if (inputMode === 'normal' && !inputBuffer) {
+      const task = selectedTask();
+      if (task) {
+        replyTarget = task;
+        inputMode = 'reply';
+        status = `Reply to ${taskName(task)}`;
+      }
+    }
+    handleAgentEditorInput(data.includes('\x1b[200~') ? data : `\x1b[200~${data}\x1b[201~`);
+  }
+
   function onData(data: string) {
+    if (isAgentTextPasteInput(data)) {
+      handleAgentTextPasteInput(data);
+      return;
+    }
+
     const keyParts = splitTerminalInput(data);
     if (keyParts.length > 1) {
       for (const keyPart of keyParts) onData(keyPart);
@@ -2060,6 +2090,7 @@ async function miAgentsCommand() {
       if (event === 'ctrlL') return '\x0c';
       if (event === 'ctrlC') return '\x03';
       if (event.startsWith('text:')) return event.slice('text:'.length);
+      if (event.startsWith('paste:')) return event.slice('paste:'.length).replace(/\\n/g, '\n');
       return event;
     };
     snapshot('initial');
@@ -2116,7 +2147,7 @@ async function compactCommand(args: string[]) {
 
 async function chatCommand(threadId = 'main') {
   await showThread(threadId);
-  console.log('\nType a message. Commands: /inbox, /compact, /upload, /detect, /exit');
+  console.log('\nType a message. Commands: /inbox, /compact, /detect, /exit');
   const rl = createInterface({ input, output });
   try {
     while (true) {
@@ -2124,7 +2155,7 @@ async function chatCommand(threadId = 'main') {
       if (!line) continue;
       if (line === '/exit' || line === '/quit') break;
       if (line === '/help') {
-        console.log('Commands: /inbox, /compact, /upload, /detect, /exit');
+        console.log('Commands: /inbox, /compact, /detect, /exit');
         continue;
       }
       if (line === '/inbox') {
@@ -2133,10 +2164,6 @@ async function chatCommand(threadId = 'main') {
       }
       if (line === '/compact') {
         await compactCommand([threadId]);
-        continue;
-      }
-      if (line === '/upload') {
-        await uploadCommand();
         continue;
       }
       if (line === '/detect' || line.startsWith('/detect ')) {
@@ -2534,8 +2561,43 @@ function renderPiAssistantMessage(text: string, width: number) {
   return lines;
 }
 
+function stripLeadingVisibleWhitespace(line: string) {
+  let index = 0;
+  let output = '';
+  while (index < line.length) {
+    const rest = line.slice(index);
+    const osc = rest.match(/^\x1b\][^\x07]*(?:\x07|\x1b\\)/);
+    if (osc) {
+      output += osc[0];
+      index += osc[0].length;
+      continue;
+    }
+    const csi = rest.match(/^\x1b\[[0-?]*[ -/]*[@-~]/);
+    if (csi) {
+      output += csi[0];
+      index += csi[0].length;
+      continue;
+    }
+    const apc = rest.match(/^\x1b_[^\x07\x1b]*(?:\x07|\x1b\\)/);
+    if (apc) {
+      output += apc[0];
+      index += apc[0].length;
+      continue;
+    }
+    if (/\s/.test(line[index] || '')) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+  return output + line.slice(index);
+}
+
 function renderPiLastOutputMessage(text: string, width: number) {
-  return renderPiAssistantMessage(text, width).map((line) => line.replace(/^((?:\x1b\[[0-9;]*m)*)\s+/, '$1'));
+  // AssistantMessageComponent wraps final assistant lines in ANSI/OSC markers.
+  // Strip Markdown's visible left padding even when those markers are
+  // interleaved with the padding on the final line.
+  return renderPiAssistantMessage(text, width).map(stripLeadingVisibleWhitespace);
 }
 
 function renderMiTranscriptItem(item: { role: 'user' | 'assistant'; text: string }, width: number) {
@@ -2544,7 +2606,7 @@ function renderMiTranscriptItem(item: { role: 'user' | 'assistant'; text: string
 
 type MiTranscriptItem = { role: 'user' | 'assistant'; text: string };
 
-const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/open', '/quit', '/mi', '/upload', '/detect'];
+const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/open', '/quit', '/mi', '/detect'];
 const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
   '/settings': 'Open settings menu',
   '/model': 'Select Mi model',
@@ -2569,7 +2631,6 @@ const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
   '/reload': 'Reload keybindings, extensions, skills, prompts, and themes',
   '/quit': 'Quit',
   '/mi': 'Chat with Mi about the selected task',
-  '/upload': 'Create an image upload link',
   '/detect': 'Review pending detect candidates one by one',
 };
 
@@ -2640,7 +2701,7 @@ async function getModelAutocompleteItems(argumentPrefix: string) {
     }));
 }
 
-const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/upload', '/detect', '/resume', '/open', '/model', '/scoped-models']);
+const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/detect', '/resume', '/open', '/model', '/scoped-models']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 
 function slashCommandName(value: string) {
@@ -2953,7 +3014,7 @@ async function miTuiCommand(initial = '') {
   let inputLine = '';
   const editorTui = { terminal: { rows: process.stdout.rows || 24 }, requestRender() { requestRender(); } } as any;
   const inputEditor = new Editor(editorTui, piEditorTheme(miThinkingLevel));
-  inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/compact', '/quit', '/upload', '/detect']));
+  inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/compact', '/quit', '/detect']));
   inputEditor.focused = true;
   inputEditor.onChange = (text) => { inputLine = text; };
   let pending = false;
@@ -3344,15 +3405,6 @@ async function miTuiCommand(initial = '') {
       cleanup();
       return;
     }
-    if (text === '/upload') {
-      void uploadCommand()
-        .then(() => requestRender())
-        .catch((error) => {
-          statusMessage = error instanceof Error ? error.message : String(error);
-          requestRender();
-        });
-      return;
-    }
     if (text === '/detect' || text.startsWith('/detect ')) {
       void showDetectReviewInTranscript(text.replace(/^\/detect\b/, '').trim(), text);
       return;
@@ -3664,8 +3716,7 @@ async function main() {
   if (command === 'inbox' || command === 'threads') return inboxCommand();
   if (command === 'temp') return tempCommand(args);
   if (command === 'compact') return compactCommand(args);
-  if (command === 'upload') return uploadCommand();
-  if (command === 'detect') {
+    if (command === 'detect') {
     console.log(await detectReviewCommand(args));
     return;
   }

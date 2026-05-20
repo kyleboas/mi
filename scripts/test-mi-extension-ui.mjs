@@ -4,8 +4,9 @@ import { readFileSync } from 'node:fs';
 const source = readFileSync(new URL('../pi/extensions/mi.ts', import.meta.url), 'utf8');
 
 const checks = [
-  ['poll timer while panel is open', /threadPollTimer\s*=\s*setInterval\(\(\) => void this\.pollThread\(\), 2000\)/],
-  ['poll reads fresh thread messages', /private async pollThread\(\)[\s\S]*readMessages\(MAIN_THREAD_ID\)[\s\S]*seenMessageIds/],
+  ['poll timer while panel is open', /threadPollTimer\s*=\s*setInterval\(\(\) => void this\.pollThread\(\), MI_THREAD_POLL_INTERVAL_MS\)/],
+  ['panel loads only recent messages', /readMessages\(MAIN_THREAD_ID, MI_THREAD_PANEL_MESSAGE_LIMIT\)/],
+  ['poll reads fresh recent thread messages', /private async pollThread\(\)[\s\S]*readMessages\(MAIN_THREAD_ID, MI_THREAD_POLL_MESSAGE_LIMIT\)[\s\S]*seenMessageIds/],
   ['poll marks messages read after rendering them', /pollThread\(\)[\s\S]*markRead\(MAIN_THREAD_ID\)/],
   ['focus propagates to the embedded pi CustomEditor', /set focused\(value: boolean\)[\s\S]*this\.editor\.focused = value/],
   ['Mi uses pi CustomEditor and pi-style editor theme', /new CustomEditor\(tui, miEditorTheme\(theme\), keybindings\)/],
