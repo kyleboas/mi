@@ -58,9 +58,6 @@ Inside pi, the Mi extension exposes a single slash command: `/mi`.
 ```bash
 /mi             # open the Mi side-channel thread
 /mi <message>   # send a side-channel message to Mi main without sending it to the current pi agent turn
-/mi read        # show unread or recent Mi messages
-/mi inbox       # show Mi threads
-/mi bring-in    # explicitly inject recent Mi context into the current pi conversation
 /mi upload      # create a temporary image upload link and insert it into this conversation
 ```
 
