@@ -334,6 +334,10 @@ class MiThreadPanel implements Component, Focusable {
 	private scrollOffset = 0;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private cachedBodyWidth?: number;
+	private cachedBodyVersion?: number;
+	private cachedBodyLines?: string[];
+	private transcriptVersion = 0;
 	private requestRender?: () => void;
 	private workingTimer?: NodeJS.Timeout;
 	private threadPollTimer?: NodeJS.Timeout;
@@ -380,6 +384,7 @@ class MiThreadPanel implements Component, Focusable {
 		this.transcript = messages
 			.filter((message) => message.role === "user" || message.role === "assistant")
 			.map((message) => ({ role: message.role as "user" | "assistant", text: message.text }));
+		this.bumpTranscript();
 		await markRead(MAIN_THREAD_ID).catch(() => undefined);
 		this.invalidate();
 		this.requestRender?.();
@@ -403,6 +408,7 @@ class MiThreadPanel implements Component, Focusable {
 			this.seenMessageIds.add(message.id);
 			this.transcript.push({ role: message.role as "user" | "assistant", text: message.text });
 		}
+		this.bumpTranscript();
 		this.scrollOffset = 0;
 		await markRead(MAIN_THREAD_ID).catch(() => undefined);
 		this.invalidate();
@@ -450,6 +456,7 @@ class MiThreadPanel implements Component, Focusable {
 	private async ask(text: string) {
 		this.setPending(true);
 		this.transcript.push({ role: "user", text });
+		this.bumpTranscript();
 		this.scrollOffset = 0;
 		const userMessage = await appendMessage(MAIN_THREAD_ID, "user", text, { unread: false, source: "pi-extension" });
 		this.seenMessageIds.add(userMessage.id);
@@ -460,8 +467,10 @@ class MiThreadPanel implements Component, Focusable {
 			const assistantMessage = await appendMessage(MAIN_THREAD_ID, "assistant", response, { unread: false, source: "mi-main" });
 			this.seenMessageIds.add(assistantMessage.id);
 			this.transcript.push({ role: "assistant", text: response });
+			this.bumpTranscript();
 		} catch (error) {
 			this.transcript.push({ role: "assistant", text: error instanceof Error ? error.message : String(error) });
+			this.bumpTranscript();
 		}
 		this.scrollOffset = 0;
 		this.setPending(false);
@@ -498,13 +507,29 @@ class MiThreadPanel implements Component, Focusable {
 		return this.theme.fg("dim", truncateToWidth(left ? `${left}${" ".repeat(gap)}${right}` : right.padStart(Math.min(width, right.length)), width));
 	}
 
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+	private bumpTranscript() {
+		this.transcriptVersion += 1;
+		this.cachedBodyWidth = undefined;
+		this.cachedBodyVersion = undefined;
+		this.cachedBodyLines = undefined;
+	}
+
+	private renderTranscriptBody(width: number): string[] {
+		if (this.cachedBodyLines && this.cachedBodyWidth === width && this.cachedBodyVersion === this.transcriptVersion) return this.cachedBodyLines;
 		const body: string[] = [];
 		for (const item of this.transcript) {
 			if (item.role === "user") body.push(...this.renderUserMessage(item.text, width));
 			else body.push(...this.renderAssistantMessage(item.text, width));
 		}
+		this.cachedBodyWidth = width;
+		this.cachedBodyVersion = this.transcriptVersion;
+		this.cachedBodyLines = body;
+		return body;
+	}
+
+	render(width: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
+		const body = [...this.renderTranscriptBody(width)];
 		if (this.pending) body.push(this.workingLine(), "");
 		const inputLines = this.editor.render(Math.max(10, width));
 		const viewport = Math.max(1, 18 - Math.max(0, inputLines.length - 1));
