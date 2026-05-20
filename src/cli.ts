@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import 'dotenv/config';
 import { AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTheme, UserMessageComponent } from '@mariozechner/pi-coding-agent';
-import { AuthStorage, ModelRegistry, ModelSelectorComponent, SettingsManager } from '@mariozechner/pi-coding-agent';
+import { AuthStorage, createAgentSessionFromServices, createAgentSessionServices, ModelRegistry, ModelSelectorComponent, SessionManager, SettingsManager } from '@mariozechner/pi-coding-agent';
 import { CombinedAutocompleteProvider, CURSOR_MARKER, Editor, matchesKey, ProcessTerminal, TUI, type Component, type Focusable, type SlashCommand } from '@mariozechner/pi-tui';
 import { fuzzyFilter } from '@mariozechner/pi-tui';
 import { spawn, spawnSync } from 'node:child_process';
@@ -354,14 +354,14 @@ function taskNameFromPrompt(prompt: string) {
 
 function taskStatus(task: MiTask) {
   const status = String(task.status || '').toLowerCase();
-  if (task.needsKyle && task.needsKyleReason === 'stopped by Escape') return 'paused';
+  if (task.needsUser && task.needsUserReason === 'stopped by Escape') return 'paused';
   if (task.finishedAt && !task.status) return 'complete';
   return task.status || 'unknown';
 }
 
 function isTaskNeedsInput(task: MiTask) {
   const status = taskStatus(task).toLowerCase();
-  return !task.finishedAt && (task.needsKyle || ['waiting', 'paused'].includes(status));
+  return status === 'error' || (!task.finishedAt && task.needsUser && ['paused', 'error'].includes(status));
 }
 
 function isTaskActive(task: MiTask) {
@@ -404,6 +404,16 @@ function taskStartedMs(task: MiTask) {
   return Date.parse(task.startedAt || task.continuedAt || task.updatedAt || '') || 0;
 }
 
+function taskSectionMovedMs(task: MiTask) {
+  const section = taskSection(task);
+  const timestamp = section === 'needs input'
+    ? task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt
+    : section === 'working'
+      ? task.continuedAt || task.updatedAt || task.lastEventAt || task.startedAt
+      : task.finishedAt || task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt;
+  return Date.parse(timestamp || '') || 0;
+}
+
 function compactDuration(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   if (seconds < 60) return `${seconds}s`;
@@ -438,8 +448,8 @@ function prColumn(task: MiTask) {
   return (`PR#${first}${urls.length > 1 ? `+${urls.length - 1}` : ''}`).padEnd(8).slice(0, 8);
 }
 
-function needsKyleColumn(task: MiTask) {
-  if (task.needsKyle) return 'NEEDS'.padEnd(7);
+function needsUserColumn(task: MiTask) {
+  if (task.needsUser) return 'NEEDS'.padEnd(7);
   if (taskStatus(task) === 'error') return 'ERROR'.padEnd(7);
   return ''.padEnd(7);
 }
@@ -579,7 +589,7 @@ function taskLastInput(task: MiTask) {
 }
 
 function taskNeedsInputQuestion(task: MiTask) {
-  return task.progress || taskDisplayText(task) || task.error || task.needsKyleReason || 'Needs input.';
+  return task.progress || taskDisplayText(task) || task.error || task.needsUserReason || 'Needs input.';
 }
 
 function readSessionActivitySteps(sessionFile: string, task: MiTask, maxRecords = 10) {
@@ -919,7 +929,7 @@ async function miAgentsCommand() {
       `Task: ${taskName(task)}`,
       `Status: ${taskStatus(task)}`,
       task.sessionFile ? `session: ${task.sessionFile}` : '',
-      task.needsKyle ? `needs ${miUserName()}: ${task.needsKyleReason || 'attention'}` : '',
+      task.needsUser ? `needs ${miUserName()}: ${task.needsUserReason || 'attention'}` : '',
       task.progress ? `progress: ${task.progress}` : '',
       task.text ? `latest result: ${task.text.slice(0, 1200)}` : '',
       task.error ? `error: ${task.error}` : '',
@@ -1070,9 +1080,7 @@ async function miAgentsCommand() {
     return tasks
       .map((task, index) => ({ task, index }))
       .filter((item) => taskSection(item.task) === label)
-      .sort((a, b) => label === 'completed'
-        ? (Date.parse(b.task.finishedAt || b.task.updatedAt || b.task.lastEventAt || '') || 0) - (Date.parse(a.task.finishedAt || a.task.updatedAt || a.task.lastEventAt || '') || 0)
-        : taskStartedMs(b.task) - taskStartedMs(a.task));
+      .sort((a, b) => taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task));
   }
 
   function navigationTaskIndexes() {
@@ -1416,7 +1424,7 @@ async function miAgentsCommand() {
       const taskId = task.id || task.sessionFile || task.sessionName || task.name;
       const taskKey = stableTaskKey(task);
       const startedAt = Date.now();
-      const immediateRunningUpdate: Partial<MiTask> = { status: 'running', needsKyle: false, needsKyleReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: value, lastInput: value, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const immediateRunningUpdate: Partial<MiTask> = { status: 'running', needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, progress: value, lastInput: value, continuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
       Object.assign(task, immediateRunningUpdate);
       if (taskKey) {
         pendingTaskUpdates.set(taskKey, immediateRunningUpdate);
@@ -1510,6 +1518,15 @@ async function miAgentsCommand() {
       return;
     }
     if (inputMode !== 'normal') {
+      if (data.includes('\r') || data.includes('\n')) {
+        void submitAgentInput().then(() => requestRender()).catch((error) => {
+          status = error instanceof Error ? error.message : String(error);
+          inputMode = 'normal';
+          agentSubmitting = false;
+          requestRender();
+        });
+        return;
+      }
       if (data === '\x1b' || data === '\x03') {
         if (inputMode === 'mi-chat' && data === '\x1b') {
           status = miChatTask ? `Chatting with Mi about ${taskName(miChatTask)} • ^C end` : defaultAgentStatus;
@@ -1613,15 +1630,15 @@ async function miAgentsCommand() {
           void dismissTaskFromList(task).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(); });
         } else if (isTaskActive(task)) {
           task.status = 'paused';
-          task.needsKyle = true;
-          task.needsKyleReason = 'stopped by Escape';
+          task.needsUser = true;
+          task.needsUserReason = 'stopped by Escape';
           task.finishedAt = undefined;
-          task.progress = 'stopped by Escape; needs Kyle input';
+          task.progress = 'stopped by Escape; needs User input';
           task.updatedAt = new Date().toISOString();
           status = `Stopped ${taskName(task)}; moved to needs input`;
           const taskKey = stableTaskKey(task);
           if (taskKey) {
-            pendingTaskUpdates.set(taskKey, { status: 'paused', needsKyle: true, needsKyleReason: 'stopped by Escape', finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: task.updatedAt });
+            pendingTaskUpdates.set(taskKey, { status: 'paused', needsUser: true, needsUserReason: 'stopped by Escape', finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: task.updatedAt });
             pendingTaskUpdateStartedAt.delete(taskKey);
           }
           clampTaskSelection();
@@ -1776,8 +1793,8 @@ type MiTask = {
   progress?: string;
   lastInput?: string;
   lastEventAt?: string;
-  needsKyle?: boolean;
-  needsKyleReason?: string;
+  needsUser?: boolean;
+  needsUserReason?: string;
   prUrls?: string[];
   sessionFile?: string;
   actualSessionFile?: string;
@@ -2137,6 +2154,43 @@ const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
 };
 
 let modelAutocompleteCache: { loadedAt: number; models: any[] } | undefined;
+let piResourceCommandCache: { loadedAt: number; cwd: string; commands: SlashCommand[] } | undefined;
+
+function prefixPiResourceDescription(description: string | undefined, sourceInfo: any) {
+  const scope = sourceInfo?.scope;
+  const source = sourceInfo?.source;
+  if (!scope || !source) return description || '';
+  const tag = source.startsWith('npm:') ? `${scope}:${source}` : source.startsWith('git:') ? `${scope}:${source}` : scope;
+  return description ? `[${tag}] ${description}` : `[${tag}]`;
+}
+
+async function getPiResourceSlashCommands(cwd = process.cwd()): Promise<SlashCommand[]> {
+  const now = Date.now();
+  if (piResourceCommandCache && piResourceCommandCache.cwd === cwd && now - piResourceCommandCache.loadedAt < 30_000) return piResourceCommandCache.commands;
+  const services = await createAgentSessionServices({ cwd, authStorage: AuthStorage.create() });
+  const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory() });
+  const builtinNames = new Set(PI_SLASH_COMMANDS.map((command) => command.replace(/^\//, '')));
+  const extensionCommands = session.extensionRunner.getRegisteredCommands()
+    .filter((cmd: any) => !builtinNames.has(cmd.name) && !MI_BLOCKED_PI_SLASH_COMMANDS.has(`/${cmd.invocationName}`))
+    .map((cmd: any) => ({
+      name: cmd.invocationName,
+      description: prefixPiResourceDescription(cmd.description, cmd.sourceInfo),
+      getArgumentCompletions: cmd.getArgumentCompletions,
+    }));
+  const templateCommands = session.promptTemplates.map((template: any) => ({
+    name: template.name,
+    description: prefixPiResourceDescription(template.description, template.sourceInfo),
+    ...(template.argumentHint ? { argumentHint: template.argumentHint } : {}),
+  }));
+  const skillCommands = services.settingsManager.getEnableSkillCommands?.()
+    ? services.resourceLoader.getSkills().skills.map((skill: any) => ({
+      name: `skill:${skill.name}`,
+      description: prefixPiResourceDescription(skill.description, skill.sourceInfo),
+    }))
+    : [];
+  piResourceCommandCache = { loadedAt: now, cwd, commands: [...templateCommands, ...extensionCommands, ...skillCommands] };
+  return piResourceCommandCache.commands;
+}
 
 async function getPiScopedModels(settingsManager = SettingsManager.create(process.cwd()), modelRegistry = ModelRegistry.create(AuthStorage.create())) {
   const patterns = settingsManager.getEnabledModels?.() || [];
@@ -2183,7 +2237,16 @@ function createPiSlashAutocompleteProvider(commands = PI_SLASH_COMMANDS) {
     description: PI_SLASH_COMMAND_DESCRIPTIONS[command],
     ...((command === '/model' || command === '/models') ? { argumentHint: '<model>', getArgumentCompletions: getModelAutocompleteItems } : {}),
   }));
-  return new CombinedAutocompleteProvider(slashCommands, process.cwd());
+  const baseProvider = new CombinedAutocompleteProvider(slashCommands, process.cwd());
+  return {
+    async getSuggestions(lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal; force?: boolean }) {
+      const resourceCommands = await getPiResourceSlashCommands(process.cwd()).catch(() => []);
+      if (resourceCommands.length === 0) return baseProvider.getSuggestions(lines, cursorLine, cursorCol, options);
+      return new CombinedAutocompleteProvider([...slashCommands, ...resourceCommands], process.cwd()).getSuggestions(lines, cursorLine, cursorCol, options);
+    },
+    applyCompletion: baseProvider.applyCompletion.bind(baseProvider),
+    shouldTriggerFileCompletion: baseProvider.shouldTriggerFileCompletion?.bind(baseProvider),
+  };
 }
 
 const miTranscriptRenderCache = new WeakMap<Array<MiTranscriptItem>, { width: number; length: number; lastRole: string; lastText: string; lines: string[] }>();
@@ -2609,7 +2672,7 @@ async function miTuiCommand(initial = '') {
       `Selected Mi background agent #${selectedAgentIndex + 1}: ${taskName(task)}`,
       `Status: ${taskStatus(task)}`,
       task.sessionFile ? `session: ${task.sessionFile}` : '',
-      task.needsKyle ? `needs ${miUserName()}: ${task.needsKyleReason || 'attention'}` : '',
+      task.needsUser ? `needs ${miUserName()}: ${task.needsUserReason || 'attention'}` : '',
       extractPrUrlsFromTask(task).length ? `PRs: ${extractPrUrlsFromTask(task).join(' ')}` : '',
       task.text ? `latest result: ${task.text.slice(0, 800)}` : '',
       task.progress ? `progress: ${task.progress}` : '',
