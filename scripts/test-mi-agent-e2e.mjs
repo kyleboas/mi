@@ -12,6 +12,12 @@ const piLog = join(root, 'pi.log');
 const requestLog = join(root, 'requests.log');
 const fakePi = join(root, 'fake-pi.mjs');
 const sessionFile = join(root, 'selected-session.jsonl');
+const stripAnsi = (text) => text.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+let selectedTaskStatus = 'active';
+let selectedTaskNeedsUser = false;
+let selectedTaskNeedsUserReason;
+let selectedTaskProgress;
+let selectedTaskLastInput;
 
 await writeFile(sessionFile, '');
 await writeFile(fakePi, `#!/usr/bin/env node\nimport { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(piLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`, { mode: 0o755 });
@@ -19,18 +25,22 @@ await writeFile(fakePi, `#!/usr/bin/env node\nimport { appendFileSync } from 'no
 const server = net.createServer((socket) => {
   socket.on('error', () => {});
   let data = '';
-  socket.on('data', (chunk) => {
+  socket.on('data', async (chunk) => {
     data += chunk.toString('utf8');
     if (!data.includes('\n')) return;
     const line = data.slice(0, data.indexOf('\n'));
     const request = JSON.parse(line);
-    void appendFile(requestLog, JSON.stringify(request) + '\n');
+    await appendFile(requestLog, JSON.stringify(request) + '\n');
     if (request.type === 'list_tasks') {
       socket.end(JSON.stringify({ ok: true, tasks: [{
         id: 'task-selected',
         name: 'selected task',
         sessionName: 'selected task',
-        status: 'active',
+        status: selectedTaskStatus,
+        needsUser: selectedTaskNeedsUser,
+        needsUserReason: selectedTaskNeedsUserReason,
+        progress: selectedTaskProgress,
+        lastInput: selectedTaskLastInput,
         cwd: root,
         sessionFile,
         actualSessionFile: sessionFile,
@@ -41,6 +51,23 @@ const server = net.createServer((socket) => {
     }
     if (request.type === 'run_worker') {
       socket.end(JSON.stringify({ ok: true, text: 'Started background task', taskId: 'task-new', sessionFile, sessionName: request.name || 'new task' }) + '\n');
+      return;
+    }
+    if (request.type === 'continue_worker') {
+      selectedTaskStatus = 'running';
+      selectedTaskNeedsUser = false;
+      selectedTaskNeedsUserReason = undefined;
+      selectedTaskProgress = request.message;
+      selectedTaskLastInput = request.message;
+      socket.end(JSON.stringify({ ok: true, text: 'Sent follow-up to background task' }) + '\n');
+      return;
+    }
+    if (request.type === 'stop_task') {
+      selectedTaskStatus = 'paused';
+      selectedTaskNeedsUser = true;
+      selectedTaskNeedsUserReason = 'stopped by Escape';
+      selectedTaskProgress = 'stopped by Escape; needs User input';
+      socket.end(JSON.stringify({ ok: true, text: 'Stopped selected task; moved to needs input' }) + '\n');
       return;
     }
     if (request.type === 'list_pi_sessions') {
@@ -101,9 +128,10 @@ function runAgentsAndSend(input, done) {
       setTimeout(() => child.kill('SIGKILL'), 500);
       reject(new Error(`mi agents timed out. stdout=${stdout.slice(-1000)} stderr=${stderr.slice(-1000)}`));
     }, 8000);
+    const startedAt = Date.now();
     const doneTimer = setInterval(async () => {
       try {
-        if (!finishing && await done()) {
+        if (!finishing && (await done(stdout, stderr) || (done.afterMs && Date.now() - startedAt >= done.afterMs))) {
           finishing = true;
           clearInterval(doneTimer);
           clearTimeout(killTimer);
@@ -126,7 +154,8 @@ function runAgentsAndSend(input, done) {
           waitForStep();
           return;
         }
-        child.stdin.write(text[index++]);
+        if (child.killed || child.stdin.destroyed) return;
+        child.stdin.write(text[index++], () => {});
         setTimeout(writeNext, 100);
       };
       writeNext();
@@ -144,11 +173,24 @@ function runAgentsAndSend(input, done) {
   });
 }
 
+// Typing a plain reply to the selected task should send it to the worker, then Esc should stop it into needs input.
+const typedReplyDone = async () => false;
+typedReplyDone.afterMs = 6000;
+const typedReplyRun = await runAgentsAndSend([
+  { input: 'please continue selected task\n' },
+  { waitFor: 'selected task', input: '\x1b\x1b' },
+], typedReplyDone);
+const typedReplyPlain = stripAnsi(typedReplyRun.stdout);
+let requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+assert.ok(requests.some((request) => request.type === 'continue_worker' && request.taskId === 'task-selected' && request.message === 'please continue selected task'), 'plain typed input should reply to selected task');
+assert.match(typedReplyPlain, /paused/, 'Esc after typed reply should render task as paused');
+assert.match(typedReplyPlain, /stopped by Escape; needs User input/, 'Esc after typed reply should render needs-input reason');
+
 // /resume is a mi agents command: it opens a session picker, then Enter adds the selected pi session as a task without opening pi.
 await runAgentsAndSend('/resume\n\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('resume_session'));
 let piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
 assert.equal(piCalls.length, 0, '/resume should not spawn pi');
-let requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 assert.ok(requests.some((request) => request.type === 'list_pi_sessions'), '/resume should open the pi-session picker');
 assert.ok(requests.some((request) => request.type === 'resume_session' && ['pi-session-old', 'pi-session-two'].includes(request.id)), 'Enter should add the selected pi session as a task');
 

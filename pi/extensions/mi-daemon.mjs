@@ -378,7 +378,22 @@ async function listPiSessionTasks() {
     if (task) parsedTasks.push(task);
   }
   const openSessionFiles = inferOpenPiSessionFiles(parsedTasks, activeProcesses);
-  const tasks = parsedTasks.map((task) => openSessionFiles.has(task.sessionFile) ? { ...task, openPiSession: true } : task);
+  const tasks = parsedTasks.map((task) => {
+    const openPiSession = openSessionFiles.has(task.sessionFile);
+    const status = String(task.status || "").toLowerCase();
+    if (openPiSession) return { ...task, status: "running", finishedAt: undefined, openPiSession: true };
+    if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
+      return enrichTask({
+        ...task,
+        status: "inactive",
+        needsUser: false,
+        needsUserReason: undefined,
+        finishedAt: task.finishedAt || task.lastEventAt || task.updatedAt || new Date().toISOString(),
+        progress: task.progress || "interactive pi session stopped",
+      });
+    }
+    return task;
+  });
   piSessionTaskCache = { at: now, tasks };
   return tasks;
 }
@@ -460,11 +475,23 @@ async function mergeOpenPiSessions(tasks, dismissed) {
     const activeStatus = String(activeSession.status || "").toLowerCase();
     const terminalTask = task.finishedAt || ["complete", "completed", "done", "error", "stopped", "paused", "inactive"].includes(taskStatus);
     const liveTrackedWorker = taskHasActiveWorker(task);
-    const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus) && !liveTrackedWorker;
+    if (liveTrackedWorker) {
+      return {
+        ...task,
+        lastEventAt: activeSession.lastEventAt || task.lastEventAt,
+        sessionFile: task.sessionFile || activeSession.sessionFile,
+        actualSessionFile: task.actualSessionFile || activeSession.actualSessionFile,
+        sessionId: task.sessionId || activeSession.sessionId,
+        sessionName: task.sessionName || activeSession.sessionName,
+      };
+    }
+    const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus);
     const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused");
     return {
       ...task,
       status: preserveStoredTerminal ? task.status : (activeSession.status || task.status),
+      needsUser: preserveStoredTerminal ? task.needsUser : (activeSession.needsUser ?? task.needsUser),
+      needsUserReason: preserveStoredTerminal ? task.needsUserReason : (activeSession.needsUserReason || task.needsUserReason),
       finishedAt: preserveStoredTerminal ? task.finishedAt : activeSession.finishedAt,
       text: preserveStoredTerminal ? task.text : (activeSession.text || task.text),
       progress: preserveStoredTerminal ? task.progress : (activeSession.progress || task.progress),
@@ -504,7 +531,7 @@ async function stopTask(request) {
     activeWorker.proc.kill();
   }
   if (task) {
-    await upsertTask({ ...task, status: "paused", needsKyle: true, needsKyleReason: "stopped by Escape", finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: new Date().toISOString() });
+    await upsertTask({ ...task, status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: new Date().toISOString() });
     untrackActiveWorker(task, name);
   }
   return { text: `Stopped ${name}; moved to needs input` };
@@ -565,26 +592,16 @@ function extractPrUrls(text) {
   return [...String(text || "").matchAll(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/gi)].map((match) => match[0]);
 }
 
-function detectNeedsKyle(task) {
-  if (task.needsKyle) return { needsKyle: true, needsKyleReason: task.needsKyleReason || "requested" };
-  const text = `${task.error || ""}\n${task.text || ""}\n${task.progress || ""}`;
-  const patterns = [
-    /approval required/i,
-    /needs? (?:kyle|user|your) (?:input|review|approval|decision|confirmation)/i,
-    /waiting (?:on|for) (?:kyle|user|you|approval|review|input|decision)/i,
-    /blocked (?:by|on|until)/i,
-    /please (?:review|approve|confirm|decide|provide)/i,
-    /requires? (?:manual|human|user) (?:review|approval|input|decision)/i,
-  ];
-  const hit = patterns.find((pattern) => pattern.test(text));
-  if (hit) return { needsKyle: true, needsKyleReason: hit.source };
-  if (task.status === "error") return { needsKyle: true, needsKyleReason: "error" };
-  return { needsKyle: false, needsKyleReason: undefined };
+function detectNeedsUser(task) {
+  const status = String(task.status || "").toLowerCase();
+  if (task.needsUser && task.needsUserReason === "stopped by Escape") return { needsUser: true, needsUserReason: "stopped by Escape" };
+  if (status === "error") return { needsUser: true, needsUserReason: task.needsUserReason || "error" };
+  return { needsUser: false, needsUserReason: undefined };
 }
 
 function enrichTask(task) {
   const prUrls = [...new Set([...(task.prUrls || []), ...extractPrUrls(`${task.text || ""}\n${task.progress || ""}\n${task.error || ""}`)])];
-  return { ...task, ...detectNeedsKyle(task), prUrls };
+  return { ...task, ...detectNeedsUser(task), prUrls };
 }
 
 async function upsertTask(task) {
@@ -594,9 +611,9 @@ async function upsertTask(task) {
   const previous = index >= 0 ? tasks[index] : undefined;
   const next = enrichTask({ ...task, updatedAt: new Date().toISOString() });
   const merged = index >= 0 ? enrichTask({ ...previous, ...next }) : next;
-  if (merged.needsKyle && !previous?.notifiedNeedsKyleAt) {
-    merged.notifiedNeedsKyleAt = new Date().toISOString();
-    await appendMainThreadMessage(`Task needs ${miUserName()}: ${merged.sessionName || merged.name || merged.id}\n\n${merged.needsKyleReason || "Needs attention"}\n\n${merged.error || merged.progress || merged.text || "Open the background task for details."}`).catch(() => undefined);
+  if (merged.needsUser && !previous?.notifiedNeedsUserAt) {
+    merged.notifiedNeedsUserAt = new Date().toISOString();
+    await appendMainThreadMessage(`Task needs ${miUserName()}: ${merged.sessionName || merged.name || merged.id}\n\n${merged.needsUserReason || "Needs attention"}\n\n${merged.error || merged.progress || merged.text || "Open the background task for details."}`).catch(() => undefined);
   }
   if (merged.status === "paused" && previous?.status !== "paused" && !previous?.notifiedPausedAt) {
     merged.notifiedPausedAt = new Date().toISOString();
@@ -974,16 +991,33 @@ async function runWorker(request) {
   const sessionDir = request.sessionDir ? String(request.sessionDir).trim() : undefined;
   log(`starting worker ${name} cwd=${cwd} model=${model}`);
   const worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1" } });
+  const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  let task = request.background
+    ? await upsertTask({
+      id: taskId,
+      name,
+      cwd,
+      status: "running",
+      progress: "starting worker",
+      startedAt: new Date().toISOString(),
+      sessionName: name,
+      model,
+      lastInput: message,
+    })
+    : undefined;
+  if (task) trackActiveWorker(task, name, worker);
   try {
     await worker.rpc({ type: "set_session_name", name });
     const before = await worker.rpc({ type: "get_state" });
     const visibleSessionFile = await mirrorSessionToHome(before.sessionFile);
-    const task = await upsertTask({
-      id: `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    task = await upsertTask({
+      ...(task || {}),
+      id: task?.id || taskId,
       name,
       cwd,
       status: request.background ? "running" : "waiting",
-      startedAt: new Date().toISOString(),
+      progress: request.background ? (task?.progress || "starting worker") : undefined,
+      startedAt: task?.startedAt || new Date().toISOString(),
       sessionFile: visibleSessionFile,
       actualSessionFile: before.sessionFile,
       sessionId: before.sessionId,
@@ -1005,6 +1039,12 @@ async function runWorker(request) {
     const text = lastAssistantText(end.messages) || "Worker completed without text.";
     await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text });
     return { text, sessionFile: await mirrorSessionToHome(after.sessionFile || before.sessionFile), sessionId: after.sessionId || before.sessionId, sessionName: after.sessionName || name, model: after.model || before.model };
+  } catch (error) {
+    if (request.background && task) {
+      await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error) });
+      untrackActiveWorker(task, name);
+    }
+    throw error;
   } finally {
     if (!request.background) worker.proc.kill();
   }
