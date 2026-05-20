@@ -1,0 +1,130 @@
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
+import { notify } from './notify.js';
+import { appendThreadMessage } from './threads.js';
+const HOME = process.env.HOME || homedir();
+const STATE_DIR = join(HOME, 'mi', 'state');
+const CRONS_PATH = join(STATE_DIR, 'crons.json');
+const LOG_PATH = join(STATE_DIR, 'cron-runs.jsonl');
+function now() { return new Date().toISOString(); }
+export function intervalToMs(value) {
+    const match = value.trim().match(/^(\d+)\s*(s|m|h|d)$/i);
+    if (!match)
+        return undefined;
+    const amount = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    if (unit === 's')
+        return amount * 1000;
+    if (unit === 'm')
+        return amount * 60_000;
+    if (unit === 'h')
+        return amount * 60 * 60_000;
+    if (unit === 'd')
+        return amount * 24 * 60 * 60_000;
+    return undefined;
+}
+async function ensureState() { await mkdir(dirname(CRONS_PATH), { recursive: true }); }
+export async function readCrons() {
+    await ensureState();
+    if (!existsSync(CRONS_PATH))
+        return [];
+    return JSON.parse(await readFile(CRONS_PATH, 'utf8'));
+}
+export async function writeCrons(crons) {
+    await ensureState();
+    await writeFile(CRONS_PATH, JSON.stringify(crons, null, 2));
+}
+export async function upsertCron(cron) {
+    if (cron.every) {
+        const ms = intervalToMs(cron.every);
+        if (!ms || ms < 60_000)
+            throw new Error('cron interval must be like 1m, 10m, 1h, 1d and at least 1m');
+    }
+    else if (cron.at) {
+        if (!Number.isFinite(Date.parse(cron.at)))
+            throw new Error('reminder time must be an ISO timestamp');
+    }
+    else {
+        throw new Error('cron needs either every or at');
+    }
+    const crons = await readCrons();
+    const index = crons.findIndex((item) => item.name === cron.name);
+    if (index >= 0)
+        crons[index] = { ...crons[index], ...cron };
+    else
+        crons.push(cron);
+    await writeCrons(crons);
+    return cron;
+}
+export async function removeCron(name) {
+    const crons = await readCrons();
+    const next = crons.filter((cron) => cron.name !== name);
+    await writeCrons(next);
+    return crons.length - next.length;
+}
+function due(cron, at = Date.now()) {
+    if (!cron.enabled)
+        return false;
+    if (cron.at)
+        return Date.parse(cron.at) <= at;
+    const ms = cron.every ? intervalToMs(cron.every) : undefined;
+    if (!ms)
+        return false;
+    if (!cron.lastRunAt)
+        return true;
+    return at - Date.parse(cron.lastRunAt) >= ms;
+}
+function formatCronErrorMessage(cron, output) {
+    const detail = output.trim() || 'No output captured.';
+    return `Mi cron error: ${cron.name}\n\n${detail}\n\nState: ${CRONS_PATH}\nLog: ${LOG_PATH}`;
+}
+async function surfaceCronError(cron, output) {
+    const message = formatCronErrorMessage(cron, output);
+    await appendThreadMessage('main', 'assistant', message, { unread: true, source: 'mi-cron' });
+    await notify(`Mi cron error: ${cron.name}`, message).catch(() => ({ skipped: true }));
+}
+export async function runCron(cron) {
+    const startedAt = now();
+    if (cron.message && !cron.command) {
+        await appendThreadMessage('main', 'assistant', cron.message, { unread: true, source: 'mi-reminder' });
+        const sent = await notify('Mi reminder', cron.message).catch(() => ({ skipped: true }));
+        const result = { status: 'ok', output: `Reminder: ${cron.message}${sent?.skipped ? ' (notification skipped)' : ''}` };
+        await appendFile(LOG_PATH, `${JSON.stringify({ name: cron.name, startedAt, finishedAt: now(), ...result })}\n`);
+        return result;
+    }
+    if (!cron.command)
+        throw new Error(`cron ${cron.name} has no command`);
+    const result = await new Promise((resolve) => {
+        const child = spawn(cron.command || '', { cwd: cron.cwd || HOME, shell: true, env: process.env });
+        let output = '';
+        child.stdout.on('data', (data) => { output += data.toString(); });
+        child.stderr.on('data', (data) => { output += data.toString(); });
+        child.on('error', (error) => resolve({ status: 'error', output: String(error) }));
+        child.on('close', (code) => resolve({ status: code === 0 ? 'ok' : 'error', output: output.slice(-4000) }));
+    });
+    await appendFile(LOG_PATH, `${JSON.stringify({ name: cron.name, startedAt, finishedAt: now(), ...result })}\n`);
+    if (result.status === 'error')
+        await surfaceCronError(cron, result.output);
+    return result;
+}
+export async function tickCrons() {
+    const crons = await readCrons();
+    const ran = [];
+    for (const cron of crons) {
+        if (!due(cron))
+            continue;
+        const result = await runCron(cron);
+        cron.lastRunAt = now();
+        cron.lastStatus = result.status;
+        cron.lastOutput = result.output.slice(-1000);
+        if (cron.at)
+            cron.enabled = false;
+        ran.push({ name: cron.name, status: result.status });
+    }
+    await writeCrons(crons);
+    return ran;
+}
+export function cronPaths() { return { cronsPath: CRONS_PATH, logPath: LOG_PATH }; }

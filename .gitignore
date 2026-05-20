@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# runtime state and logs
+state/
+.flue/
+*.log
+*.pid
+
+# local/editor
+.DS_Store
+*.swp
+*.swo
+
+# build scratch
+coverage/
+.tmp/
+tmp/

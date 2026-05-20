@@ -1,0 +1,7 @@
+{
+  "name": "@mi/cloudflare",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "main": "index.ts"
+}
