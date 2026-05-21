@@ -177,6 +177,13 @@ try {
   const followup = rows.find((t) => t.id === 'task-new-followup' || t.sessionId === uuid(10));
   assert.equal(followup.status, 'running', 'newer stored follow-up was overwritten by stale completed session scan');
 
+  // 9. A persisted external Pi session that was working but is no longer open must stay visible as needs input.
+  await writeTasks([{ id: `pi-session:${uuid(11)}`, source: 'pi-session', name: 'stopped-external-pi', sessionName: 'stopped-external-pi', cwd: '/repo', status: 'running', sessionId: uuid(11), sessionFile: '/missing/session.jsonl', updatedAt: iso(8000), progress: 'working' }]);
+  rows = (await request('list_tasks')).tasks;
+  const stoppedExternal = rows.find((t) => t.name === 'stopped-external-pi');
+  assert.equal(stoppedExternal.status, 'paused', 'stopped external pi session disappeared or stayed working instead of needs input');
+  assert.equal(stoppedExternal.needsUser, true, 'stopped external pi session did not move to needs input');
+
   console.log('Mi agent dedupe repro checks passed.');
 } finally {
   daemon.kill('SIGTERM');
