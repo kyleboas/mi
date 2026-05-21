@@ -24,6 +24,8 @@ npm run mi --
 
 ## `mi agents`
 
+![](/assets/mi_agents.jpeg)
+
 `mi agents` opens the live background-agent view.
 
 ```bash
