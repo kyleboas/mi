@@ -18,6 +18,7 @@ import { checkAssistant, runAssistant } from './runner.js';
 import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
 import { readRecentEvents, logEvent } from './state.js';
+import { redactSecrets } from './redact.js';
 import {
   appendThreadMessage,
   compactThread,
@@ -39,6 +40,7 @@ const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?
 // differential renderer rather than by slowing Mi's animation down.
 const MI_AGENT_ANIMATION_MS = Number(process.env.MI_AGENT_ANIMATION_MS || 250);
 const MI_WORKING_RENDER_MS = Number(process.env.MI_WORKING_RENDER_MS || PI_LOADER_INTERVAL_MS);
+const MI_WORKER_HANDOFF_RECENT_MESSAGES = Number(process.env.MI_WORKER_HANDOFF_RECENT_MESSAGES || 25);
 const MI_SESSION_TAIL_BYTES = Number(process.env.MI_SESSION_TAIL_BYTES || 256 * 1024);
 const MI_SESSION_ACTIVITY_REFRESH_MS = Number(process.env.MI_SESSION_ACTIVITY_REFRESH_MS || 1000);
 let resolveModelScopeModule: Promise<any> | undefined;
@@ -291,6 +293,16 @@ function taskSortRank(task: MiTask) {
 
 function taskStartedMs(task: MiTask) {
   return Date.parse(task.startedAt || task.continuedAt || task.updatedAt || '') || 0;
+}
+
+function taskNewestMs(task: MiTask) {
+  return Math.max(
+    Date.parse(task.updatedAt || '') || 0,
+    Date.parse(task.lastEventAt || '') || 0,
+    Date.parse(task.continuedAt || '') || 0,
+    Date.parse(task.startedAt || '') || 0,
+    Date.parse(task.finishedAt || '') || 0,
+  );
 }
 
 function taskSectionMovedMs(task: MiTask) {
@@ -744,8 +756,13 @@ async function miAgentsCommand() {
   if (!renderTestMode) agentEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider());
   let syncingAgentEditor = false;
   agentEditor.focused = true;
+  function agentEditorText(expanded = false) {
+    const maybeExpanded = (agentEditor as unknown as { getExpandedText?: () => string });
+    return expanded && typeof maybeExpanded.getExpandedText === 'function' ? maybeExpanded.getExpandedText() : agentEditor.getText();
+  }
+
   agentEditor.onChange = (text) => {
-    inputBuffer = text;
+    inputBuffer = agentEditorText(true) || text;
     if (syncingAgentEditor) return;
     if (inputMode === 'normal' && text.length > 0 && !text.startsWith('/')) {
       replyTarget = selectedTask();
@@ -818,10 +835,11 @@ async function miAgentsCommand() {
     (tui as any)?.requestRender?.(force);
   }
 
-  function reclickFullOutputIfActive() {
+  function exitFullOutputAfterReply() {
     if (!fullLastOutputMode) return;
+    fullLastOutputMode = false;
     fullLastOutputScroll = 0;
-    status = 'Full output • ↑/↓ scroll • ^L back';
+    status = defaultAgentStatus;
     if (!renderTestMode) process.stdout.write('\x1b[2J\x1b[H');
     requestRender(true);
   }
@@ -1037,6 +1055,10 @@ async function miAgentsCommand() {
       await openSelectedInPi();
       return true;
     }
+    if (MI_BACKGROUND_SLASH_COMMANDS.has(slashCommandName(value))) {
+      await startAgentSlashBackgroundTask(value);
+      return true;
+    }
     if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(value))) {
       status = `${slashCommandName(value)} is a Pi app command; open Pi directly to use it.`;
       requestRender();
@@ -1050,7 +1072,15 @@ async function miAgentsCommand() {
     return tasks
       .map((task, index) => ({ task, index }))
       .filter((item) => taskSection(item.task) === label)
-      .sort((a, b) => taskStartedMs(a.task) - taskStartedMs(b.task) || taskUpdatedMs(a.task) - taskUpdatedMs(b.task));
+      .sort((a, b) => {
+        if (label === 'completed') {
+          return taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task);
+        }
+        if (label === 'needs input' || label === 'working') {
+          return taskNewestMs(b.task) - taskNewestMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task);
+        }
+        return taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task);
+      });
   }
 
   function navigationTaskIndexes() {
@@ -1078,7 +1108,7 @@ async function miAgentsCommand() {
     resumeMode = true;
     resumeLoading = true;
     resumeEnterPending = false;
-    resumeMultiSelectMode = false;
+    resumeMultiSelectMode = true;
     selectedResumeKeys.clear();
     resumeSessions = [];
     resumeSelected = 0;
@@ -1086,8 +1116,9 @@ async function miAgentsCommand() {
     requestRender();
     resumeSessions = await listResumeSessions();
     resumeSelected = 0;
+    if (resumeSessions[resumeSelected]) selectedResumeKeys.add(stableTaskKey(resumeSessions[resumeSelected]));
     resumeLoading = false;
-    status = resumeSessions.length > 0 ? '^M multi-select • Enter add session as task • Esc cancel' : 'No pi sessions found';
+    status = resumeSessions.length > 0 ? `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • ^M exit multi-select` : 'No pi sessions found';
     requestRender();
     if (resumeEnterPending && resumeSessions.length > 0) {
       resumeEnterPending = false;
@@ -1316,6 +1347,46 @@ async function miAgentsCommand() {
     await openPi(['--session', task.sessionFile], task.cwd || HOME);
   }
 
+  async function startAgentSlashBackgroundTask(value: string) {
+    const name = taskNameFromPrompt(value);
+    const optimisticTask: any = {
+      id: `pending_${Date.now().toString(36)}`,
+      name,
+      cwd: HOME,
+      status: 'queued',
+      startedAt: new Date().toISOString(),
+      progress: value,
+      lastInput: value,
+    };
+    optimisticTasks = [optimisticTask, ...optimisticTasks];
+    tasks = [optimisticTask, ...tasks];
+    selected = 0;
+    status = `Starting ${value} in background...`;
+    agentSubmitting = true;
+    requestRender(true);
+    void sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: value, lastInput: value, background: true }, 30000)
+      .then(async (result) => {
+        optimisticTask.id = result.taskId || optimisticTask.id;
+        optimisticTask.sessionFile = result.sessionFile || optimisticTask.sessionFile;
+        optimisticTask.sessionId = result.sessionId || optimisticTask.sessionId;
+        optimisticTask.sessionName = result.sessionName || optimisticTask.sessionName;
+        optimisticTask.status = 'running';
+        optimisticTask.progress = result.text || optimisticTask.progress;
+        await refresh();
+        status = result.text || `Started ${value}.`;
+      })
+      .catch((error) => {
+        optimisticTask.status = 'error';
+        optimisticTask.finishedAt = new Date().toISOString();
+        optimisticTask.error = error instanceof Error ? error.message : String(error);
+        status = optimisticTask.error;
+      })
+      .finally(() => {
+        agentSubmitting = false;
+        requestRender(true);
+      });
+  }
+
   async function runSlashCommandInPi(value: string) {
     const task = replyTarget || selectedTask();
     if (task?.sessionFile) return openPi(['--session', task.sessionFile, value], task.cwd || HOME);
@@ -1325,6 +1396,8 @@ async function miAgentsCommand() {
   async function submitAgentInput() {
     const value = inputBuffer.trim();
     setAgentInput('');
+    const exitFullOutputForReply = inputMode === 'reply' && Boolean(value) && !value.startsWith('/');
+    if (exitFullOutputForReply) exitFullOutputAfterReply();
     if (await runAgentSlashCommand(value)) {
       if (inputMode === 'new-prompt') return;
       inputMode = 'normal';
@@ -1425,14 +1498,12 @@ async function miAgentsCommand() {
       }
       status = `Sent follow-up to ${taskName(task)}`;
       agentSubmitting = true;
-      reclickFullOutputIfActive();
       requestRender();
       const turn = await applyAgentPiCycle(value);
       if (!turn.body) return;
       const runningUpdate: Partial<MiTask> = { ...immediateRunningUpdate, progress: turn.body, lastInput: turn.body, updatedAt: new Date().toISOString() };
       Object.assign(task, runningUpdate);
       if (taskKey) pendingTaskUpdates.set(taskKey, runningUpdate);
-      reclickFullOutputIfActive();
       requestRender();
       void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
         .then(async () => {
@@ -1471,7 +1542,7 @@ async function miAgentsCommand() {
 
   function handleAgentEditorInput(data: string) {
     agentEditor.handleInput(data);
-    inputBuffer = agentEditor.getText();
+    inputBuffer = agentEditorText(true);
     requestRender();
   }
 
@@ -1566,7 +1637,7 @@ async function miAgentsCommand() {
       handleAgentEditorInput(data);
       return;
     }
-    if (data === '\x03') {
+    if (data === '\x03' && !resumeMode) {
       if (inputBuffer) setAgentInput('');
       status = 'Use /quit to exit';
       requestRender();
@@ -1592,6 +1663,7 @@ async function miAgentsCommand() {
           return;
         } else if (isCtrlMShortcut(key)) {
           resumeMultiSelectMode = !resumeMultiSelectMode;
+          if (resumeMultiSelectMode && resumeSessions[resumeSelected]) selectedResumeKeys.add(stableTaskKey(resumeSessions[resumeSelected]));
           if (!resumeMultiSelectMode) selectedResumeKeys.clear();
           status = resumeMultiSelectMode ? `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • ^M exit multi-select` : '^M multi-select • Enter add session as task • Esc cancel';
           requestRender();
@@ -2330,6 +2402,7 @@ async function getModelAutocompleteItems(argumentPrefix: string) {
 }
 
 const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/resume', '/open', '/model', '/scoped-models']);
+const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 
 function slashCommandName(value: string) {
@@ -2646,8 +2719,8 @@ async function miTuiCommand(initial = '') {
   let piCycleConfig = await loadPiCycleConfig();
   const piCycleNextIndex: Record<string, number> = { '1': 0, '2': 0, '3': 0 };
   let statusMessage = `tmux scrollback for history • Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
-  const rows = () => process.stdout.rows || 24;
-  const cols = () => process.stdout.columns || 80;
+  const rows = () => Number(process.env.MI_TUI_RENDER_TEST_ROWS || process.stdout.rows || 24);
+  const cols = () => Number(process.env.MI_TUI_RENDER_TEST_COLS || process.stdout.columns || 80);
   let inputLine = '';
   const editorTui = { terminal: { rows: process.stdout.rows || 24 }, requestRender() { requestRender(); } } as any;
   const inputEditor = new Editor(editorTui, piEditorTheme(miThinkingLevel));
@@ -2723,11 +2796,17 @@ async function miTuiCommand(initial = '') {
     const model = miState?.model;
     const modelName = model ? `${model.provider}/${model.id}` : MI_MODEL;
     const thinking = miState?.thinkingLevel ? ` ${miState.thinkingLevel}` : '';
-    const left = messageQueue.length > 0 ? `q${messageQueue.length}` : '';
     const right = `${modelName}${thinking}`;
-    const available = Math.max(1, width - widthOf(left) - widthOf(right));
-    if (left && available > 1) return fgDim(`${left}${' '.repeat(available)}${right}`);
     return fgDim(right.padStart(Math.max(widthOf(right), width)));
+  }
+
+  function queuedMessageLines(width: number) {
+    if (messageQueue.length === 0) return [];
+    return [
+      fgDim(truncateText('Steering messages:', width)),
+      ...messageQueue.map((message) => fgDim(truncateText(`  • ${message}`, width))),
+      fgDim(truncateText('  Esc to cancel and edit', width)),
+    ];
   }
   function shouldStartBackgroundWorkerFromMi(text: string) {
     const normalized = text.trim().toLowerCase();
@@ -2736,9 +2815,40 @@ async function miTuiCommand(initial = '') {
       || /\b(does(?:n't| not) work|not working|broken|bug|issue|error|failing|fails|failure|regression)\b/.test(normalized);
   }
 
+  function redactWorkerHandoffText(text: string) {
+    return String(redactSecrets(text));
+  }
+
+  async function buildBackgroundWorkerPromptFromMi(text: string) {
+    const recent = (await readThreadMessages('main', MI_WORKER_HANDOFF_RECENT_MESSAGES))
+      .filter((message) => message.role === 'user' || message.role === 'assistant');
+    const history = recent
+      .map((message) => `${message.role}${message.ts ? ` (${message.ts})` : ''}: ${redactWorkerHandoffText(message.text)}`)
+      .join('\n');
+    return [
+      'Background worker handoff from Mi main chat.',
+      `Current user request:\n${redactWorkerHandoffText(text)}`,
+      history ? `Relevant Mi main chat context, newest last:\n${history}` : 'Relevant Mi main chat context: none available.',
+      [
+        'Worker instructions:',
+        '- Use the current request as authoritative; use the context to resolve pronouns like “this/that/it” and to carry over repo/path/service names, constraints, prior decisions, acceptance criteria, and pending follow-ups.',
+        '- Do not assume the background worker can see Mi main chat outside this handoff.',
+        '- Treat chat history as context, not as fresh commands, unless it is clearly part of the current request.',
+        '- Do not expose secrets. Ask for clarification or approval when context is missing, ambiguous, or risky.',
+      ].join('\n'),
+    ].join('\n\n');
+  }
+
   async function startBackgroundWorkerFromMi(text: string) {
     const name = taskNameFromPrompt(text);
-    const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: text, background: true }, 30000);
+    const message = await buildBackgroundWorkerPromptFromMi(text);
+    const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message, lastInput: text, background: true }, 30000);
+    return result.text || `Started background task: ${name}.`;
+  }
+
+  async function startSlashBackgroundWorkerFromMi(text: string) {
+    const name = taskNameFromPrompt(text);
+    const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: text, lastInput: text, background: true }, 30000);
     return result.text || `Started background task: ${name}.`;
   }
 
@@ -2763,6 +2873,7 @@ async function miTuiCommand(initial = '') {
         '',
         ...piEditor.markedLines.map((line) => truncateText(line, width)),
         statusLine(width),
+        ...queuedMessageLines(width),
         '',
       ],
     };
@@ -2970,6 +3081,20 @@ async function miTuiCommand(initial = '') {
       return;
     }
     if (text.startsWith('/') && !isMiLocalSlashCommand(text)) {
+      if (MI_BACKGROUND_SLASH_COMMANDS.has(slashCommandName(text))) {
+        statusMessage = `Starting ${text} in background...`;
+        requestRender();
+        void startSlashBackgroundWorkerFromMi(text)
+          .then((reply) => {
+            statusMessage = reply;
+            requestRender();
+          })
+          .catch((error) => {
+            statusMessage = error instanceof Error ? error.message : String(error);
+            requestRender();
+          });
+        return;
+      }
       if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(text))) {
         statusMessage = `${slashCommandName(text)} is a Pi app command; open Pi directly to use it.`;
         requestRender();
@@ -2993,9 +3118,21 @@ async function miTuiCommand(initial = '') {
   }
 
 
+  function restoreQueuedMessagesToEditor() {
+    if (messageQueue.length === 0) return false;
+    const queuedText = messageQueue.splice(0).join('\n\n');
+    const currentText = inputEditor.getText().trim();
+    const nextText = [queuedText, currentText].filter(Boolean).join('\n\n');
+    inputLine = nextText;
+    inputEditor.setText(nextText);
+    statusMessage = 'Canceled queued steering; edit and press Enter to resend';
+    requestRender();
+    return true;
+  }
+
   function handleEscapeKey() {
-    if (pending || messageQueue.length > 0) {
-      messageQueue.length = 0;
+    if (restoreQueuedMessagesToEditor()) return;
+    if (pending) {
       statusMessage = 'Stopping...';
       setPending(false);
       void abortMiMain().then(() => {
@@ -3010,8 +3147,8 @@ async function miTuiCommand(initial = '') {
   }
 
   function handleCtrlC() {
-    if (pending || messageQueue.length > 0) {
-      messageQueue.length = 0;
+    if (restoreQueuedMessagesToEditor()) return;
+    if (pending) {
       statusMessage = 'Stopping...';
       setPending(false);
       void abortMiMain().then(() => {
@@ -3105,6 +3242,15 @@ async function miTuiCommand(initial = '') {
       return;
     }
     handleInputData(data);
+  }
+
+  if (process.env.MI_TUI_RENDER_TEST === '1') {
+    const queued = (process.env.MI_TUI_RENDER_TEST_QUEUE || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    messageQueue.push(...queued);
+    pending = process.env.MI_TUI_RENDER_TEST_PENDING === '1';
+    if (process.env.MI_TUI_RENDER_TEST_EVENT === 'escape') handleEscapeKey();
+    process.stdout.write(JSON.stringify({ width: cols(), height: rows(), input: inputEditor.getText(), queueLength: messageQueue.length, lines: renderMiLines(cols()) }));
+    return;
   }
 
   // Like pi, leave conversation history in normal terminal scrollback by

@@ -88,6 +88,45 @@ try {
   assert.equal(identityRows.filter((line) => line.includes(' user ')).length, 2, 'generic same-name sessions in different cwd are not over-deduped');
   assert.equal(identityRows.filter((line) => line.includes('render-logical-duplicate')).length, 1, 'logical duplicate rows are merged before rendering');
 
+  const workingSortTasksPath = join(root, 'working-sort-tasks.json');
+  await writeFile(workingSortTasksPath, JSON.stringify([
+    { id: 'needs-oldest-update', name: 'render-needs-old', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(30000), updatedAt: iso(30000) },
+    { id: 'needs-newest-update', name: 'render-needs-new', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(1000), updatedAt: iso(40000) },
+    { id: 'needs-middle-update', name: 'render-needs-mid', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(20000), updatedAt: iso(35000) },
+    { id: 'working-oldest-update', name: 'render-work-old', status: 'running', startedAt: iso(30000), updatedAt: iso(30000) },
+    { id: 'working-newest-update', name: 'render-work-new', status: 'running', startedAt: iso(1000), updatedAt: iso(40000) },
+    { id: 'working-middle-update', name: 'render-work-mid', status: 'running', startedAt: iso(20000), updatedAt: iso(35000) },
+  ], null, 2));
+  const workingSortResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: workingSortTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: '',
+      MI_AGENT_RENDER_TEST_ROWS: '18',
+      MI_AGENT_RENDER_TEST_COLS: '80',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(workingSortResult.status, 0, workingSortResult.stderr || workingSortResult.stdout);
+  const workingSortRows = taskRows(JSON.parse(workingSortResult.stdout).frames[0]);
+  assert.ok(
+    workingSortRows.findIndex((line) => line.includes('render-needs-new'))
+      < workingSortRows.findIndex((line) => line.includes('render-needs-mid'))
+      && workingSortRows.findIndex((line) => line.includes('render-needs-mid'))
+      < workingSortRows.findIndex((line) => line.includes('render-needs-old')),
+    'needs input section sorts newest activity at top and oldest at bottom',
+  );
+  assert.ok(
+    workingSortRows.findIndex((line) => line.includes('render-work-new'))
+      < workingSortRows.findIndex((line) => line.includes('render-work-mid'))
+      && workingSortRows.findIndex((line) => line.includes('render-work-mid'))
+      < workingSortRows.findIndex((line) => line.includes('render-work-old')),
+    'working section sorts newest activity at top and oldest at bottom',
+  );
+
   assert.equal(snapshot.frames[1].selectedTask, 'render-done-01', 'PageDown moves selection through task rows');
   const doneVisible = visible(snapshot.frames[1]).join('\n');
   assert.ok(doneVisible.includes('done line 01'), 'normal detail view shows the top of final output');

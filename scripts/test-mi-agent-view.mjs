@@ -107,9 +107,12 @@ assert.match(cli, /value === '\/resume' \|\| value\.startsWith\('\/resume '\)[\s
 assert.match(cli, /async function listResumeSessions\(\)[\s\S]*type: 'list_pi_sessions'/, 'resume picker lists pi sessions from the daemon');
 assert.match(cli, /function resumeSessionRequest\(session: MiTask\)[\s\S]*type: 'resume_session'/, 'resume picker builds a request to add a selected pi session as a task');
 assert.match(cli, /let resumeMultiSelectMode = false/, 'resume picker has multi-select mode');
+assert.match(cli, /async function openResumeMenu\(\)[\s\S]*resumeMultiSelectMode = true;[\s\S]*Enter add selected/, 'resume picker opens in multi-select mode by default');
+assert.match(cli, /if \(resumeSessions\[resumeSelected\]\) selectedResumeKeys\.add\(stableTaskKey\(resumeSessions\[resumeSelected\]\)\)/, 'resume picker ticks the current selection when multi-select opens');
 assert.match(cli, /function toggleSelectedResumeSession\(\)/, 'resume picker can toggle selected sessions');
 assert.match(cli, /async function addSelectedResumeSessions\(\)/, 'resume picker can add multiple selected sessions');
 assert.match(cli, /const keys = data\.match[\s\S]*resumeMultiSelectMode && key === ' '/, 'resume picker handles combined key chunks and space in multi-select mode');
+assert.match(cli, /if \(data === '\\x03' && !resumeMode\)/, 'Ctrl-C is handled by resume picker while /resume is open');
 assert.match(cli, /if \(resumeMultiSelectMode\) void addSelectedResumeSessions/, 'resume picker handles Enter in multi-select mode');
 assert.doesNotMatch(cli, /const task = replyTarget \|\| selectedTask\(\)[\s\S]*type: 'continue_worker'[\s\S]*useGoal: '0'/, 'agent view no longer approximates pi slash commands through worker RPC');
 assert.match(cli, /taskId = task\.id \|\| task\.sessionFile \|\| task\.sessionName \|\| task\.name/, 'agent view can reply to discovered session tasks by session file');
@@ -150,8 +153,8 @@ assert.match(cli, /function taskLastInput\(task: MiTask\)[\s\S]*task\.lastInput[
 assert.match(cli, /session: \$\{task\.sessionName \|\| ''\} \$\{task\.sessionFile \|\| ''\}[\s\S]*const prUrls = extractPrUrlsFromTask\(task\);[\s\S]*`PR: \$\{prUrls\.join\(' '\)\}`[\s\S]*const lastInput = taskLastInput\(task\);[\s\S]*renderPiUserMessage\(lastInput, width\)[\s\S]*isTaskNeedsInput\(task\)[\s\S]*readSessionActivitySteps\(task\.sessionFile, task, 12\)[\s\S]*renderPiAssistantMessage\(errorText, width\)/, 'task detail shows session/PR, last input, then Esc activity or needs-input error');
 assert.match(cli, /let fullLastOutputMode = false/, 'agent view tracks full last output mode');
 assert.match(cli, /const fullLastOutput = fullLastOutputMode && task[\s\S]*taskFinalOutput\(task, \{ full: true \}\) \|\| taskDisplayText\(task\) \|\| task\.progress \|\| 'No result yet\.'/, 'agent view expands available task output in full output mode');
-assert.match(cli, /function reclickFullOutputIfActive\(\)[\s\S]*fullLastOutputMode[\s\S]*process\.stdout\.write\('\\x1b\[2J\\x1b\[H'\)[\s\S]*requestRender\(true\)/, 'agent view re-clicks full output after replies so terminal scrollback lands on the refreshed full output');
-assert.match(cli, /status = `Sent follow-up to \$\{taskName\(task\)\}`;[\s\S]*agentSubmitting = true;[\s\S]*reclickFullOutputIfActive\(\)/, 'sending a reply while in full output mode automatically re-applies full output mode');
+assert.match(cli, /function exitFullOutputAfterReply\(\)[\s\S]*fullLastOutputMode = false[\s\S]*status = defaultAgentStatus[\s\S]*requestRender\(true\)/, 'agent view exits full output after replies so it returns to the normal task view');
+assert.match(cli, /const exitFullOutputForReply = inputMode === 'reply' && Boolean\(value\) && !value\.startsWith\('\/'\);[\s\S]*if \(exitFullOutputForReply\) exitFullOutputAfterReply\(\)/, 'submitting a normal reply while in full output mode immediately returns to normal view');
 assert.match(cli, /fullLastOutput && task[\s\S]*renderPiLastOutputMessage\(fullLastOutput \|\| 'No result yet\.', width\)[\s\S]*lines\.push\(\.\.\.outputLines\)[\s\S]*lines\.push\(\.\.\.footerLines\)/, 'full last output mode renders all output for terminal scrollback');
 assert.match(cli, /taskFinalOutput\(task, \{ full: true \}\)/, 'Ctrl-L full output mode reads the full session output instead of the tailed summary');
 assert.match(cli, /let fullLastOutputScroll = 0/, 'agent view tracks internal full-output scroll state');
@@ -200,9 +203,10 @@ assert.match(cli, /function taskTimeLabel\(task: MiTask\)[\s\S]*section === 'nee
 assert.match(cli, /function taskTimeLabel\(task: MiTask\)[\s\S]*Date\.parse\(task\.continuedAt \|\| task\.startedAt/, 'working tasks show time working');
 assert.match(cli, /function sectionTaskItems\(label: 'needs input' \| 'working' \| 'completed'\)/, 'mi agents builds sorted section task lists');
 assert.match(cli, /function taskStartedMs\(task: MiTask\)[\s\S]*Date\.parse\(task\.startedAt \|\| task\.continuedAt \|\| task\.updatedAt/, 'task ordering can use task start time');
-assert.match(cli, /\.sort\(\(a, b\) => taskStartedMs\(a\.task\) - taskStartedMs\(b\.task\) \|\| taskUpdatedMs\(a\.task\) - taskUpdatedMs\(b\.task\)\)/, 'sections sort oldest tasks to newest tasks');
+assert.match(cli, /label === 'completed'[\s\S]*taskSectionMovedMs\(b\.task\) - taskSectionMovedMs\(a\.task\)[\s\S]*taskStartedMs\(b\.task\) - taskStartedMs\(a\.task\)/, 'completed section sorts newest completions to oldest');
+assert.match(cli, /return taskStartedMs\(b\.task\) - taskStartedMs\(a\.task\) \|\| taskUpdatedMs\(b\.task\) - taskUpdatedMs\(a\.task\)/, 'active sections sort newest tasks to oldest tasks');
 assert.match(cli, /for \(const label of \['needs input', 'working', 'completed'\] as const\)/, 'mi agents splits tasks into needs input, working, and completed sections');
-assert.match(cli, /label === 'completed' && selectedSection !== 'completed'[\s\S]*sectionTasks\.slice\(0, 3\)/, 'mi agents initially shows only the first three completed tasks');
+assert.match(cli, /label === 'completed' && selectedSection !== 'completed'[\s\S]*sectionTasks\.slice\(0, 3\)/, 'mi agents initially shows only the newest three completed tasks');
 assert.match(cli, /`completed \(\$\{visibleSectionTasks\.length\} shown of \$\{sectionTasks\.length\}\)`/, 'mi agents indicates completed list count when capped');
 assert.match(cli, /function navigationTaskIndexes\(\)[\s\S]*sectionTaskItems\(label\)/, 'mi agents page navigation uses visible section order, not raw task indexes');
 assert.doesNotMatch(cli, /isPageUpKey\(data\)\) moveAgentListSelection\(-3\)|isPageDownKey\(data\)\) moveAgentListSelection\(3\)/, 'mi agents does not use PageUp/PageDown for task rows; pi Editor owns them');
@@ -236,7 +240,8 @@ assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, on
 assert.match(cli, /leave conversation history in normal terminal scrollback/, 'main Mi TUI documents why it avoids alternate screen');
 assert.match(cli, /if \(options\.alternateScreen\) process\.stdout\.write\('\\x1b\[\?1049l'\)/, 'alternate-screen mi agents restores the normal screen on cleanup');
 assert.match(cli, /function shouldStartBackgroundWorkerFromMi\(text: string\)[\s\S]*does\(\?:n't\| not\) work[\s\S]*broken[\s\S]*bug[\s\S]*issue/, 'main Mi detects actionable bug/work requests for background workers');
-assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string\)[\s\S]*type: 'run_worker'[\s\S]*background: true/, 'main Mi can start a background worker directly');
+assert.match(cli, /async function buildBackgroundWorkerPromptFromMi\(text: string\)[\s\S]*Background worker handoff from Mi main chat[\s\S]*Current user request:[\s\S]*Relevant Mi main chat context/, 'main Mi builds a self-contained worker handoff with recent chat context');
+assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string\)[\s\S]*const message = await buildBackgroundWorkerPromptFromMi\(text\)[\s\S]*type: 'run_worker'[\s\S]*message, lastInput: text[\s\S]*background: true/, 'main Mi starts background workers with handoff context while preserving the user request as task input');
 assert.match(cli, /shouldStartBackgroundWorkerFromMi\(text\)[\s\S]*await startBackgroundWorkerFromMi\(text\)[\s\S]*await sendToMiMain\(await buildMiTurnPrompt\(text\)\)/, 'main Mi routes actionable work to a background worker and chatty messages to Mi main');
 assert.match(cli, /async function buildMiTurnPrompt\(text: string\)/, 'main Mi TUI builds pi-chat-style turn prompts');
 assert.match(cli, /readThreadMessages\('main', 15\)/, 'main Mi TUI includes last 15 messages as context');
@@ -280,6 +285,7 @@ assert.match(daemon, /async function resumePiSessions\(\)/, 'daemon can restore 
 assert.doesNotMatch(daemon, /resumePiSessions\(\)[\s\S]*writeDismissedTaskKeys\(new Set\(\)\)/, 'resume does not clear all dismissed historical sessions');
 assert.match(daemon, /const activeSessions = sessions\.filter\(\(task\) => \["active", "running"\]\.includes\(String\(task\.status \|\| ""\)\.toLowerCase\(\)\)\)/, 'resume restores live active pi sessions');
 assert.match(daemon, /past dismissed sessions stay hidden/, 'resume reports that old dismissed sessions remain hidden');
+assert.match(daemon, /function dismissedPiSessionFiles\(dismissed\)[\s\S]*includeExpired: true/, 'resume picker can show dismissed pi-session tasks even after the recent-session window');
 assert.match(daemon, /if \(request\.type === "list_pi_sessions"\)/, 'daemon routes resume picker session listing');
 assert.match(daemon, /if \(request\.type === "resume_session"\)/, 'daemon routes adding one selected pi session');
 assert.match(daemon, /if \(request\.type === "resume_sessions"\)/, 'daemon still supports bulk active-session resume requests');
@@ -288,7 +294,7 @@ assert.match(daemon, /if \(openPiSession && \["running", "active", "queued", "th
 assert.match(daemon, /function inferOpenPiSessions[\s\S]*inferred\.set\(proc\.sessionFile, proc\)[\s\S]*openPiInput/, 'daemon keeps the open pi terminal path with inferred open sessions');
 assert.match(daemon, /async function queueMessageIntoOpenPiSession[\s\S]*appendFile\(input, `\\x1b\[200~\$\{body\}\\x1b\[201~\\r`\)/, 'daemon can paste a reply into the open pi TTY and press Enter so pi queues it normally');
 assert.match(daemon, /if \(task\.openPiSession\) \{[\s\S]*queueMessageIntoOpenPiSession\(task, workerInputMessage\(message, request\.useGoal\)\)[\s\S]*Queued message in open Pi session/, 'daemon replies to an open interactive pi session by queueing into that pi instead of opening a competing worker');
-assert.match(daemon, /status: "paused",[\s\S]*needsUser: true,[\s\S]*interactive pi session stopped before replying/, 'daemon marks naturally stopped busy interactive pi sessions as needs input');
+assert.match(daemon, /status: "paused",[\s\S]*needsUser: true,[\s\S]*needsUserReason: stoppedPiNeedsInputReason\(task\)/, 'daemon marks naturally stopped busy interactive pi sessions as needs input');
 assert.match(daemon, /if \(liveTrackedWorker\) \{[\s\S]*\.\.\.task,[\s\S]*sessionFile: task\.sessionFile \|\| activeSession\.sessionFile/, 'daemon preserves live tracked worker status over passive session scans');
 assert.match(daemon, /const staleBusySession = \["running", "active", "queued", "thinking", "thinkingqueued"\]\.includes\(activeStatus\)/, 'daemon detects stale busy pi sessions');
 assert.match(daemon, /const scannedPausedFromMissingInteractiveProcess = activeStatus === "paused"[\s\S]*preserveStoredWorking = storedWorking[\s\S]*scannedPausedFromMissingInteractiveProcess/, 'daemon does not let passive session scans pause a stored working background task');
@@ -308,7 +314,7 @@ assert.match(daemon, /function dedupePiSessionTasks\(tasks\)[\s\S]*sameLogicalTa
 assert.match(daemon, /return dedupePiSessionTasks\(merged\)/, 'daemon returns deduped pi session task rows');
 assert.match(daemon, /const task = await upsertTask\(session\)/, 'adding from resume picker persists the selected pi session as a task');
 assert.match(daemon, /function reconcileStoredTask\(task\)/, 'daemon reconciles stale running task state after restart');
-assert.match(daemon, /authoritative[\s\S]*finishTask\(\) writes complete[\s\S]*stop_task writes paused\/needsUser/, 'daemon only leaves working after final output, error, or Esc pause');
+assert.match(daemon, /authoritative[\s\S]*finishTask\(\) writes complete[\s\S]*stop_task writes[\s\S]*paused\/needsUser/, 'daemon only leaves working after final output, error, or Esc pause');
 assert.match(daemon, /return \{ \.\.\.task, status: task\.status \|\| "running", finishedAt: undefined \}/, 'daemon keeps working tasks running when worker bookkeeping is missing');
 assert.match(daemon, /const PI_SESSION_SCAN_CACHE_MS = Number\(process\.env\.MI_PI_SESSION_SCAN_CACHE_MS \|\| 5000\)/, 'daemon refreshes active pi session scan at mi agents polling cadence by default');
 assert.doesNotMatch(daemon, /const RECENT_PI_SESSION_ACTIVE_MS = Number\(process\.env\.MI_RECENT_PI_SESSION_ACTIVE_MS \|\| 2 \* 60_000\)/, 'daemon no longer drops pi-session tasks after a recent-session window');
@@ -331,13 +337,13 @@ assert.match(daemon, /async function findOpenDuplicateWorkerIssue[\s\S]*sameLogi
 assert.match(daemon, /const startingWorkerKeys = new Set\(\)/, 'daemon reserves in-flight worker starts');
 assert.match(daemon, /startingWorkerKeys\.has\(startKey\)[\s\S]*Not starting duplicate task[\s\S]*startingWorkerKeys\.add\(startKey\)/, 'daemon suppresses concurrent duplicate starts before both can upsert');
 assert.match(daemon, /task\?\.needsUser[\s\S]*\["running", "waiting", "active", "queued", "thinking", "thinkingqueued", "paused", "error"\]/, 'daemon treats needs-user/running/error tasks as open issues');
-assert.match(daemon, /function existingOpenIssueMessage[\s\S]*needs \$\{miUserName\(\)\}[\s\S]*Existing task is \$\{status\}\$\{reason\}/, 'duplicate suppression explains when an existing task is waiting for input');
+assert.match(daemon, /function existingOpenIssueMessage[\s\S]*needs input: \$\{task\.needsUserReason \|\| "attention"\}[\s\S]*Existing task is \$\{status\}\$\{reason\}/, 'duplicate suppression explains when an existing task is waiting for input');
 assert.match(daemon, /\["complete", "completed", "done", "error", "stopped", "paused", "inactive"\]\.includes\(taskStatus\)/, 'daemon treats paused tasks as terminal when merging stale busy sessions');
 assert.match(daemon, /function workerKeys\(task, fallbackName\)[\s\S]*task\.sessionId[\s\S]*task\.sessionFile[\s\S]*sessionFingerprint\(task\)/, 'daemon tracks active workers by task and session identity');
 assert.match(daemon, /const sessions = await listPiSessionTasks\(\)[\s\S]*const task = \[\.\.\.tasks, \.\.\.sessions\]\.find[\s\S]*const activeWorker = task \? workerKeys\(task, name\)\.map[\s\S]*activeWorker\.expectedStop = true;[\s\S]*activeWorker\.proc\.kill\(\)/, 'daemon marks stop_task worker exits as expected before SIGTERM and can stop discovered pi sessions');
 assert.match(daemon, /if \(worker\.expectedStop\)[\s\S]*worker_expected_stop[\s\S]*return/, 'daemon does not overwrite paused stopped tasks with SIGTERM errors');
 assert.match(daemon, /\}\)\(\)\.catch\(async \(error\) => \{[\s\S]*if \(worker\.expectedStop\)[\s\S]*return;[\s\S]*status: "error"/, 'daemon ignores expected SIGTERM during background continue startup');
-assert.match(daemon, /status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined[\s\S]*stopped by Escape; needs \$\{miUserName\(\)\} input/, 'daemon stop_task parks stopped workers in needs input');
+assert.match(daemon, /status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined[\s\S]*stopped by Escape; needs input/, 'daemon stop_task parks stopped workers in needs input');
 assert.match(daemon, /explicitSessionFiles\.has\(entry\.file\)/, 'daemon always includes explicitly open pi session files in the scan');
 assert.doesNotMatch(daemon, /const closeStartWindowMs|entry\.delta <= closeStartWindowMs|activeTaskIds/, 'daemon does not keep stale sessions stuck working through fuzzy process matching or status overrides');
 assert.match(daemon, /environ\.includes\("MI_WORKER=1"\)/, 'daemon excludes Mi-owned headless workers from open session list');
@@ -345,8 +351,9 @@ assert.match(daemon, /procStats\.ppid === process\.pid/, 'daemon excludes Mi-own
 assert.match(daemon, /!input\.startsWith\("\/dev\/pts\/"\)/, 'daemon ignores headless Mi-owned pi processes when marking external sessions active');
 assert.match(daemon, /status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt:/, 'daemon clears stale needs-input and completion fields when replying to a task');
 assert.match(daemon, /entry\.id === task\.id \|\| sameLogicalTask\(entry, task\)/, 'daemon upserts logical task matches instead of creating duplicates when ids change');
-assert.match(daemon, /lastInput: message/, 'daemon persists the original Mi-sent message/reply as task last input');
-assert.match(daemon, /const updated = await upsertTask\(\{ \.\.\.task, status: "running", needsUser: false, needsUserReason: undefined[\s\S]*lastInput: message \}\);[\s\S]*if \(request\.background\)/, 'daemon clears stale needs-input state and persists background replies before slow pi startup/prompt work');
+assert.match(daemon, /function taskInputFromRequest\(request, fallback\)[\s\S]*request\.lastInput[\s\S]*request\.displayMessage[\s\S]*request\.originalMessage/, 'daemon can separate full worker handoff prompts from concise task input');
+assert.match(daemon, /lastInput: taskInput/, 'daemon persists the original Mi-sent message/reply as task last input when provided');
+assert.match(daemon, /const updated = await upsertTask\(\{ \.\.\.task, status: "running", needsUser: false, needsUserReason: undefined[\s\S]*lastInput: taskInput \}\);[\s\S]*if \(request\.background\)/, 'daemon clears stale needs-input state and persists background replies before slow pi startup/prompt work');
 assert.match(daemon, /return \{ text: `Sent follow-up to background task/, 'daemon returns immediately after queueing a background reply');
 assert.match(daemon, /if \(request\.type === "continue_worker"\)/, 'daemon can reply to workers');
 assert.match(daemon, /function isSlashCommand\(message\)/, 'daemon detects pi slash commands for workers');
@@ -380,4 +387,3 @@ assert(waitAgentEnd, 'daemon defines timeout-free waitAgentEnd');
 assert(!/setTimeout|timeoutMs|300000|Timed out waiting for worker/.test(waitAgentEnd), 'worker wait has no arbitrary timeout');
 
 console.log('Mi agent view checks passed.');
-
