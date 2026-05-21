@@ -8,6 +8,26 @@ Mi is a small local assistant interface built around three surfaces only:
 
 Everything else in this repo exists to support those surfaces.
 
+## Install from Git
+
+Requires Node.js and npm. Install Mi directly from the GitHub repo:
+
+```bash
+npm install -g git+https://github.com/kyleboas/mi.git
+```
+
+Then run:
+
+```bash
+mi
+```
+
+To update, reinstall from the same Git URL:
+
+```bash
+npm install -g git+https://github.com/kyleboas/mi.git
+```
+
 ## `mi`
 
 `mi` opens the main Mi conversation in pi. The durable Mi thread is stored locally in `state/threads/main.jsonl`, so background jobs can append messages while no terminal is open and the next `mi` run can show them through the pi extension.
