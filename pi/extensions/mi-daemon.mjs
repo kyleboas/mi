@@ -314,9 +314,9 @@ async function readSessionSample(file, stats) {
   }
 }
 
-async function readPiSessionTask(file, stats) {
+async function readPiSessionTask(file, stats, options = {}) {
   if (file.startsWith(SESSION_DIR) || file.includes("/sessions/mi-main/")) return undefined;
-  if (Date.now() - stats.mtimeMs > ACTIVE_SESSION_WINDOW_MS) return undefined;
+  if (!options.includeExpired && Date.now() - stats.mtimeMs > ACTIVE_SESSION_WINDOW_MS) return undefined;
   let sessionId = "";
   let cwd = HOME;
   let startedAt = "";
@@ -498,6 +498,12 @@ function normalizedLastInput(task) {
 
 function logicalTaskStartKey({ name, cwd, message }) {
   return [String(cwd || ""), normalizedNameText(name), normalizeLastInputText(message).toLowerCase().slice(0, 500)].join("\u001f");
+}
+
+function taskInputFromRequest(request, fallback) {
+  const value = request.lastInput ?? request.displayMessage ?? request.originalMessage;
+  const text = String(value || "").trim();
+  return text || fallback;
 }
 
 function sameLogicalTask(a, b) {
@@ -703,9 +709,35 @@ async function dismissTask(request) {
   return { text: `Removed ${match?.sessionName || match?.name || requested[0]} from task list` };
 }
 
+function dismissedPiSessionFiles(dismissed) {
+  const files = [];
+  for (const key of dismissed) {
+    const file = String(key || "");
+    if (!file.endsWith(".jsonl")) continue;
+    if (!file.startsWith(PI_SESSIONS_DIR)) continue;
+    if (file.startsWith(SESSION_DIR) || file.includes("/sessions/mi-main/")) continue;
+    files.push(file);
+  }
+  return [...new Set(files)];
+}
+
 async function listPiSessionsForResume() {
   piSessionTaskCache = { at: 0, tasks: [] };
-  return (await listPiSessionTasks()).filter((task) => !isExcludedPiSessionTask(task));
+  const sessions = (await listPiSessionTasks()).filter((task) => !isExcludedPiSessionTask(task));
+  const sessionFiles = new Set(sessions.map((task) => task.sessionFile).filter(Boolean));
+  const dismissed = await readDismissedTaskKeys();
+  for (const file of dismissedPiSessionFiles(dismissed)) {
+    if (sessionFiles.has(file)) continue;
+    try {
+      const stats = await stat(file);
+      const task = await readPiSessionTask(file, stats, { includeExpired: true });
+      if (task && !isExcludedPiSessionTask(task)) {
+        sessions.push(task);
+        sessionFiles.add(file);
+      }
+    } catch {}
+  }
+  return dedupePiSessionTasks(sessions);
 }
 
 async function resumePiSession(request) {
@@ -1171,11 +1203,12 @@ async function findOpenDuplicateWorkerIssue({ name, cwd, message }) {
 async function runWorker(request) {
   const message = String(request.message || "").trim();
   if (!message) throw new Error("Message is empty");
+  const taskInput = taskInputFromRequest(request, message);
   const name = String(request.name || `Mi worker ${new Date().toISOString()}`).trim();
   const cwd = String(request.cwd || HOME).trim();
   const model = String(request.model || MI_MODEL).trim();
   const sessionDir = request.sessionDir ? String(request.sessionDir).trim() : undefined;
-  const startKey = logicalTaskStartKey({ name, cwd, message });
+  const startKey = logicalTaskStartKey({ name, cwd, message: taskInput });
   if (startingWorkerKeys.has(startKey)) {
     await log(`duplicate_worker_start_suppressed ${name}`);
     return { text: `Not starting duplicate task: ${name}. Existing task is already starting.`, sessionName: name };
@@ -1184,7 +1217,7 @@ async function runWorker(request) {
   let worker;
   let task;
   try {
-    const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message });
+    const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message: taskInput });
     if (duplicate) {
       const text = existingOpenIssueMessage(duplicate, name);
       await log(`duplicate_worker_suppressed ${name} existing=${duplicate.id || duplicate.sessionName || duplicate.sessionFile || "unknown"}`);
@@ -1203,7 +1236,7 @@ async function runWorker(request) {
         startedAt: new Date().toISOString(),
         sessionName: name,
         model,
-        lastInput: message,
+        lastInput: taskInput,
       })
       : undefined;
     if (task) trackActiveWorker(task, name, worker);
@@ -1223,7 +1256,7 @@ async function runWorker(request) {
       sessionId: before.sessionId,
       sessionName: before.sessionName || name,
       model: before.model,
-      lastInput: message,
+      lastInput: taskInput,
     });
     installTaskHeartbeat(worker, task);
     const done = worker.waitAgentEnd();
@@ -1279,6 +1312,7 @@ async function continueWorker(request) {
   const message = String(request.message || "").trim();
   if (!taskId) throw new Error("taskId required");
   if (!message) throw new Error("Message is empty");
+  const taskInput = taskInputFromRequest(request, message);
   const tasks = await listAllTasks();
   let task = tasks.find((entry) => entry.id === taskId || entry.name === taskId || entry.sessionName === taskId || entry.sessionFile === taskId || entry.actualSessionFile === taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
@@ -1286,18 +1320,18 @@ async function continueWorker(request) {
   const name = task.sessionName || task.name || task.id;
   const activeWorker = workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
-    await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
+    await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
     void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
       .catch((error) => {
         if (activeWorker.expectedStop) return log(`worker_expected_stop ${name}`);
-        return upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message });
+        return upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: taskInput });
       });
     return { text: `Queued message for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
   }
   if (task.openPiSession) {
     const queued = await queueMessageIntoOpenPiSession(task, workerInputMessage(message, request.useGoal));
     if (queued) {
-      await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "message queued in open pi", lastInput: message });
+      await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "message queued in open pi", lastInput: taskInput });
       return { text: `Queued message in open Pi session: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
     }
   }
@@ -1306,7 +1340,7 @@ async function continueWorker(request) {
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
   const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
-  const updated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: message });
+  const updated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
   if (request.background) {
     trackActiveWorker(updated, name, worker);
     void (async () => {
@@ -1320,7 +1354,7 @@ async function continueWorker(request) {
         await log(`worker_expected_stop ${name}`);
         return;
       }
-      await upsertTask({ ...updated, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: message });
+      await upsertTask({ ...updated, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: taskInput });
       untrackActiveWorker(updated, name);
       worker.proc.kill();
     });

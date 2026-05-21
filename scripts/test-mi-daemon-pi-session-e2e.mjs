@@ -107,7 +107,7 @@ try {
     return task && String(task.status).toLowerCase() === 'paused' ? task : undefined;
   }, 'stopped typed pi session to move to needs input');
   assert.equal(paused.needsUser, true);
-  assert.equal(paused.needsUserReason, 'interactive pi session stopped before replying');
+  assert.match(paused.needsUserReason, /Pi session is no longer running and no final assistant response was recorded/);
   assert.equal(paused.finishedAt, undefined);
 
   console.log('mi daemon pi-session e2e passed');
