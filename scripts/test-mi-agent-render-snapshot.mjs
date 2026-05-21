@@ -152,6 +152,47 @@ try {
   const withInput = visible(fullSnapshot.frames[4]).join('\n');
   assert.ok(withInput.includes('reply text'), 'input remains visible and usable in full output mode');
 
+  const longActivitySessionPath = join(root, 'long-activity-session.jsonl');
+  await writeFile(longActivitySessionPath, `${JSON.stringify({
+    type: 'message',
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'toolCall',
+        name: 'bash',
+        arguments: {
+          command: "python - <<'PY'\nprint('this is a long activity command that used to leak a newline into one rendered TUI row and push following rows down')\nPY",
+        },
+      }],
+    },
+  })}\n`);
+  const longActivityTasksPath = join(root, 'long-activity-tasks.json');
+  await writeFile(longActivityTasksPath, JSON.stringify([
+    { id: 'long-activity-1', name: 'render-long-activity', status: 'running', sessionFile: longActivitySessionPath, progress: 'working', updatedAt: iso(12500) },
+  ], null, 2));
+  const longActivityResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: longActivityTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: '',
+      MI_AGENT_RENDER_TEST_ROWS: '12',
+      MI_AGENT_RENDER_TEST_COLS: '60',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(longActivityResult.status, 0, longActivityResult.stderr || longActivityResult.stdout);
+  const longActivityFrame = JSON.parse(longActivityResult.stdout).frames[0];
+  assert.ok(visible(longActivityFrame).some((line) => line.includes('running: python')), 'fixture renders the long activity line');
+  const physicalLongActivityRows = visible(longActivityFrame).flatMap((line) => line.split(/\r?\n/));
+  assert.equal(
+    physicalLongActivityRows.length,
+    longActivityFrame.lines.length,
+    'rendered mi agents lines must not contain embedded newlines because they shift following terminal rows',
+  );
+
   const pasteTasksPath = join(root, 'paste-tasks.json');
   await writeFile(pasteTasksPath, JSON.stringify([
     { id: 'paste-1', name: 'render-paste-target', status: 'paused', needsUser: true, needsUserReason: 'needs reply', progress: 'waiting', updatedAt: iso(13000) },

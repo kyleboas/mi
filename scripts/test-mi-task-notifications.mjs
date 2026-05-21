@@ -17,31 +17,25 @@ function assertIncludes(needle, message) {
   if (!source.includes(needle)) throw new Error(message);
 }
 
-function assertMatches(regex, message) {
-  if (!regex.test(source)) throw new Error(message);
+function assertNotMatches(regex, message) {
+  if (regex.test(source)) throw new Error(message);
 }
 
-assertIncludes('async function deliverTaskMessage(title, text)', 'Mi daemon must have a task delivery path.');
-assertMatches(/async function deliverTaskMessage[\s\S]*appendMainThreadMessage\(text\)[\s\S]*sendPushover\(title, text\)/, 'Task delivery must append to the main Mi thread and attempt push notification.');
-assertMatches(/unread: true[\s\S]*source: "mi-task"/, 'Task messages must be unread Mi task messages in the main thread.');
-if (/appendMainThreadMessage\(`\$\{kind\}: \$\{name\}/.test(source) || /deliverTaskMessage\(`Mi task complete:/.test(source)) {
-  throw new Error('Background task completions must stay in task state/resume, not be posted into the main Mi thread.');
-}
-assertMatches(/done\.then\([\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task errors must be surfaced to the user immediately after being recorded.');
-assertMatches(/continueWorker[\s\S]*catch\(async \(error\)[\s\S]*status: "error"[\s\S]*deliverTaskMessage\(`Mi task failed:/, 'Background task follow-up errors must be surfaced to the user immediately after being recorded.');
-assertIncludes('safeNotificationText', 'Task notifications must sanitize obvious secrets before push delivery.');
-assertCliIncludes("const payload = { type: 'run_worker', name, cwd, message, background: true };", 'New Mi task workers must use the raw task name as the session name so /resume shows only <task>.');
+assertNotMatches(/appendMainThreadMessage\(`Task (started|updated|paused|needs)/, 'Background task status changes must not be posted into the main Mi thread.');
+assertNotMatches(/appendMainThreadMessage\(`\$\{kind\} failed:/, 'Background task failures must stay in task state/resume, not main Mi thread.');
+assertNotMatches(/mi-task-status/, 'Background task status messages must not use main-thread task status notifications.');
+assertIncludes('notifiedNeedsUserAt', 'Task state should still record needs-user transitions without posting messages.');
+assertIncludes('notifiedPausedAt', 'Task state should still record paused transitions without posting messages.');
+assertCliIncludes("sendTaskSocketRequest({ type: 'run_worker', name, cwd, message, background: true }", 'New Mi task workers must use the raw task name as the session name so /resume shows only <task>.');
 assertCliNotIncludes("name: `Mi task: ${name}`", 'New Mi task workers must not prefix session names with "Mi task:".');
-assertMatches(/entry\.name === `Mi task: \$\{taskId\}`/, 'Existing prefixed Mi task records must remain addressable by unprefixed task id/name.');
+assertNotMatches(/deliverTaskMessage\(`Mi task complete:/, 'Background task completions must stay in task state/resume, not be posted into the main Mi thread.');
 assertIncludes('const activeWorkers = new Map();', 'Mi daemon must track active task workers so follow-ups can queue into the running session.');
-assertMatches(/activeWorker[\s\S]*streamingBehavior: "steer"[\s\S]*Queued message for background task/, 'Mi task replies to running workers must use pi normal queued-message behavior (Enter while streaming = steer) instead of opening a competing session.');
+if (!/activeWorker[\s\S]*streamingBehavior: isSlashCommand\(message\) \? undefined : "steer"[\s\S]*Queued message for background task/.test(source)) {
+  throw new Error('Mi task replies to running workers must use pi normal queued-message behavior (Enter while streaming = steer) instead of opening a competing session.');
+}
 assertIncludes('function trackActiveWorker(task, fallbackName, worker)', 'Mi daemon must track both newly-started and continued background workers while they are active.');
 if (!/if \(cron\.message && !cron\.command\) \{[\s\S]*appendThreadMessage\('main', 'assistant', cron\.message, \{ unread: true, source: 'mi-reminder' \}\)[\s\S]*notify\('Mi reminder', cron\.message\)\.catch\(\(\) => \(\{ skipped: true \}\)\)[\s\S]*status: 'ok'/.test(cronSource)) {
   throw new Error('Reminder-only crons must append an unread assistant message to the main Mi thread and still attempt external notification without failing the cron when notify fails.');
-}
-
-if (!/function isActiveTask[\s\S]*task\.finishedAt[\s\S]*complete[\s\S]*completed[\s\S]*done[\s\S]*error[\s\S]*\['running', 'waiting', 'active'\]\.includes\(status\)/.test(cliSource)) {
-  throw new Error('Mi TUI status-bar task list must exclude completed/terminal tasks and only show active tasks.');
 }
 
 console.log('Mi task notification behavior checks passed.');

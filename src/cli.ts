@@ -4,7 +4,7 @@ import { AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTh
 import { AuthStorage, createAgentSessionFromServices, createAgentSessionServices, ModelRegistry, ModelSelectorComponent, SessionManager, SettingsManager } from '@mariozechner/pi-coding-agent';
 import { CombinedAutocompleteProvider, CURSOR_MARKER, Editor, matchesKey, ProcessTerminal, TUI, type Component, type Focusable, type SlashCommand } from '@mariozechner/pi-tui';
 import { fuzzyFilter, truncateToWidth, visibleWidth } from '@mariozechner/pi-tui';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { createInterface } from 'node:readline/promises';
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
@@ -31,14 +31,16 @@ import {
 
 initTheme(process.env.PI_THEME, false);
 
-const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 5000);
+const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 10000);
+const MI_AGENT_CLOCK_MS = Number(process.env.MI_AGENT_CLOCK_MS || 1000);
 const PI_LOADER_INTERVAL_MS = 80;
 const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
 // Match pi's loader animation cadence. Flicker is handled by pi-tui's
 // differential renderer rather than by slowing Mi's animation down.
-const MI_AGENT_ANIMATION_MS = Number(process.env.MI_AGENT_ANIMATION_MS || PI_LOADER_INTERVAL_MS);
+const MI_AGENT_ANIMATION_MS = Number(process.env.MI_AGENT_ANIMATION_MS || 250);
 const MI_WORKING_RENDER_MS = Number(process.env.MI_WORKING_RENDER_MS || PI_LOADER_INTERVAL_MS);
 const MI_SESSION_TAIL_BYTES = Number(process.env.MI_SESSION_TAIL_BYTES || 256 * 1024);
+const MI_SESSION_ACTIVITY_REFRESH_MS = Number(process.env.MI_SESSION_ACTIVITY_REFRESH_MS || 1000);
 let resolveModelScopeModule: Promise<any> | undefined;
 let scopedModelsSelectorModule: Promise<any> | undefined;
 
@@ -71,8 +73,6 @@ Usage:
   mi threads                      List Mi conversations
   mi temp <title>                 Create/open a temporary conversation
   mi compact [thread]             Compact old read messages in a thread
-  mi detect [approve|reject|skip|needs-more-evidence]  Review detect candidates one by one
-  mi detect-approval [next|approve <id>|reject <id>]  Review pending detect trends
   mi agents                       Open mi agents live background agent view
   mi task <name> [--cwd <path>] -- <task prompt>
   mi task reply <task-id-or-name> -- <follow-up prompt>
@@ -229,400 +229,6 @@ async function tempCommand(args: string[]) {
   await chatCommand(thread.id);
 }
 
-type DetectApprovalItem = {
-  id: number;
-  trend: string;
-  score: number;
-  sources: number;
-  detected_at?: string;
-  route_reason?: string;
-  verification?: unknown;
-};
-
-type DetectReviewPayload = {
-  candidate: Record<string, unknown>;
-  sources: Array<Record<string, unknown>>;
-  patterns: Array<Record<string, unknown>>;
-};
-
-type DetectReviewState = {
-  currentId?: number;
-  queue?: DetectReviewPayload[];
-  updatedAt?: string;
-};
-
-const DETECT_PIPELINE_CWD = process.env.DETECT_PIPELINE_CWD
-  || join(homedir(), 'mi-detect-pipeline');
-const DETECT_REVIEW_STATE_PATH = join(homedir(), 'mi', 'state', 'detect-review.json');
-
-const DETECT_TASK_INSTRUCTION = `The user sent /detect. Treat this as a repeatable Mi task, not as a Pi app command and not as literal chat. Review existing detect candidates one by one. Do not run the full detect pipeline. Fetch pending candidates ordered by score, present only the top one in the requested format, then stop for Approve or Reject. Use safe secret handling and the configured detect pipeline directory. The output format must be:
-
-Sure. Starting with the top scored one:
-
-#<id> — Score <score>
-<trend/question>
-
-Why it scored high:
-<brief explanation>
-
-Core angle:
-<central tactical framing>
-
-Likely report structure:
-1. <section>
-2. <section>
-3. <section>
-4. <section>
-5. <section>
-
-My take:
-<recommendation>
-
-Approve or Reject`;
-
-function runDetectApprovalPython(code: string, args: string[] = []) {
-  const local = spawnSync('python3', ['-c', code, ...args], { cwd: DETECT_PIPELINE_CWD, encoding: 'utf8' });
-  if (local.status === 0) return local.stdout || '';
-
-  const localError = `${local.stderr || ''}\n${local.stdout || ''}`;
-  const shouldFallbackToRailway = /missing[_ ]database|database connection|DATABASE_URL|postgres/i.test(localError);
-  if (!shouldFallbackToRailway) throw new Error((local.stderr || local.stdout || 'detect approval command failed').slice(-1000));
-
-  const railway = spawnSync('railway', [
-    'run',
-    '--service',
-    process.env.DETECT_RAILWAY_SERVICE || 'postgres',
-    'bash',
-    '-lc',
-    'unset DATABASE_URL DATABASE_PRIVATE_URL DATABASE_PUBLIC_URL; exec python3 -c "$0" "$@"',
-    code,
-    ...args,
-  ], { cwd: DETECT_PIPELINE_CWD, encoding: 'utf8' });
-  if (railway.status !== 0) throw new Error((railway.stderr || railway.stdout || 'detect approval command failed').slice(-1000));
-  return railway.stdout || '';
-}
-
-function formatDetectApprovalItem(item: DetectApprovalItem) {
-  return [
-    `Detect trend #${item.id}: ${item.trend}`,
-    `Score: ${item.score} | sources: ${item.sources}${item.detected_at ? ` | detected: ${item.detected_at}` : ''}`,
-    item.route_reason ? `Route reason: ${item.route_reason}` : '',
-    `Decide: mi detect-approval approve ${item.id}  OR  mi detect-approval reject ${item.id}`,
-  ].filter(Boolean).join('\n');
-}
-
-async function loadDetectReviewState(): Promise<DetectReviewState | undefined> {
-  try {
-    return JSON.parse(await readFile(DETECT_REVIEW_STATE_PATH, 'utf8')) as DetectReviewState;
-  } catch {
-    return undefined;
-  }
-}
-
-async function saveDetectReviewState(state: DetectReviewState) {
-  await mkdir(dirname(DETECT_REVIEW_STATE_PATH), { recursive: true });
-  await writeFile(DETECT_REVIEW_STATE_PATH, JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2));
-}
-
-async function clearDetectReviewState() {
-  await rm(DETECT_REVIEW_STATE_PATH, { force: true }).catch(() => undefined);
-}
-
-function fetchDetectReviewCandidates(excludeIds: number[] = []): DetectReviewPayload[] {
-  const py = String.raw`
-import json
-import sys
-import psycopg
-from psycopg.rows import dict_row
-from db_conn import resolve_database_conninfo
-exclude_ids = {int(v) for v in sys.argv[1:] if v}
-conninfo, reason = resolve_database_conninfo()
-if not conninfo:
-    raise SystemExit(f"missing database connection: {reason}")
-with psycopg.connect(conninfo) as conn, conn.cursor(row_factory=dict_row) as cur:
-    cur.execute("""
-        SELECT *
-        FROM trend_candidates
-        WHERE status = 'pending' AND COALESCE(report_decision, 'pending') = 'pending'
-        ORDER BY COALESCE(final_score, score, 0) DESC, detected_at DESC NULLS LAST, id DESC
-        LIMIT 50
-    """)
-    candidates = [row for row in (cur.fetchall() or []) if int(row.get('id') or 0) not in exclude_ids][:25]
-    results = []
-    has_patterns = False
-    try:
-        cur.execute("SELECT to_regclass('trend_candidate_patterns') AS table_name")
-        has_patterns = bool(cur.fetchone().get('table_name'))
-    except Exception:
-        has_patterns = False
-    for candidate in candidates:
-        cid = candidate['id']
-        sources = []
-        try:
-            cur.execute("""
-                SELECT s.id, s.title, s.url, s.source_type, s.publish_date, s.created_at, s.metadata
-                FROM trend_candidate_sources tcs
-                JOIN sources s ON s.id = tcs.source_id
-                WHERE tcs.trend_candidate_id = %s
-                ORDER BY s.publish_date DESC NULLS LAST, s.id DESC
-                LIMIT 8
-            """, (cid,))
-            sources = cur.fetchall() or []
-        except Exception:
-            sources = []
-        patterns = []
-        if has_patterns:
-            try:
-                cur.execute("SELECT * FROM trend_candidate_patterns WHERE trend_candidate_id = %s LIMIT 8", (cid,))
-                patterns = cur.fetchall() or []
-            except Exception:
-                patterns = []
-        results.append({'candidate': candidate, 'sources': sources, 'patterns': patterns})
-print(json.dumps(results, default=str, ensure_ascii=False))
-`;
-  return JSON.parse(runDetectApprovalPython(py, excludeIds.map(String))) as DetectReviewPayload[];
-}
-
-function fetchTopDetectReviewCandidate(excludeId?: number): DetectReviewPayload | undefined {
-  return fetchDetectReviewCandidates(excludeId ? [excludeId] : [])[0];
-}
-
-function decideDetectReviewCandidate(candidateId: number, decision: 'approved' | 'rejected' | 'needs_more_evidence', note = '') {
-  const py = String.raw`
-import json, sys
-import psycopg
-from db_conn import resolve_database_conninfo
-candidate_id = int(sys.argv[1])
-decision = sys.argv[2]
-note = sys.argv[3] if len(sys.argv) > 3 else ''
-feedback_value = {'approved': 5, 'rejected': -5, 'needs_more_evidence': -1}.get(decision, 0)
-conninfo, reason = resolve_database_conninfo()
-if not conninfo:
-    raise SystemExit(f"missing database connection: {reason}")
-with psycopg.connect(conninfo) as conn, conn.cursor() as cur:
-    cur.execute("""
-        UPDATE trend_candidates
-        SET report_decision = %s, report_decided_at = NOW(), report_decision_source = 'mi_conversation_review'
-        WHERE id = %s AND status = 'pending' AND COALESCE(report_decision, 'pending') = 'pending'
-        RETURNING id, trend, COALESCE(final_score, score, 0), COALESCE(source_diversity, 0), report_decision
-    """, (decision, candidate_id))
-    row = cur.fetchone()
-    if not row:
-        raise SystemExit("candidate not found or already decided")
-    feedback_note = f"mi_conversation_review:{decision}"
-    if note:
-        feedback_note = f"{feedback_note}:{note}"
-    if feedback_value:
-        cur.execute("""
-            INSERT INTO trend_feedback (trend_candidate_id, trend_text, feedback_value, note)
-            VALUES (%s, %s, %s, %s)
-        """, (row[0], row[1], feedback_value, feedback_note))
-    conn.commit()
-print(json.dumps({"id": row[0], "trend": row[1], "score": int(row[2] or 0), "sources": int(row[3] or 0), "decision": row[4], "note": note}))
-`;
-  return JSON.parse(runDetectApprovalPython(py, [String(candidateId), decision, note])) as { id: number; trend: string; score: number; sources: number; decision: string; note?: string };
-}
-
-function sentenceCase(text: string) {
-  const trimmed = text.trim();
-  return trimmed ? `${trimmed[0]?.toUpperCase()}${trimmed.slice(1)}` : trimmed;
-}
-
-function firstClauseFromQuestion(trend: string) {
-  const stripped = trend.replace(/\?+$/, '').trim();
-  const focus = stripped
-    .replace(/^How\s+should\s+/i, '')
-    .replace(/^How\s+do\s+/i, '')
-    .replace(/^How\s+can\s+/i, '')
-    .replace(/^How\s+would\s+/i, '')
-    .replace(/^Can\s+/i, '');
-  return focus ? `${focus[0]?.toLowerCase()}${focus.slice(1)}` : stripped;
-}
-
-function formatDetectReviewCandidate(payload: DetectReviewPayload) {
-  const candidate = payload.candidate;
-  const id = Number(candidate.id);
-  const trend = String(candidate.trend || candidate.question || '').trim();
-  const score = Number(candidate.final_score ?? candidate.score ?? 0);
-  const sources = Number(candidate.source_diversity ?? payload.sources.length ?? 0);
-  const routeReason = typeof candidate.detect_route_reason === 'string' ? candidate.detect_route_reason.trim() : '';
-  const focus = firstClauseFromQuestion(trend) || 'this tactical problem';
-  const questionFrame = /^can\b/i.test(trend) ? `whether ${focus}` : /^how\b/i.test(trend) ? `how ${focus}` : `whether ${focus}`;
-  const evidenceNote = sources > 1 ? ` It also has source diversity (${sources}) to support a report rather than a one-off observation.` : sources === 1 ? ' It has a linked source, but the evidence base should be checked before approval.' : '';
-  const routeNote = routeReason ? ` The detector also flagged it because ${routeReason.replace(/_/g, ' ').replace(/\.$/, '')}.` : '';
-  const sourceLines = payload.sources.length > 0
-    ? payload.sources.slice(0, 5).map((source, index) => {
-      const title = String(source.title || `Source ${index + 1}`).trim();
-      const url = String(source.url || '').trim();
-      const type = String(source.source_type || '').trim();
-      const date = String(source.publish_date || source.created_at || '').slice(0, 10);
-      const meta = [type, date].filter(Boolean).join(', ');
-      return `${index + 1}. ${title}${meta ? ` (${meta})` : ''}${url ? `\n   ${url}` : ''}`;
-    }).join('\n')
-    : 'No linked sources found.';
-
-  return `Sure. Starting with the top scored one:
-
-#${id} — Score ${score}
-${trend}
-
-Why it scored high:
-This is a strong tactical question because it is framed as a coaching decision, not just a topic label. It asks ${questionFrame}, which gives the report a practical problem to solve and a clear way to separate useful conditions from risky ones.${evidenceNote}${routeNote}
-
-Sources:
-${sourceLines}
-
-Core angle:
-The report should turn this into a decision framework: when the idea creates advantage, when it becomes dangerous, what cues coaches should read from the opponent and their own players, and how those cues change the choice during a match.
-
-Likely report structure:
-1. What the decision involves
-2. Conditions that make it useful
-3. Conditions that make it dangerous
-4. How opponent and team structure change the decision
-5. Practical decision framework for coaches
-
-My take:
-This one is worth reviewing seriously. It has a clear coaching application and should produce a useful evergreen tactical piece if the sources support the examples.
-
-Approve or Reject`;
-}
-
-function detectReviewPayloadId(payload: DetectReviewPayload) {
-  return Number(payload.candidate.id);
-}
-
-async function nextDetectReviewText(excludeId?: number, options: { refresh?: boolean } = {}) {
-  const state = await loadDetectReviewState();
-  let queue = options.refresh ? [] : [...(state?.queue || [])];
-  if (excludeId) queue = queue.filter((payload) => detectReviewPayloadId(payload) !== excludeId);
-  if (queue.length === 0) queue = fetchDetectReviewCandidates(excludeId ? [excludeId] : []);
-
-  const [payload, ...remainingQueue] = queue;
-  if (!payload?.candidate?.id) {
-    await clearDetectReviewState();
-    return 'No pending detect candidates are ready for review.';
-  }
-  await saveDetectReviewState({ currentId: detectReviewPayloadId(payload), queue: remainingQueue });
-  return formatDetectReviewCandidate(payload);
-}
-
-function detectReviewArgsLineFromText(text: string) {
-  const trimmed = text.trim();
-  if (!trimmed) return undefined;
-  const needs = trimmed.match(/^(needs[-_\s]+more[-_\s]+evidence|more[-_\s]+evidence)(?:\b|$)([\s\S]*)$/i);
-  if (needs) return `needs-more-evidence${needs[2] || ''}`.trim();
-  const decision = trimmed.match(/^(approve|approved|reject|rejected|skip)(?:\b|$)([\s\S]*)$/i);
-  if (decision) return `${decision[1].toLowerCase()}${decision[2] || ''}`.trim();
-  return undefined;
-}
-
-async function detectReviewCommand(args: string[]) {
-  const rawAction = args[0] || 'next';
-  const action = rawAction.toLowerCase().replace(/_/g, '-');
-  if (action === 'next' || action === 'show' || action === 'list') return nextDetectReviewText(undefined, { refresh: true });
-
-  const state = await loadDetectReviewState();
-  const explicitId = Number(args[1] || args[0]);
-  const hasExplicitId = Number.isInteger(explicitId) && explicitId > 0;
-  const candidateId = hasExplicitId ? explicitId : state?.currentId;
-  if (!candidateId) return 'No current detect candidate. Send /detect first.';
-
-  const noteStart = hasExplicitId ? 2 : 1;
-  const note = args.slice(noteStart).join(' ').trim();
-
-  if (action === 'skip') return nextDetectReviewText(candidateId);
-
-  const decision = action === 'approve' || action === 'approved'
-    ? 'approved'
-    : action === 'reject' || action === 'rejected'
-      ? 'rejected'
-      : action === 'needs-more-evidence' || action === 'more-evidence'
-        ? 'needs_more_evidence'
-        : undefined;
-  if (!decision) return 'Use /detect, /detect approve, /detect reject, /detect skip, or /detect needs-more-evidence.';
-
-  const result = decideDetectReviewCandidate(candidateId, decision, note);
-  const next = await nextDetectReviewText(candidateId);
-  const noteLine = note ? `\nFeedback saved: ${note}` : '';
-  return `${sentenceCase(result.decision.replace(/_/g, ' '))}: #${result.id} ${result.trend}${noteLine}\n\n${next}`;
-}
-
-async function detectApprovalCommand(args: string[]) {
-  const action = args[0] || 'next';
-  if (action === 'next' || action === 'list') {
-    const py = String.raw`
-import json
-import psycopg
-from db_conn import resolve_database_conninfo
-from detect_policy import load_policy as load_detect_policy, passes_report_gate
-conninfo, reason = resolve_database_conninfo()
-if not conninfo:
-    raise SystemExit(f"missing database connection: {reason}")
-policy = load_detect_policy()
-min_score = int(policy["report_min_score"])
-min_sources = int(policy["report_min_sources"])
-with psycopg.connect(conninfo) as conn, conn.cursor() as cur:
-    cur.execute("""
-        SELECT id, trend, COALESCE(final_score, score, 0), COALESCE(source_diversity, 0), detected_at, detect_route_reason, detect_verification
-        FROM trend_candidates
-        WHERE status = 'pending' AND COALESCE(report_decision, 'pending') = 'pending'
-        ORDER BY COALESCE(final_score, score, 0) DESC, detected_at DESC, id DESC
-        LIMIT 25
-    """)
-    rows = cur.fetchall() or []
-items = []
-for id_, trend, score, sources, detected_at, route_reason, verification in rows:
-    if passes_report_gate(final_score=int(score or 0), source_diversity=int(sources or 0), min_score=min_score, min_sources=min_sources, policy=policy):
-        items.append({"id": id_, "trend": trend, "score": int(score or 0), "sources": int(sources or 0), "detected_at": detected_at.isoformat() if detected_at else None, "route_reason": route_reason, "verification": verification})
-print(json.dumps(items[:10], default=str))
-`;
-    const items = JSON.parse(runDetectApprovalPython(py)) as DetectApprovalItem[];
-    if (items.length === 0) {
-      console.log('No pending detect trends passing the report gate.');
-      return;
-    }
-    const shown = action === 'next' ? items.slice(0, 1) : items;
-    for (const item of shown) console.log(formatDetectApprovalItem(item));
-    if (action === 'next' && items.length > 1) console.log(`\n${items.length - 1} more pending. Run again after approve/reject.`);
-    return;
-  }
-
-  if (action === 'approve' || action === 'reject') {
-    const id = Number(args[1]);
-    if (!Number.isInteger(id) || id <= 0) throw new Error(`usage: mi detect-approval ${action} <candidate-id>`);
-    const decision = action === 'approve' ? 'approved' : 'rejected';
-    const py = String.raw`
-import json, sys
-import psycopg
-from db_conn import resolve_database_conninfo
-candidate_id = int(sys.argv[1])
-decision = sys.argv[2]
-conninfo, reason = resolve_database_conninfo()
-if not conninfo:
-    raise SystemExit(f"missing database connection: {reason}")
-with psycopg.connect(conninfo) as conn, conn.cursor() as cur:
-    cur.execute("""
-        UPDATE trend_candidates
-        SET report_decision = %s, report_decided_at = NOW(), report_decision_source = 'mi_detect_approval_command'
-        WHERE id = %s AND status = 'pending' AND COALESCE(report_decision, 'pending') = 'pending'
-        RETURNING id, trend, COALESCE(final_score, score, 0), COALESCE(source_diversity, 0)
-    """, (decision, candidate_id))
-    row = cur.fetchone()
-    if not row:
-        raise SystemExit("candidate not found or already decided")
-    conn.commit()
-print(json.dumps({"id": row[0], "trend": row[1], "score": int(row[2] or 0), "sources": int(row[3] or 0), "decision": decision}))
-`;
-    const result = JSON.parse(runDetectApprovalPython(py, [String(id), decision]));
-    await appendThreadMessage('main', 'assistant', `Detect trend ${result.decision}: #${result.id} ${result.trend}`, { unread: false, source: 'detect-approval-command' });
-    console.log(`${result.decision}: #${result.id} ${result.trend}`);
-    return;
-  }
-
-  throw new Error('usage: mi detect-approval [next|list|approve <candidate-id>|reject <candidate-id>]');
-}
-
 function taskName(task: MiTask) {
   return (task.name || task.sessionName || task.id || 'task').replace(/^Mi task:\s*/i, '').trim() || 'task';
 }
@@ -672,8 +278,7 @@ function taskSectionRank(task: MiTask) {
 function taskActivitySymbol(task: MiTask, animated = true, frameIndex = 0) {
   if (isTaskNeedsInput(task)) return '●';
   if (!isTaskActive(task)) return '○';
-  if (!animated || !isTaskWorking(task)) return '●';
-  return PI_SPINNER_FRAMES[frameIndex % PI_SPINNER_FRAMES.length] || '⠋';
+  return '●';
 }
 
 function taskUpdatedMs(task: MiTask) {
@@ -761,7 +366,9 @@ function taskFinalOutput(task: MiTask, options: { full?: boolean } = {}) {
 
 function taskDetail(task: MiTask) {
   const taskText = taskDisplayText(task);
-  const detail = task.error || (isTaskActive(task) ? (task.progress || taskText) : (taskText || task.progress)) || task.sessionName || '';
+  const base = task.error || (isTaskActive(task) ? (task.progress || taskText) : (taskText || task.progress)) || task.sessionName || '';
+  const reason = task.needsUser ? `needs input: ${task.needsUserReason || 'attention'}` : '';
+  const detail = reason ? `${reason}${base ? ` — ${base}` : ''}` : base;
   return detail.replace(/\s+/g, ' ');
 }
 
@@ -776,16 +383,21 @@ function textFromSessionMessage(message: any) {
     .trim();
 }
 
-function summarizeSessionTool(name: string, args: any) {
-  if (name === 'bash') return `running: ${String(args?.command || '').slice(0, 140)}`;
-  if (name === 'read') return `reading: ${args?.path || ''}${args?.offset ? `:${args.offset}` : ''}`;
-  if (name === 'edit') return `editing: ${args?.path || ''}`;
-  if (name === 'write') return `writing: ${args?.path || ''}`;
-  if (name) return `using ${name}`;
-  return 'using tool';
+function summarizeSessionTool(name: string, args: any, elapsedLabel = '') {
+  const elapsed = elapsedLabel ? ` (${elapsedLabel})` : '';
+  if (name === 'bash') return `running${elapsed}: ${String(args?.command || '').slice(0, 140)}`;
+  if (name === 'read') return `reading${elapsed}: ${args?.path || ''}${args?.offset ? `:${args.offset}` : ''}`;
+  if (name === 'edit') return `editing${elapsed}: ${args?.path || ''}`;
+  if (name === 'write') return `writing${elapsed}: ${args?.path || ''}`;
+  if (name) return `using ${name}${elapsed}`;
+  return `using tool${elapsed}`;
 }
 
-function formatSessionEvent(record: any) {
+function recordTimestampMs(record: any) {
+  return Date.parse(record?.timestamp || record?.createdAt || record?.at || '') || 0;
+}
+
+function formatSessionEvent(record: any, options: { toolResultTimes?: Map<string, number>; nowMs?: number } = {}) {
   if (record.type !== 'message') return '';
   const role = record.message?.role || '';
   if (role === 'user') return `you: ${textFromSessionMessage(record.message).replace(/\s+/g, ' ').slice(0, 180)}`;
@@ -793,7 +405,12 @@ function formatSessionEvent(record: any) {
     const content = record.message?.content;
     if (Array.isArray(content)) {
       const tool = content.find((part: any) => part?.type === 'toolCall');
-      if (tool) return summarizeSessionTool(tool.name || '', tool.arguments || {});
+      if (tool) {
+        const startMs = recordTimestampMs(record);
+        const endMs = options.toolResultTimes?.get(String(tool.id || '')) || options.nowMs || Date.now();
+        const elapsed = startMs ? compactDuration(endMs - startMs) : '';
+        return summarizeSessionTool(tool.name || '', tool.arguments || {}, elapsed);
+      }
       const thinking = content.find((part: any) => part?.type === 'thinking')?.thinking;
       if (thinking) return 'thinking…';
     }
@@ -880,25 +497,43 @@ function taskNeedsInputQuestion(task: MiTask) {
   return task.progress || taskDisplayText(task) || task.error || task.needsUserReason || 'Needs input.';
 }
 
+const sessionActivityStepsCache = new Map<string, { at: number; value: string[] }>();
+
 function readSessionActivitySteps(sessionFile: string, task: MiTask, maxRecords = 10) {
+  const active = isTaskActive(task);
+  const failed = taskStatus(task) === 'error';
+  const cacheKey = [sessionFile, maxRecords, active ? 'active' : 'idle', failed ? 'failed' : 'ok'].join('\u001f');
+  const cached = sessionActivityStepsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < MI_SESSION_ACTIVITY_REFRESH_MS) return cached.value;
   try {
     const raw = readSessionTailSync(sessionFile);
-    const events = raw
+    const records = raw
       .trim()
       .split(/\r?\n/)
       .slice(-120)
-      .map((line) => { try { return formatSessionEvent(JSON.parse(line)); } catch { return ''; } })
+      .map((line) => { try { return JSON.parse(line); } catch { return undefined; } })
+      .filter(Boolean);
+    const toolResultTimes = new Map<string, number>();
+    for (const record of records) {
+      if (record?.type !== 'message' || record?.message?.role !== 'toolResult') continue;
+      const toolCallId = String(record.message.toolCallId || '');
+      const timestamp = recordTimestampMs(record);
+      if (toolCallId && timestamp) toolResultTimes.set(toolCallId, timestamp);
+    }
+    const nowMs = Date.now();
+    const events = records
+      .map((record) => formatSessionEvent(record, { toolResultTimes, nowMs }))
       .filter(Boolean)
       .filter((line, index, lines) => index === 0 || line !== lines[index - 1])
       .slice(-maxRecords);
     if (events.length === 0) return [];
-    const active = isTaskActive(task);
-    const failed = taskStatus(task) === 'error';
-    return events.map((line, index) => {
+    const value = events.map((line, index) => {
       const last = index === events.length - 1;
       const mark = failed && last ? '!' : active && last ? '→' : '✓';
       return `${mark} ${line}`;
     });
+    sessionActivityStepsCache.set(cacheKey, { at: Date.now(), value });
+    return value;
   } catch {
     return [];
   }
@@ -1091,8 +726,7 @@ async function miAgentsCommand() {
   const selectedResumeKeys = new Set<string>();
   let tui: TUI | undefined;
   let pollTimer: NodeJS.Timeout | undefined;
-  let animationTimer: NodeJS.Timeout | undefined;
-  let agentSpinnerFrame = 0;
+  let clockTimer: NodeJS.Timeout | undefined;
   const renderTestMode = process.env.MI_AGENT_RENDER_TEST === '1';
   let piCycleConfig = renderTestMode ? { shortcut: 'z', tiers: { '1': [MI_MODEL], '2': [MI_MODEL], '3': [MI_MODEL] }, thinkingLevels: {} } : await loadPiCycleConfig();
   const piCycleNextIndex: Record<string, number> = { '1': 0, '2': 0, '3': 0 };
@@ -1184,12 +818,20 @@ async function miAgentsCommand() {
     (tui as any)?.requestRender?.(force);
   }
 
+  function reclickFullOutputIfActive() {
+    if (!fullLastOutputMode) return;
+    fullLastOutputScroll = 0;
+    status = 'Full output • ↑/↓ scroll • ^L back';
+    if (!renderTestMode) process.stdout.write('\x1b[2J\x1b[H');
+    requestRender(true);
+  }
+
   function selectedTask() {
     return selected >= 0 ? tasks[selected] : undefined;
   }
 
   function clampTaskSelection() {
-    selected = tasks.length > 0 ? Math.max(0, Math.min(selected, tasks.length - 1)) : -1;
+    selected = tasks.length > 0 && selected >= 0 ? Math.min(selected, tasks.length - 1) : -1;
   }
 
   function agentModelBase(modelSpec = agentModelSpec) {
@@ -1254,7 +896,7 @@ async function miAgentsCommand() {
       `Task: ${taskName(task)}`,
       `Status: ${taskStatus(task)}`,
       task.sessionFile ? `session: ${task.sessionFile}` : '',
-      task.needsUser ? `needs ${miUserName()}: ${task.needsUserReason || 'attention'}` : '',
+      task.needsUser ? `needs input: ${task.needsUserReason || 'attention'}` : '',
       task.progress ? `progress: ${task.progress}` : '',
       task.text ? `latest result: ${task.text.slice(0, 1200)}` : '',
       task.error ? `error: ${task.error}` : '',
@@ -1340,17 +982,12 @@ async function miAgentsCommand() {
       const prompt = value.slice('/new'.length).trim();
       inputMode = 'new-prompt';
       pendingName = '';
+      replyTarget = undefined;
+      selected = -1;
       setAgentInput(prompt);
       status = 'New task';
       requestRender();
       if (prompt) void submitAgentInput();
-      return true;
-    }
-    if (value === '/detect' || value.startsWith('/detect ')) {
-      const response = await detectReviewCommand(value.replace(/^\/detect\b/, '').trim().split(/\s+/).filter(Boolean));
-      status = response.split('\n')[0] || 'Detect review updated';
-      await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'detect-review-command' });
-      requestRender();
       return true;
     }
     if (value === '/scoped-models') {
@@ -1413,7 +1050,7 @@ async function miAgentsCommand() {
     return tasks
       .map((task, index) => ({ task, index }))
       .filter((item) => taskSection(item.task) === label)
-      .sort((a, b) => taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task));
+      .sort((a, b) => taskStartedMs(a.task) - taskStartedMs(b.task) || taskUpdatedMs(a.task) - taskUpdatedMs(b.task));
   }
 
   function navigationTaskIndexes() {
@@ -1601,7 +1238,7 @@ async function miAgentsCommand() {
           lines.push(fgDim(truncateText(row.label, width)));
         } else {
           const key = stableTaskKey(row.task);
-          const symbol = multiSelectMode ? (selectedTaskKeys.has(key) ? '✓' : ' ') : taskActivitySymbol(row.task, true, agentSpinnerFrame);
+          const symbol = multiSelectMode ? (selectedTaskKeys.has(key) ? '✓' : ' ') : taskActivitySymbol(row.task, false);
           const prefix = row.index === selected ? '→ ' : '  ';
           const text = truncateText(`${prefix}${symbol} ${formatTaskRow(row.task, width - 4)}`, width);
           lines.push(row.index === selected ? fgAccent(text) : text);
@@ -1788,12 +1425,14 @@ async function miAgentsCommand() {
       }
       status = `Sent follow-up to ${taskName(task)}`;
       agentSubmitting = true;
+      reclickFullOutputIfActive();
       requestRender();
       const turn = await applyAgentPiCycle(value);
       if (!turn.body) return;
       const runningUpdate: Partial<MiTask> = { ...immediateRunningUpdate, progress: turn.body, lastInput: turn.body, updatedAt: new Date().toISOString() };
       Object.assign(task, runningUpdate);
       if (taskKey) pendingTaskUpdates.set(taskKey, runningUpdate);
+      reclickFullOutputIfActive();
       requestRender();
       void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
         .then(async () => {
@@ -1825,7 +1464,7 @@ async function miAgentsCommand() {
     if (closed) return;
     closed = true;
     if (pollTimer) clearInterval(pollTimer);
-    if (animationTimer) clearInterval(animationTimer);
+    if (clockTimer) clearInterval(clockTimer);
     tui?.stop();
     tui = undefined;
   }
@@ -2019,12 +1658,12 @@ async function miAgentsCommand() {
           task.needsUser = true;
           task.needsUserReason = 'stopped by Escape';
           task.finishedAt = undefined;
-          task.progress = `stopped by Escape; needs ${miUserName()} input`;
+          task.progress = 'stopped by Escape; needs input';
           task.updatedAt = new Date().toISOString();
           status = `Stopped ${taskName(task)}; moved to needs input`;
           const taskKey = stableTaskKey(task);
           if (taskKey) {
-            pendingTaskUpdates.set(taskKey, { status: 'paused', needsUser: true, needsUserReason: 'stopped by Escape', finishedAt: undefined, progress: `stopped by Escape; needs ${miUserName()} input`, updatedAt: task.updatedAt });
+            pendingTaskUpdates.set(taskKey, { status: 'paused', needsUser: true, needsUserReason: 'stopped by Escape', finishedAt: undefined, progress: 'stopped by Escape; needs input', updatedAt: task.updatedAt });
             pendingTaskUpdateStartedAt.delete(taskKey);
           }
           clampTaskSelection();
@@ -2121,11 +1760,12 @@ async function miAgentsCommand() {
   tui = startPiTuiScreen(new FunctionScreen(renderAgentLines, onData), { alternateScreen: true });
   await refresh();
   pollTimer = setInterval(() => void refresh(), MI_TASK_POLL_MS);
-  animationTimer = setInterval(() => {
-    if (!tasks.some(isTaskWorking)) return;
-    agentSpinnerFrame = (agentSpinnerFrame + 1) % PI_SPINNER_FRAMES.length;
+  clockTimer = setInterval(() => {
+    if (tasks.length === 0 && resumeSessions.length === 0) return;
     requestRender();
-  }, MI_AGENT_ANIMATION_MS);
+  }, MI_AGENT_CLOCK_MS);
+  // Working background agents use a static filled dot; task state arrives via polling,
+  // while elapsed time labels are computed locally from timestamps once per second.
   await new Promise<void>((resolve) => {
     const interval = setInterval(() => {
       if (closed) {
@@ -2147,7 +1787,7 @@ async function compactCommand(args: string[]) {
 
 async function chatCommand(threadId = 'main') {
   await showThread(threadId);
-  console.log('\nType a message. Commands: /inbox, /compact, /detect, /exit');
+  console.log('\nType a message. Commands: /inbox, /compact, /exit');
   const rl = createInterface({ input, output });
   try {
     while (true) {
@@ -2155,7 +1795,7 @@ async function chatCommand(threadId = 'main') {
       if (!line) continue;
       if (line === '/exit' || line === '/quit') break;
       if (line === '/help') {
-        console.log('Commands: /inbox, /compact, /detect, /exit');
+        console.log('Commands: /inbox, /compact, /exit');
         continue;
       }
       if (line === '/inbox') {
@@ -2164,20 +1804,6 @@ async function chatCommand(threadId = 'main') {
       }
       if (line === '/compact') {
         await compactCommand([threadId]);
-        continue;
-      }
-      if (line === '/detect' || line.startsWith('/detect ')) {
-        const response = await detectReviewCommand(line.replace(/^\/detect\b/, '').trim().split(/\s+/).filter(Boolean));
-        await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'detect-review-command' });
-        console.log(`mi> ${response}`);
-        continue;
-      }
-      const detectReviewArgsLine = existsSync(DETECT_REVIEW_STATE_PATH) ? detectReviewArgsLineFromText(line) : undefined;
-      if (detectReviewArgsLine) {
-        await appendThreadMessage('main', 'user', line, { unread: false, source: 'mi-cli' });
-        const response = await detectReviewCommand(detectReviewArgsLine.split(/\s+/).filter(Boolean));
-        await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'detect-review-command' });
-        console.log(`mi> ${response}`);
         continue;
       }
       const reply = await askMi(threadId, line);
@@ -2248,6 +1874,9 @@ type MiTask = {
   sessionName?: string;
   sessionId?: string;
   source?: string;
+  openPiSession?: boolean;
+  openPiPid?: number;
+  openPiInput?: string;
 };
 
 function readPushoverEnvFile(): Record<string, string> {
@@ -2319,7 +1948,7 @@ function widthOf(text: string) {
 }
 
 function truncateText(text: string, width: number) {
-  return truncateToWidth(stripCursorMarkers(text), Math.max(0, width), '');
+  return truncateToWidth(stripCursorMarkers(text).replace(/[\r\n]+/g, ' '), Math.max(0, width), '');
 }
 
 function padVisibleEnd(text: string, width: number) {
@@ -2606,7 +2235,7 @@ function renderMiTranscriptItem(item: { role: 'user' | 'assistant'; text: string
 
 type MiTranscriptItem = { role: 'user' | 'assistant'; text: string };
 
-const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/open', '/quit', '/mi', '/detect'];
+const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/open', '/quit', '/mi'];
 const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
   '/settings': 'Open settings menu',
   '/model': 'Select Mi model',
@@ -2631,7 +2260,6 @@ const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
   '/reload': 'Reload keybindings, extensions, skills, prompts, and themes',
   '/quit': 'Quit',
   '/mi': 'Chat with Mi about the selected task',
-  '/detect': 'Review pending detect candidates one by one',
 };
 
 let modelAutocompleteCache: { loadedAt: number; models: any[] } | undefined;
@@ -2701,7 +2329,7 @@ async function getModelAutocompleteItems(argumentPrefix: string) {
     }));
 }
 
-const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/detect', '/resume', '/open', '/model', '/scoped-models']);
+const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/resume', '/open', '/model', '/scoped-models']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 
 function slashCommandName(value: string) {
@@ -2730,7 +2358,16 @@ function createPiSlashAutocompleteProvider(commands = PI_SLASH_COMMANDS) {
   };
 }
 
+const miTranscriptItemRenderCache = new WeakMap<MiTranscriptItem, { width: number; role: string; text: string; lines: string[] }>();
 const miTranscriptRenderCache = new WeakMap<Array<MiTranscriptItem>, { width: number; length: number; lastRole: string; lastText: string; lines: string[] }>();
+
+function renderCachedMiTranscriptItem(item: MiTranscriptItem, width: number) {
+  const cached = miTranscriptItemRenderCache.get(item);
+  if (cached && cached.width === width && cached.role === item.role && cached.text === item.text) return cached.lines;
+  const lines = renderMiTranscriptItem(item, width);
+  miTranscriptItemRenderCache.set(item, { width, role: item.role, text: item.text, lines });
+  return lines;
+}
 
 function renderMiTranscript(transcript: Array<MiTranscriptItem>, width: number) {
   const last = transcript.at(-1);
@@ -2738,7 +2375,7 @@ function renderMiTranscript(transcript: Array<MiTranscriptItem>, width: number) 
   if (cached && cached.width === width && cached.length === transcript.length && cached.lastRole === (last?.role || '') && cached.lastText === (last?.text || '')) return cached.lines;
   const body: string[] = [];
   for (const item of transcript) {
-    const lines = renderMiTranscriptItem(item, width);
+    const lines = renderCachedMiTranscriptItem(item, width);
     if (lines.length === 0) continue;
     if (body.length > 0) body.push('');
     body.push(...lines);
@@ -3014,7 +2651,7 @@ async function miTuiCommand(initial = '') {
   let inputLine = '';
   const editorTui = { terminal: { rows: process.stdout.rows || 24 }, requestRender() { requestRender(); } } as any;
   const inputEditor = new Editor(editorTui, piEditorTheme(miThinkingLevel));
-  inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/compact', '/quit', '/detect']));
+  inputEditor.setAutocompleteProvider(createPiSlashAutocompleteProvider(['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/compact', '/quit']));
   inputEditor.focused = true;
   inputEditor.onChange = (text) => { inputLine = text; };
   let pending = false;
@@ -3024,39 +2661,15 @@ async function miTuiCommand(initial = '') {
   let tui: TUI | undefined;
   let workingTimer: NodeJS.Timeout | undefined;
   let workingFrame = 0;
-  let taskPollTimer: NodeJS.Timeout | undefined;
-  let agentAnimationTimer: NodeJS.Timeout | undefined;
-  let compactAgentSpinnerFrame = 0;
   let pendingEscapeTimer: NodeJS.Timeout | undefined;
   let pendingEscapeData = '';
-  let compactAgents: MiTask[] = [];
   let modelPicker: PiSelectorComponent | undefined;
-  let selectedAgentIndex = -1;
-  let agentListFocused = false;
-  const dismissedCompactAgentKeys = new Set<string>();
 
   // Do not fetch model state on startup: that spins up the Mi main pi RPC process.
   // The footer can show MI_MODEL until the first prompt/model action needs real state.
 
-  function refreshCompactAgents() {
-    listTasks()
-      .then((tasks) => {
-        const selectedKey = selectedAgent() ? stableTaskKey(selectedAgent()!) : '';
-        compactAgents = tasks.filter((task) => !dismissedCompactAgentKeys.has(stableTaskKey(task)));
-        if (selectedKey) selectedAgentIndex = compactAgents.findIndex((task) => stableTaskKey(task) === selectedKey);
-        if (selectedAgentIndex >= compactAgents.length) selectedAgentIndex = compactAgents.length - 1;
-        requestRender();
-      })
-      .catch(() => undefined);
-  }
-
-  refreshCompactAgents();
-  taskPollTimer = setInterval(refreshCompactAgents, MI_TASK_POLL_MS);
-  agentAnimationTimer = setInterval(() => {
-    if (!compactAgents.some(isTaskWorking)) return;
-    compactAgentSpinnerFrame = (compactAgentSpinnerFrame + 1) % PI_SPINNER_FRAMES.length;
-    requestRender();
-  }, MI_AGENT_ANIMATION_MS);
+  // Main Mi behaves like pi: it renders only the active conversation.
+  // Background workers live in the dedicated `mi agents` view.
 
   function requestRender() {
     tui?.requestRender();
@@ -3106,63 +2719,16 @@ async function miTuiCommand(initial = '') {
     return String(n);
   }
 
-  function selectedAgent() {
-    return selectedAgentIndex >= 0 ? compactAgents[selectedAgentIndex] : undefined;
-  }
-
-  function compactAgentWindow() {
-    if (compactAgents.length === 0) return { start: 0, items: [] as Array<{ task: MiTask; index: number }> };
-    const anchor = selectedAgentIndex >= 0 ? selectedAgentIndex : 0;
-    const start = Math.max(0, Math.min(anchor - 1, Math.max(0, compactAgents.length - 3)));
-    return { start, items: compactAgents.slice(start, start + 3).map((task, offset) => ({ task, index: start + offset })) };
-  }
-
   function statusLine(width: number) {
     const model = miState?.model;
     const modelName = model ? `${model.provider}/${model.id}` : MI_MODEL;
     const thinking = miState?.thinkingLevel ? ` ${miState.thinkingLevel}` : '';
-    const selected = selectedAgent() ? ` agent:${selectedAgentIndex + 1}` : '';
-    const left = [messageQueue.length > 0 ? `q${messageQueue.length}` : '', selected].filter(Boolean).join(' ');
+    const left = messageQueue.length > 0 ? `q${messageQueue.length}` : '';
     const right = `${modelName}${thinking}`;
     const available = Math.max(1, width - widthOf(left) - widthOf(right));
     if (left && available > 1) return fgDim(`${left}${' '.repeat(available)}${right}`);
     return fgDim(right.padStart(Math.max(widthOf(right), width)));
   }
-
-  function compactAgentLines(width: number) {
-    if (compactAgents.length === 0) return [];
-    const window = compactAgentWindow();
-    const lines: string[] = [];
-    for (const { task, index } of window.items) {
-      const marker = agentListFocused && index === selectedAgentIndex ? '▸' : index === selectedAgentIndex ? '→' : ' ';
-      const row = truncateText(`${marker}${taskActivitySymbol(task, true, compactAgentSpinnerFrame)} ${formatTaskRow(task, width - 4)}`, width);
-      lines.push(fgLightGrey(row));
-    }
-    return lines.slice(0, 4);
-  }
-
-  function selectedAgentVisibleNumber() {
-    if (selectedAgentIndex < 0) return undefined;
-    const window = compactAgentWindow();
-    const found = window.items.find((item) => item.index === selectedAgentIndex);
-    return found ? String(found.index - window.start + 1) : String(selectedAgentIndex + 1);
-  }
-
-  function selectedAgentContext() {
-    const task = selectedAgent();
-    if (!task) return '';
-    return [
-      `Selected Mi background agent #${selectedAgentIndex + 1}: ${taskName(task)}`,
-      `Status: ${taskStatus(task)}`,
-      task.sessionFile ? `session: ${task.sessionFile}` : '',
-      task.needsUser ? `needs ${miUserName()}: ${task.needsUserReason || 'attention'}` : '',
-      extractPrUrlsFromTask(task).length ? `PRs: ${extractPrUrlsFromTask(task).join(' ')}` : '',
-      task.text ? `latest result: ${task.text.slice(0, 800)}` : '',
-      task.progress ? `progress: ${task.progress}` : '',
-      task.error ? `error: ${task.error}` : '',
-    ].filter(Boolean).join('\n');
-  }
-
   function shouldStartBackgroundWorkerFromMi(text: string) {
     const normalized = text.trim().toLowerCase();
     if (!normalized || normalized.startsWith('/')) return false;
@@ -3173,38 +2739,30 @@ async function miTuiCommand(initial = '') {
   async function startBackgroundWorkerFromMi(text: string) {
     const name = taskNameFromPrompt(text);
     const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: text, background: true }, 30000);
-    refreshCompactAgents();
     return result.text || `Started background task: ${name}.`;
   }
 
   async function buildMiTurnPrompt(text: string) {
     const recent = (await readThreadMessages('main', 15)).filter((message) => message.role === 'user' || message.role === 'assistant');
     const history = recent.map((message) => `${message.role}: ${message.text}`).join('\n');
-    const agentContext = selectedAgentContext();
-    const detectInstruction = text.trim() === '/detect' || text.trim().startsWith('/detect ') ? DETECT_TASK_INSTRUCTION : '';
     return [
       `You are Mi, ${miUserPossessive()} private persistent assistant. Reply naturally and use recent conversation context. Do not mention hidden context unless it is useful.`,
-      detectInstruction,
       history ? `Recent conversation history for context only:\n${history}` : '',
-      agentContext ? `Selected agent context:\n${agentContext}` : '',
       `New message to answer:\n${text}`,
     ].filter(Boolean).join('\n\n');
   }
 
   function footerLines(width: number, height: number) {
-    const agentLines = compactAgentLines(width);
     editorTui.terminal.rows = height;
     const piEditor = renderPiEditor(inputEditor, width);
     const inputTopPadding = 1;
     return {
-      agentLines,
       piEditor,
       inputTopPadding,
       lines: [
         '',
         ...piEditor.markedLines.map((line) => truncateText(line, width)),
         statusLine(width),
-        ...agentLines,
         '',
       ],
     };
@@ -3241,15 +2799,6 @@ async function miTuiCommand(initial = '') {
   }
 
   async function askOne(text: string) {
-    if (text === '/detect' || text.startsWith('/detect ')) {
-      await showDetectReviewInTranscript(text.replace(/^\/detect\b/, '').trim(), text);
-      return;
-    }
-    const detectReviewArgsLine = existsSync(DETECT_REVIEW_STATE_PATH) ? detectReviewArgsLineFromText(text) : undefined;
-    if (detectReviewArgsLine) {
-      await showDetectReviewInTranscript(detectReviewArgsLine, text, { echoUser: true });
-      return;
-    }
     setPending(true);
     transcript.push({ role: 'user', text });
     scrollOffset = 0;
@@ -3296,8 +2845,6 @@ async function miTuiCommand(initial = '') {
     if (closed) return;
     closed = true;
     if (workingTimer) clearInterval(workingTimer);
-    if (taskPollTimer) clearInterval(taskPollTimer);
-    if (agentAnimationTimer) clearInterval(agentAnimationTimer);
     if (pendingEscapeTimer) clearTimeout(pendingEscapeTimer);
     tui?.stop();
     tui = undefined;
@@ -3369,32 +2916,6 @@ async function miTuiCommand(initial = '') {
     });
   }
 
-  async function showDetectReviewInTranscript(argsLine: string, userText?: string, options: { echoUser?: boolean } = {}) {
-    const showWorking = !options.echoUser;
-    statusMessage = showWorking ? 'Loading detect candidates...' : 'Saving review...';
-    if (showWorking) setPending(true);
-    if (userText && options.echoUser) {
-      transcript.push({ role: 'user', text: userText });
-      await appendThreadMessage('main', 'user', userText, { unread: false, source: 'mi-cli' });
-    }
-    // /detect itself is a repeatable task trigger, not chat. Follow-up review
-    // text like "reject because X" is echoed/persisted as normal user feedback.
-    requestRender();
-    try {
-      const args = argsLine.trim() ? argsLine.trim().split(/\s+/) : [];
-      const response = await detectReviewCommand(args);
-      await appendThreadMessage('main', 'assistant', response, { unread: false, source: 'detect-review-command' });
-      transcript.push({ role: 'assistant', text: response });
-      scrollOffset = 0;
-      statusMessage = `tmux scrollback for history • Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
-    } catch (error) {
-      statusMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      if (showWorking) setPending(false);
-    }
-    requestRender();
-  }
-
   function submitInput() {
     const text = inputLine.trim();
     if (!text) return;
@@ -3403,10 +2924,6 @@ async function miTuiCommand(initial = '') {
     renderInputLine();
     if (text === '/quit') {
       cleanup();
-      return;
-    }
-    if (text === '/detect' || text.startsWith('/detect ')) {
-      void showDetectReviewInTranscript(text.replace(/^\/detect\b/, '').trim(), text);
       return;
     }
     if (text === '/scoped-models') {
@@ -3464,11 +2981,6 @@ async function miTuiCommand(initial = '') {
       });
       return;
     }
-    const detectReviewArgsLine = existsSync(DETECT_REVIEW_STATE_PATH) ? detectReviewArgsLineFromText(text) : undefined;
-    if (detectReviewArgsLine) {
-      void showDetectReviewInTranscript(detectReviewArgsLine, text, { echoUser: true });
-      return;
-    }
     void applyPiCycle(text)
       .then(({ body }) => {
         if (body) enqueueMessage(body);
@@ -3480,30 +2992,6 @@ async function miTuiCommand(initial = '') {
       });
   }
 
-  function selectVisibleAgent(numberKey: string) {
-    const numeric = Number(numberKey);
-    if (numeric === 0) {
-      selectedAgentIndex = -1;
-      requestRender();
-      return true;
-    }
-    if (!Number.isInteger(numeric) || numeric < 1 || numeric > 3) return false;
-    const { items } = compactAgentWindow();
-    const item = items[numeric - 1];
-    if (!item) return false;
-    selectedAgentIndex = item.index;
-    requestRender();
-    return true;
-  }
-
-  function moveAgentSelection(delta: number) {
-    if (compactAgents.length === 0) return false;
-    agentListFocused = true;
-    if (selectedAgentIndex < 0) selectedAgentIndex = delta > 0 ? Math.min(delta, compactAgents.length - 1) : compactAgents.length - 1;
-    else selectedAgentIndex = Math.max(0, Math.min(compactAgents.length - 1, selectedAgentIndex + delta));
-    requestRender();
-    return true;
-  }
 
   function handleEscapeKey() {
     if (pending || messageQueue.length > 0) {
@@ -3514,26 +3002,6 @@ async function miTuiCommand(initial = '') {
         statusMessage = `Shift+Tab thinking • ${piCycleConfig.shortcut}/${piCycleConfig.shortcut.repeat(2)}/${piCycleConfig.shortcut.repeat(3)} pi-cycle`;
         requestRender();
       });
-    } else if (selectedAgentIndex >= 0 || agentListFocused) {
-      const task = selectedAgent();
-      if (task && isTaskActive(task)) {
-        task.status = 'paused';
-        task.needsUser = true;
-        task.needsUserReason = 'stopped by Escape';
-        task.finishedAt = undefined;
-        task.progress = `stopped by Escape; needs ${miUserName()} input`;
-        task.updatedAt = new Date().toISOString();
-        statusMessage = `Stopped ${taskName(task)}; moved to needs input`;
-        void stopTaskInList(task).then(() => refreshCompactAgents()).catch((error) => { statusMessage = error instanceof Error ? error.message : String(error); requestRender(); });
-      } else if (task) {
-        const key = stableTaskKey(task);
-        if (key) dismissedCompactAgentKeys.add(key);
-        compactAgents = compactAgents.filter((entry) => stableTaskKey(entry) !== key);
-        statusMessage = `Removed ${taskName(task)} from list`;
-        void dismissTaskFromList(task).catch((error) => { statusMessage = error instanceof Error ? error.message : String(error); requestRender(); });
-      }
-      selectedAgentIndex = -1;
-      agentListFocused = false;
     } else {
       inputLine = '';
       inputEditor.setText('');
@@ -3580,7 +3048,6 @@ async function miTuiCommand(initial = '') {
       requestRender();
       return;
     }
-    if (inputLine.length === 0 && /^[0-5]$/.test(data) && selectVisibleAgent(data)) return;
     if (data === '\x1b') {
       handleEscapeKey();
       return;
@@ -3591,10 +3058,6 @@ async function miTuiCommand(initial = '') {
     }
     if (matchesKey(data, 'shift+tab') || data === '\x1b[Z' || data === '\x1b[1;2Z' || data === '\x1b\t' || data.includes('\x1b[Z') || data.includes('\x1b[1;2Z')) {
       void cycleThinking();
-    } else if (data === '\x0c') {
-      agentListFocused = true;
-      if (selectedAgentIndex < 0 && compactAgents.length > 0) selectedAgentIndex = 0;
-      requestRender();
     } else if (isPageUpKey(data) || isPageDownKey(data) || isUpKey(data) || isDownKey(data)) {
       inputEditor.handleInput(data);
       inputLine = inputEditor.getText();
@@ -3606,12 +3069,6 @@ async function miTuiCommand(initial = '') {
       if (textBeforeEnter) {
         inputEditor.insertTextAtCursor(textBeforeEnter);
         inputLine = inputEditor.getText();
-      }
-      if (!inputLine.trim() && selectedAgentIndex >= 0) {
-        inputLine = `${selectedAgentVisibleNumber() || selectedAgentIndex + 1} `;
-        inputEditor.setText(inputLine);
-        renderInputLine();
-        return;
       }
       submitInput();
       const afterEnter = parts.join('');
@@ -3716,11 +3173,6 @@ async function main() {
   if (command === 'inbox' || command === 'threads') return inboxCommand();
   if (command === 'temp') return tempCommand(args);
   if (command === 'compact') return compactCommand(args);
-    if (command === 'detect') {
-    console.log(await detectReviewCommand(args));
-    return;
-  }
-  if (command === 'detect-approval') return detectApprovalCommand(args);
   if (command === 'agents') return miAgentsCommand();
   if (command === 'task') return taskCommand(args);
   if (command === 'make') return makeCommand(args);

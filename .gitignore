@@ -21,3 +21,5 @@ state/
 coverage/
 .tmp/
 tmp/
+
+dist/

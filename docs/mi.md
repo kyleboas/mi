@@ -1,6 +1,6 @@
 # Mi
 
-Mi is a tiny private assistant harness for running small AI workers from plain files.
+Mi is a tiny local assistant harness for running small AI workers from plain files.
 
 Product definition:
 
@@ -105,7 +105,8 @@ Daemon behavior:
 - Discovered/open pi sessions are merged with stored tasks and remain visible until cleared.
 - Stale busy session state does not overwrite a terminal stored task result when no live Mi worker exists.
 - Dismissed task/session keys are persisted.
+- Known noisy project-specific pi sessions can be excluded through code/configuration when needed.
 
-## Private access
+## Public-control safety
 
-The Mi web UI remains private-network-only. There is no public webhook/control UI. Persistent Flue orchestration binds to loopback and is reached through Mi, not directly. Push notifications are only for safe notifications, not a control plane.
+Mi does not expose a public webhook/control UI by default. Persistent Flue orchestration binds to loopback. Notification integrations are outbound-only and must not carry secrets, public control links, or dangerous action links.

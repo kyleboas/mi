@@ -4,12 +4,12 @@ set -euo pipefail
 SERVICE_NAME="${MI_CRON_SERVICE_NAME:-mi-cron-tick}"
 SERVICE="/etc/systemd/system/${SERVICE_NAME}.service"
 TIMER="/etc/systemd/system/${SERVICE_NAME}.timer"
-MI_USER="${MI_USER:-${USER}}"
-MI_WORKDIR="${MI_WORKDIR:-$(pwd)}"
-MI_BIN="${MI_BIN:-$(command -v mi)}"
+MI_USER="${MI_CRON_USER:-$(id -un)}"
+MI_WORKDIR="${MI_CRON_WORKDIR:-$(pwd)}"
+MI_BIN="${MI_CRON_BIN:-$(command -v mi)}"
 
-if [[ -z "${MI_BIN}" ]]; then
-  echo "mi binary not found; set MI_BIN=/path/to/mi" >&2
+if [[ -z "$MI_BIN" ]]; then
+  echo "mi binary not found; set MI_CRON_BIN=/path/to/mi" >&2
   exit 1
 fi
 
@@ -44,6 +44,7 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now "${SERVICE_NAME}.timer"
 
+# Remove temporary user crontab fallback after systemd is active.
 if command -v crontab >/dev/null 2>&1; then
   (crontab -l 2>/dev/null | grep -v "${SERVICE_NAME}" || true) | crontab -
 fi
