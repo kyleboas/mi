@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -62,8 +62,10 @@ function miSummaryInstruction() {
 }
 
 async function log(line) {
-  await mkdir(RUNTIME_DIR, { recursive: true });
-  await appendFile(LOG_PATH, `${new Date().toISOString()} ${line}\n`).catch(() => undefined);
+  await mkdir(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+  await chmod(RUNTIME_DIR, 0o700).catch(() => undefined);
+  await appendFile(LOG_PATH, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 }).catch(() => undefined);
+  await chmod(LOG_PATH, 0o600).catch(() => undefined);
 }
 
 function socketHealth(timeoutMs = 500) {
@@ -107,7 +109,8 @@ function parseDaemonLock(text, stats) {
 }
 
 async function writeDaemonHeartbeat() {
-  await writeFile(LOCK_PATH, daemonLockPayload()).catch(() => undefined);
+  await writeFile(LOCK_PATH, daemonLockPayload(), { mode: 0o600 }).catch(() => undefined);
+  await chmod(LOCK_PATH, 0o600).catch(() => undefined);
 }
 
 function startDaemonHeartbeat() {
@@ -116,11 +119,13 @@ function startDaemonHeartbeat() {
 }
 
 async function acquireDaemonLock() {
-  await mkdir(dirname(SOCKET_PATH), { recursive: true });
+  await mkdir(dirname(SOCKET_PATH), { recursive: true, mode: 0o700 });
+  await chmod(dirname(SOCKET_PATH), 0o700).catch(() => undefined);
   for (let attempt = 0; attempt < 20; attempt++) {
     try {
-      daemonLockHandle = await open(LOCK_PATH, "wx");
+      daemonLockHandle = await open(LOCK_PATH, "wx", 0o600);
       await daemonLockHandle.writeFile(daemonLockPayload());
+      await chmod(LOCK_PATH, 0o600).catch(() => undefined);
       startDaemonHeartbeat();
       return true;
     } catch (error) {
@@ -1488,7 +1493,8 @@ async function handle(socket, request) {
 
 if (!(await acquireDaemonLock())) process.exit(0);
 if (existsSync(SOCKET_PATH)) await rm(SOCKET_PATH, { force: true });
-await mkdir(SESSION_DIR, { recursive: true });
+await mkdir(SESSION_DIR, { recursive: true, mode: 0o700 });
+await chmod(SESSION_DIR, 0o700).catch(() => undefined);
 // Keep the daemon lightweight: Mi main pi starts lazily on prompt/state/model requests.
 
 const server = net.createServer((socket) => {
@@ -1503,7 +1509,10 @@ const server = net.createServer((socket) => {
   });
 });
 
-server.listen(SOCKET_PATH, () => log(`listening ${SOCKET_PATH}`));
+server.listen(SOCKET_PATH, () => {
+  chmod(SOCKET_PATH, 0o600).catch(() => undefined);
+  log(`listening ${SOCKET_PATH}`);
+});
 process.on("SIGTERM", async () => {
   if (daemonHeartbeatTimer) clearInterval(daemonHeartbeatTimer);
   server.close();

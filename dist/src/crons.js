@@ -1,10 +1,11 @@
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { notify } from './notify.js';
 import { appendThreadMessage } from './threads.js';
+import { redactSecrets } from './redact.js';
 const HOME = process.env.HOME || homedir();
 const STATE_DIR = join(HOME, 'mi', 'state');
 const CRONS_PATH = join(STATE_DIR, 'crons.json');
@@ -26,7 +27,10 @@ export function intervalToMs(value) {
         return amount * 24 * 60 * 60_000;
     return undefined;
 }
-async function ensureState() { await mkdir(dirname(CRONS_PATH), { recursive: true }); }
+async function ensureState() {
+    await mkdir(dirname(CRONS_PATH), { recursive: true, mode: 0o700 });
+    await chmod(dirname(CRONS_PATH), 0o700).catch(() => undefined);
+}
 export async function readCrons() {
     await ensureState();
     if (!existsSync(CRONS_PATH))
@@ -35,7 +39,8 @@ export async function readCrons() {
 }
 export async function writeCrons(crons) {
     await ensureState();
-    await writeFile(CRONS_PATH, JSON.stringify(crons, null, 2));
+    await writeFile(CRONS_PATH, JSON.stringify(crons, null, 2), { mode: 0o600 });
+    await chmod(CRONS_PATH, 0o600).catch(() => undefined);
 }
 export async function upsertCron(cron) {
     if (cron.every) {
@@ -86,26 +91,80 @@ async function surfaceCronError(cron, output) {
     await appendThreadMessage('main', 'assistant', message, { unread: true, source: 'mi-cron' });
     await notify(`Mi cron error: ${cron.name}`, message).catch(() => ({ skipped: true }));
 }
+function redactOutput(output) {
+    return String(redactSecrets(output));
+}
+function splitCronCommand(command) {
+    const parts = [];
+    let current = '';
+    let quote;
+    let escaped = false;
+    for (const char of command.trim()) {
+        if (escaped) {
+            current += char;
+            escaped = false;
+            continue;
+        }
+        if (char === '\\' && quote !== 'single') {
+            escaped = true;
+            continue;
+        }
+        if (char === "'" && quote !== 'double') {
+            quote = quote === 'single' ? undefined : 'single';
+            continue;
+        }
+        if (char === '"' && quote !== 'single') {
+            quote = quote === 'double' ? undefined : 'double';
+            continue;
+        }
+        if (!quote && /\s/.test(char)) {
+            if (current)
+                parts.push(current);
+            current = '';
+            continue;
+        }
+        current += char;
+    }
+    if (escaped || quote)
+        throw new Error('cron command has unfinished escape or quote');
+    if (current)
+        parts.push(current);
+    if (!parts.length)
+        throw new Error('cron command is empty');
+    if (parts.some((part) => /[;&|`$<>]/.test(part)))
+        throw new Error('cron command contains shell metacharacters; use a simple executable plus args');
+    return { file: parts[0], args: parts.slice(1) };
+}
+function cronEnv() {
+    const keys = ['HOME', 'USER', 'LOGNAME', 'PATH', 'SHELL', 'LANG', 'LC_ALL', 'TERM'];
+    return Object.fromEntries(keys.flatMap((key) => process.env[key] ? [[key, process.env[key]]] : []));
+}
+async function appendCronLog(record) {
+    await ensureState();
+    await appendFile(LOG_PATH, `${JSON.stringify(redactSecrets(record))}\n`, { mode: 0o600 });
+    await chmod(LOG_PATH, 0o600).catch(() => undefined);
+}
 export async function runCron(cron) {
     const startedAt = now();
     if (cron.message && !cron.command) {
         await appendThreadMessage('main', 'assistant', cron.message, { unread: true, source: 'mi-reminder' });
         const sent = await notify('Mi reminder', cron.message).catch(() => ({ skipped: true }));
         const result = { status: 'ok', output: `Reminder: ${cron.message}${sent?.skipped ? ' (notification skipped)' : ''}` };
-        await appendFile(LOG_PATH, `${JSON.stringify({ name: cron.name, startedAt, finishedAt: now(), ...result })}\n`);
+        await appendCronLog({ name: cron.name, startedAt, finishedAt: now(), ...result });
         return result;
     }
     if (!cron.command)
         throw new Error(`cron ${cron.name} has no command`);
+    const { file, args } = splitCronCommand(cron.command);
     const result = await new Promise((resolve) => {
-        const child = spawn(cron.command || '', { cwd: cron.cwd || HOME, shell: true, env: process.env });
+        const child = spawn(file, args, { cwd: cron.cwd || HOME, shell: false, env: cronEnv() });
         let output = '';
         child.stdout.on('data', (data) => { output += data.toString(); });
         child.stderr.on('data', (data) => { output += data.toString(); });
-        child.on('error', (error) => resolve({ status: 'error', output: String(error) }));
-        child.on('close', (code) => resolve({ status: code === 0 ? 'ok' : 'error', output: output.slice(-4000) }));
+        child.on('error', (error) => resolve({ status: 'error', output: redactOutput(String(error)) }));
+        child.on('close', (code) => resolve({ status: code === 0 ? 'ok' : 'error', output: redactOutput(output.slice(-4000)) }));
     });
-    await appendFile(LOG_PATH, `${JSON.stringify({ name: cron.name, startedAt, finishedAt: now(), ...result })}\n`);
+    await appendCronLog({ name: cron.name, startedAt, finishedAt: now(), ...result });
     if (result.status === 'error')
         await surfaceCronError(cron, result.output);
     return result;
@@ -119,7 +178,7 @@ export async function tickCrons() {
         const result = await runCron(cron);
         cron.lastRunAt = now();
         cron.lastStatus = result.status;
-        cron.lastOutput = result.output.slice(-1000);
+        cron.lastOutput = redactOutput(result.output).slice(-1000);
         if (cron.at)
             cron.enabled = false;
         ran.push({ name: cron.name, status: result.status });
