@@ -59,10 +59,7 @@ Inside pi, the Mi extension exposes a single slash command: `/mi`.
 
 ```bash
 /mi             # open the Mi side-channel thread
-/mi <message>   # send a side-channel message to Mi main without sending it to the current pi agent turn
-/mi read        # show unread or recent Mi messages
-/mi inbox       # show Mi threads
-/mi bring-in    # explicitly inject recent Mi context into the current pi conversation
+/mi <message>   # send a side-channel message to Mi
 ```
 
 `/mi <message>` is intentionally minimal: it appends to `state/threads/main.jsonl` and shows a confirmation. It does not steer, interrupt, or add context to the active pi conversation. Bare `mi ...` input is not registered by the extension; use `/mi` instead.
