@@ -17,6 +17,8 @@ import { assistantPath } from './assistant.js';
 import { checkAssistant, runAssistant } from './runner.js';
 import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
+import { runMiCheck } from './proactive.js';
+import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import { readRecentEvents, logEvent } from './state.js';
 import { redactSecrets } from './redact.js';
 import {
@@ -76,6 +78,11 @@ Usage:
   mi temp <title>                 Create/open a temporary conversation
   mi compact [thread]             Compact old read messages in a thread
   mi agents                       Open mi agents live background agent view
+  mi check                        Run one proactive Mi check-in
+  mi cron list                    List Mi cron jobs
+  mi cron check                   Run due Mi cron jobs now
+  mi cron remove <name>           Remove a Mi cron job
+  mi cron add <name> (--every <1h>|--at <iso>) [--cwd <path>] -- <command>
   mi task <name> [--cwd <path>] -- <task prompt>
   mi task reply <task-id-or-name> -- <follow-up prompt>
   mi task list                    List background agent tasks
@@ -83,7 +90,7 @@ Usage:
   mi make <description> [--name <name>]
   mi run <assistant>
   mi edit <assistant> <change>
-  mi check <assistant>
+  mi check <assistant>            Validate an assistant file
   mi logs <assistant> [limit]
 `;
 }
@@ -145,6 +152,13 @@ async function checkCommand(args: string[]) {
   console.log(`${result.path}: ${result.ok ? 'ok' : 'needs work'}`);
   for (const issue of result.issues) console.log(`- ${issue}`);
   if (!result.ok) process.exitCode = 1;
+}
+
+async function proactiveCheckCommand(args: string[]) {
+  const checkIds = args.length > 0 ? args : undefined;
+  const result = await runMiCheck({ checkIds });
+  console.log(result.message);
+  if (result.skipped.length > 0 && result.notices.length === 0) console.log(`Skipped ${result.skipped.length} duplicate notice(s).`);
 }
 
 async function logsCommand(args: string[]) {
@@ -308,9 +322,9 @@ function taskNewestMs(task: MiTask) {
 function taskSectionMovedMs(task: MiTask) {
   const section = taskSection(task);
   const timestamp = section === 'needs input'
-    ? task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt
+    ? task.notifiedNeedsUserAt || task.notifiedPausedAt || task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt
     : section === 'working'
-      ? task.continuedAt || task.updatedAt || task.lastEventAt || task.startedAt
+      ? task.continuedAt || task.startedAt || task.updatedAt || task.lastEventAt
       : task.finishedAt || task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt;
   return Date.parse(timestamp || '') || 0;
 }
@@ -331,7 +345,7 @@ function taskTimeLabel(task: MiTask) {
   const timestamp = section === 'completed'
     ? Date.parse(task.finishedAt || task.updatedAt || task.lastEventAt || '')
     : section === 'needs input'
-      ? Date.parse(task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt || '')
+      ? Date.parse(task.notifiedNeedsUserAt || task.notifiedPausedAt || task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt || '')
       : Date.parse(task.continuedAt || task.startedAt || task.updatedAt || task.lastEventAt || '');
   if (!timestamp) return '';
   return compactDuration(now - timestamp);
@@ -464,7 +478,8 @@ function readSessionOutputSync(sessionFile: string, full = false) {
 function readSessionFinalOutput(sessionFile: string, options: { full?: boolean } = {}) {
   try {
     const raw = readSessionOutputSync(sessionFile, options.full === true);
-    const records = raw.trim().split(/\r?\n/).slice(options.full ? undefined : -160).reverse();
+    const records = raw.trim().split(/\r?\n/).slice(options.full ? undefined : -160);
+    const outputs: string[] = [];
     for (const line of records) {
       let record: any;
       try { record = JSON.parse(line); } catch { continue; }
@@ -472,10 +487,35 @@ function readSessionFinalOutput(sessionFile: string, options: { full?: boolean }
       const content = record.message?.content;
       if (Array.isArray(content) && content.some((part: any) => part?.type === 'toolCall')) continue;
       const text = textFromSessionMessage(record.message).replace(/^thinking:.*$/gmi, '').trim();
-      if (text && !isNonFinalAssistantText(text)) return text;
+      if (text && !isNonFinalAssistantText(text)) outputs.push(text);
     }
+    if (options.full) return outputs.join('\n\n');
+    return outputs.at(-1) || '';
   } catch {}
   return '';
+}
+
+function readSessionFullTranscript(sessionFile: string) {
+  try {
+    const raw = readSessionOutputSync(sessionFile, true);
+    const items: Array<{ role: 'user' | 'assistant'; text: string }> = [];
+    for (const line of raw.trim().split(/\r?\n/)) {
+      let record: any;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (record.type !== 'message') continue;
+      const role = record.message?.role || '';
+      if (role !== 'user' && role !== 'assistant') continue;
+      const content = record.message?.content;
+      if (role === 'assistant' && Array.isArray(content) && content.some((part: any) => part?.type === 'toolCall')) continue;
+      const text = role === 'user'
+        ? normalizeLastInputText(textFromSessionMessage(record.message))
+        : textFromSessionMessage(record.message).replace(/^thinking:.*$/gmi, '').trim();
+      if (!text || isNonFinalAssistantText(text)) continue;
+      items.push({ role, text });
+    }
+    return items;
+  } catch {}
+  return [];
 }
 
 function normalizeLastInputText(text: string) {
@@ -1072,15 +1112,7 @@ async function miAgentsCommand() {
     return tasks
       .map((task, index) => ({ task, index }))
       .filter((item) => taskSection(item.task) === label)
-      .sort((a, b) => {
-        if (label === 'completed') {
-          return taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task);
-        }
-        if (label === 'needs input' || label === 'working') {
-          return taskNewestMs(b.task) - taskNewestMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task);
-        }
-        return taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task);
-      });
+      .sort((a, b) => taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task));
   }
 
   function navigationTaskIndexes() {
@@ -1217,17 +1249,23 @@ async function miAgentsCommand() {
     if (fullLastOutput && task) {
       lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
       lines.push(fgThinking(undefined, '─'.repeat(width)));
-      const lastInput = taskLastInput(task);
+      const lastInput = task.sessionFile ? '' : taskLastInput(task);
       if (lastInput) {
         lines.push('');
         lines.push(...renderPiUserMessage(lastInput, width));
         lines.push('');
       }
-      const outputLines = renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
-      // Like pi: render the last input, then the whole output above the normal
-      // input footer instead of fitting it into an internal viewport. The
-      // terminal/tmux scrollback owns scrolling; because the footer is last,
-      // the visible screen lands at the latest output with input still usable.
+      const transcript = task.sessionFile ? readSessionFullTranscript(task.sessionFile) : [];
+      const outputLines = transcript.length > 0
+        ? transcript.flatMap((item, index) => [
+            ...(index > 0 ? [''] : []),
+            ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
+          ])
+        : renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
+      // Like pi: render the conversation above the normal input footer instead
+      // of fitting it into an internal viewport. The terminal/tmux scrollback
+      // owns scrolling; because the footer is last, the visible screen lands at
+      // the latest output with input still usable.
       lines.push(...outputLines);
       lines.push(...footerLines);
       return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
@@ -1940,6 +1978,8 @@ type MiTask = {
   lastEventAt?: string;
   needsUser?: boolean;
   needsUserReason?: string;
+  notifiedNeedsUserAt?: string;
+  notifiedPausedAt?: string;
   prUrls?: string[];
   sessionFile?: string;
   actualSessionFile?: string;
@@ -2336,6 +2376,7 @@ const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
 
 let modelAutocompleteCache: { loadedAt: number; models: any[] } | undefined;
 let piResourceCommandCache: { loadedAt: number; cwd: string; commands: SlashCommand[] } | undefined;
+let piResourceCommandLoad: Promise<SlashCommand[]> | undefined;
 
 function prefixPiResourceDescription(description: string | undefined, sourceInfo: any) {
   const scope = sourceInfo?.scope;
@@ -2345,9 +2386,7 @@ function prefixPiResourceDescription(description: string | undefined, sourceInfo
   return description ? `[${tag}] ${description}` : `[${tag}]`;
 }
 
-async function getPiResourceSlashCommands(cwd = process.cwd()): Promise<SlashCommand[]> {
-  const now = Date.now();
-  if (piResourceCommandCache && piResourceCommandCache.cwd === cwd && now - piResourceCommandCache.loadedAt < 30_000) return piResourceCommandCache.commands;
+async function loadPiResourceSlashCommands(cwd = process.cwd()): Promise<SlashCommand[]> {
   const services = await createAgentSessionServices({ cwd, authStorage: AuthStorage.create() });
   const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory() });
   const builtinNames = new Set(PI_SLASH_COMMANDS.map((command) => command.replace(/^\//, '')));
@@ -2369,8 +2408,22 @@ async function getPiResourceSlashCommands(cwd = process.cwd()): Promise<SlashCom
       description: prefixPiResourceDescription(skill.description, skill.sourceInfo),
     }))
     : [];
-  piResourceCommandCache = { loadedAt: now, cwd, commands: [...templateCommands, ...extensionCommands, ...skillCommands] };
+  piResourceCommandCache = { loadedAt: Date.now(), cwd, commands: [...templateCommands, ...extensionCommands, ...skillCommands] };
   return piResourceCommandCache.commands;
+}
+
+function getCachedPiResourceSlashCommands(cwd = process.cwd()): SlashCommand[] {
+  const now = Date.now();
+  if (piResourceCommandCache && piResourceCommandCache.cwd === cwd && now - piResourceCommandCache.loadedAt < 30_000) return piResourceCommandCache.commands;
+  if (!piResourceCommandLoad) {
+    piResourceCommandLoad = new Promise<SlashCommand[]>((resolve) => {
+      // Defer Pi service/resource loading until after the current keypress can
+      // render. createAgentSessionServices does some synchronous startup work
+      // before its first await, which made typing the initial "/" feel sticky.
+      setTimeout(() => { void loadPiResourceSlashCommands(cwd).then(resolve, () => resolve([])); }, 0);
+    }).finally(() => { piResourceCommandLoad = undefined; });
+  }
+  return piResourceCommandCache?.cwd === cwd ? piResourceCommandCache.commands : [];
 }
 
 async function getPiScopedModels(settingsManager = SettingsManager.create(process.cwd()), modelRegistry = ModelRegistry.create(AuthStorage.create())) {
@@ -2422,7 +2475,7 @@ function createPiSlashAutocompleteProvider(commands = PI_SLASH_COMMANDS) {
   const baseProvider = new CombinedAutocompleteProvider(slashCommands, process.cwd());
   return {
     async getSuggestions(lines: string[], cursorLine: number, cursorCol: number, options: { signal: AbortSignal; force?: boolean }) {
-      const resourceCommands = await getPiResourceSlashCommands(process.cwd()).catch(() => []);
+      const resourceCommands = getCachedPiResourceSlashCommands(process.cwd());
       if (resourceCommands.length === 0) return baseProvider.getSuggestions(lines, cursorLine, cursorCol, options);
       return new CombinedAutocompleteProvider([...slashCommands, ...resourceCommands], process.cwd()).getSuggestions(lines, cursorLine, cursorCol, options);
     },
@@ -2842,7 +2895,7 @@ async function miTuiCommand(initial = '') {
   async function startBackgroundWorkerFromMi(text: string) {
     const name = taskNameFromPrompt(text);
     const message = await buildBackgroundWorkerPromptFromMi(text);
-    const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message, lastInput: text, background: true }, 30000);
+    const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message, lastInput: text, background: true, reportToMain: true }, 30000);
     return result.text || `Started background task: ${name}.`;
   }
 
@@ -3303,6 +3356,58 @@ async function launchPiMain(args: string[]) {
   });
 }
 
+async function cronCommand(args: string[]) {
+  const subcommand = args[0] || 'list';
+  if (subcommand === 'list') {
+    const crons = await readCrons();
+    const paths = cronPaths();
+    if (crons.length === 0) {
+      console.log(`No Mi crons configured. State: ${paths.cronsPath}`);
+      return;
+    }
+    for (const cron of crons) {
+      const schedule = cron.every ? `every ${cron.every}` : `at ${cron.at}`;
+      const status = cron.enabled ? 'enabled' : 'disabled';
+      const last = cron.lastRunAt ? ` last=${cron.lastRunAt} ${cron.lastStatus || ''}`.trimEnd() : ' never-run';
+      console.log(`${cron.name}\t${status}\t${schedule}\t${last}`);
+    }
+    console.log(`State: ${paths.cronsPath}`);
+    console.log(`Log: ${paths.logPath}`);
+    return;
+  }
+  if (subcommand === 'check' || subcommand === 'tick') {
+    const ran = await tickCrons();
+    if (ran.length === 0) console.log('No due Mi crons.');
+    else for (const item of ran) console.log(`${item.name}: ${item.status}`);
+    return;
+  }
+  if (subcommand === 'remove' || subcommand === 'delete' || subcommand === 'rm') {
+    const name = args[1];
+    if (!name) throw new Error('cron name required');
+    const removed = await removeCron(name);
+    console.log(removed ? `Removed ${name}` : `No cron named ${name}`);
+    return;
+  }
+  if (subcommand === 'add') {
+    const rest = args.slice(1);
+    const separator = rest.indexOf('--');
+    const meta = separator === -1 ? rest : rest.slice(0, separator);
+    const commandParts = separator === -1 ? [] : rest.slice(separator + 1);
+    const name = meta[0];
+    if (!name) throw new Error('cron name required');
+    const every = argValue(meta, '--every');
+    const at = argValue(meta, '--at');
+    const cwd = argValue(meta, '--cwd');
+    const enabled = !meta.includes('--disabled');
+    if (Boolean(every) === Boolean(at)) throw new Error('provide exactly one of --every or --at');
+    if (commandParts.length === 0) throw new Error('cron command required after --');
+    const cron = await upsertCron({ name, every, at, cwd, enabled, command: commandParts.join(' ') });
+    console.log(`Saved ${cron.name}`);
+    return;
+  }
+  throw new Error(`unknown cron command: ${subcommand}`);
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) return miTuiCommand('');
@@ -3320,6 +3425,8 @@ async function main() {
   if (command === 'temp') return tempCommand(args);
   if (command === 'compact') return compactCommand(args);
   if (command === 'agents') return miAgentsCommand();
+  if (command === 'check' && (args.length === 0 || ['all', 'pendingApprovals', 'failedCrons', 'dailyBrief', 'pending-approvals', 'approval-reminders', 'failed-crons', 'crons', 'daily-brief', 'brief'].includes(args[0]))) return proactiveCheckCommand(args);
+  if (command === 'cron') return cronCommand(args);
   if (command === 'task') return taskCommand(args);
   if (command === 'make') return makeCommand(args);
   if (command === 'run') return runCommand(args);

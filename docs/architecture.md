@@ -37,6 +37,12 @@ The current private implementation uses these runtime components under the two p
    - `pi.inspect` is read-only and constrained to safe read/search tools.
    - `pi.repair` is defined as the code-changing worker but disabled by default; it requires approval before enabling.
 
+3. **`mi check`**
+   - One proactive check-in, not an agent platform.
+   - Shape: read state → run checks → dedupe → append message → maybe notify.
+   - Default checks are `pendingApprovals`, `failedCrons`, and `dailyBrief`.
+   - It creates awareness only: notices, summaries, nudges, and notifications. It never acts.
+
 ## Core primitives
 
 Mi core intentionally exposes only five primitives:
@@ -47,7 +53,7 @@ Mi core intentionally exposes only five primitives:
 - **Worker**: a short-lived AI process that does one job. The first worker backend is pi.
 - **Run**: a durable record of what happened: timestamp, trigger, assistant, tool calls, worker results, approvals, status, and final report.
 
-These primitives live in `src/primitives.ts`. Run records are written to `state/runs/<run-id>.json` and `state/runs.jsonl`. Service-specific behavior belongs in installable tool packages, not the core.
+These primitives live in `src/primitives.ts`. Run records are written to `state/runs/<run-id>.json` and `state/runs.jsonl`. Proactive observations are logged in Mi-owned local state (`state/events.jsonl` and `state/proactive-dedupe.json`). Service-specific behavior belongs in installable tool packages, not the core.
 
 ## Routing policy
 
@@ -59,13 +65,14 @@ The current routing classifier returns one of three modes:
 
 ## Safety model
 
-Safety is enforced in `src/safety.ts` and at runner boundaries:
+Safety is enforced in `src/safety.ts`, `src/proactive.ts`, and at runner boundaries:
 
 - Assistants are read-only by default.
 - Tools or permissions that imply write/deploy/merge/delete/DNS/secret changes require approval.
 - `pi.inspect` is read-only.
 - `pi.repair` always requires an explicit approval gate before code-changing worker runs.
 - Runtime assistants cannot silently rewrite `assistants/*.md`; they may only suggest instruction changes.
+- Proactive Mi creates awareness only. It appends observations and may notify, but it does not inspect with pi, start workers, edit files, deploy, merge, delete, change config, or approve anything.
 - Builder edits are reviewable file changes.
 
 ## Safety boundary
