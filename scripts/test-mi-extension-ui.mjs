@@ -15,6 +15,8 @@ const checks = [
   ['Mi-like separator and status line below input', /lines\.push\(this\.theme\.fg\("accent", truncateToWidth\("─"\.repeat\(width\)/],
   ['queued input is accepted while pending', /private messageQueue: string\[\][\s\S]*private enqueue\(text: string\)/],
   ['timers are cleaned up on close', /private close\(\)[\s\S]*clearInterval\(this\.threadPollTimer\)/],
+  ['pi sessions expose a live bridge socket', /function piBridgeSocketPath\(sessionFile: string\)[\s\S]*async function startPiSessionBridge\(pi: ExtensionAPI, ctx: any\)[\s\S]*type === "send_user_message"[\s\S]*pi\.sendUserMessage/],
+  ['pi session events publish to Mi daemon', /function publishPiSessionEvent\(ctx: any[\s\S]*type: "pi_session_event"[\s\S]*pi\.on\("agent_start"[\s\S]*pi\.on\("agent_end"/],
 ];
 
 const failures = checks.filter(([, pattern]) => !pattern.test(source));

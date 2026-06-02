@@ -10,7 +10,8 @@ import {
 import { Key, matchesKey, truncateToWidth, type Component, type Focusable, type TUI } from "@mariozechner/pi-tui";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { appendFile, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -23,6 +24,7 @@ const MAIN_THREAD_ID = "main";
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, ".pi", "agent", "mi");
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, "main.sock");
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, ".pi", "agent", "extensions", "mi-daemon.mjs");
+const MI_PI_BRIDGE_DIR = join(MI_RUNTIME_DIR, "pi-bridges");
 const MI_TASKS_DIR = join(HOME, "mi");
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, "preferences.md");
 const PI_SESSION_DIR = join(HOME, ".pi", "agent", "sessions");
@@ -540,7 +542,205 @@ async function showMiThread(initial: string, ctx: ExtensionCommandContext) {
 	});
 }
 
+function piBridgeSocketPath(sessionFile: string) {
+	const hash = createHash("sha1").update(sessionFile).digest("hex");
+	return join(MI_PI_BRIDGE_DIR, `${hash}.sock`);
+}
+
+function socketRequestPath(socketPath: string, payload: unknown, timeoutMs = 800): Promise<any> {
+	return new Promise((resolve, reject) => {
+		const socket = net.createConnection(socketPath);
+		let data = "";
+		const timer = setTimeout(() => {
+			socket.destroy();
+			reject(new Error("Timed out waiting for pi bridge"));
+		}, timeoutMs);
+		socket.on("connect", () => socket.write(`${JSON.stringify(payload)}\n`));
+		socket.on("data", (chunk) => {
+			data += chunk.toString("utf8");
+			if (!data.includes("\n")) return;
+			clearTimeout(timer);
+			socket.end();
+			try {
+				const response = JSON.parse(data.slice(0, data.indexOf("\n")));
+				response.ok ? resolve(response) : reject(new Error(response.error || "pi bridge returned an error"));
+			} catch (error) {
+				reject(error);
+			}
+		});
+		socket.on("error", (error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
+	});
+}
+
+async function bridgeSocketIsAlive(socketPath: string) {
+	try {
+		await socketRequestPath(socketPath, { type: "health" }, 500);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function sendDaemonEvent(payload: Record<string, unknown>) {
+	if (!existsSync(MI_SOCKET_PATH)) return;
+	const socket = net.createConnection(MI_SOCKET_PATH);
+	const timer = setTimeout(() => socket.destroy(), 1000);
+	socket.on("connect", () => socket.write(`${JSON.stringify(payload)}\n`));
+	socket.on("data", () => {
+		clearTimeout(timer);
+		socket.end();
+	});
+	socket.on("error", () => clearTimeout(timer));
+}
+
+function sessionEventText(event: any) {
+	return messageText(event?.message || event);
+}
+
+function sessionEventRole(event: any) {
+	return messageRole(event?.message || event);
+}
+
+function lastAssistantTextFromMessages(messages: unknown[] = []) {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (messageRole(message) !== "assistant") continue;
+		const text = messageText(message);
+		if (text) return text;
+	}
+	return "";
+}
+
+async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
+	if (process.env.MI_MAIN === "1") return;
+	const sessionFile = ctx.sessionManager.getSessionFile?.();
+	if (!sessionFile) return;
+	await mkdir(MI_PI_BRIDGE_DIR, { recursive: true });
+	const socketPath = piBridgeSocketPath(sessionFile);
+	if (existsSync(socketPath)) {
+		if (await bridgeSocketIsAlive(socketPath)) return;
+		await rm(socketPath, { force: true }).catch(() => undefined);
+	}
+	const server = net.createServer((socket) => {
+		let data = "";
+		socket.on("data", (chunk) => {
+			data += chunk.toString("utf8");
+			if (!data.includes("\n")) return;
+			const line = data.slice(0, data.indexOf("\n"));
+			let request: any;
+			try { request = JSON.parse(line); } catch (error) { socket.end(JSON.stringify({ ok: false, error: String(error instanceof Error ? error.message : error) }) + "\n"); return; }
+			try {
+				if (request.type === "health") {
+					socket.end(JSON.stringify({ ok: true, pid: process.pid, sessionFile }) + "\n");
+					return;
+				}
+				if (Number(request.sourcePid || 0) === process.pid) {
+					socket.end(JSON.stringify({ ok: true, ignored: true }) + "\n");
+					return;
+				}
+				if (request.type === "send_user_message") {
+					const text = String(request.message || "").trim();
+					if (!text) throw new Error("Message is empty");
+					if (/^\/[A-Za-z][\w:-]*(?:\s|$)/.test(text)) throw new Error("Slash commands must be delivered through the terminal input path");
+					const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
+					const deliverAs = request.deliverAs === "followUp" ? "followUp" : "steer";
+					if (idle) pi.sendUserMessage(text);
+					else pi.sendUserMessage(text, { deliverAs } as any);
+					socket.end(JSON.stringify({ ok: true }) + "\n");
+					return;
+				}
+				if (request.type === "mirror_message") {
+					const text = String(request.message || "").trim();
+					if (text) {
+						ctx.ui.notify(`${request.role === "user" ? "External user" : "External update"}: ${text.slice(0, 500)}`, "info");
+						pi.sendMessage({ customType: "mi-sync", content: `${request.role === "user" ? "External user message" : "External session update"}:\n\n${text}`, display: true, details: { source: "mi-sync", role: request.role } } as any, { deliverAs: "nextTurn" } as any);
+					}
+					socket.end(JSON.stringify({ ok: true }) + "\n");
+					return;
+				}
+				throw new Error(`Unknown pi bridge request: ${request.type}`);
+			} catch (error) {
+				socket.end(JSON.stringify({ ok: false, error: String(error instanceof Error ? error.message : error) }) + "\n");
+			}
+		});
+	});
+	server.on("error", () => undefined);
+	server.listen(socketPath);
+	(pi as any).__miBridgeServer = server;
+	(pi as any).__miBridgeSocketPath = socketPath;
+}
+
+function stopPiSessionBridge(pi: ExtensionAPI) {
+	const server = (pi as any).__miBridgeServer as net.Server | undefined;
+	const socketPath = (pi as any).__miBridgeSocketPath as string | undefined;
+	(pi as any).__miBridgeServer = undefined;
+	(pi as any).__miBridgeSocketPath = undefined;
+	server?.close();
+	if (socketPath) void rm(socketPath, { force: true }).catch(() => undefined);
+}
+
+function publishPiSessionEvent(ctx: any, event: Record<string, unknown>) {
+	if (process.env.MI_MAIN === "1") return;
+	const sessionFile = ctx.sessionManager.getSessionFile?.();
+	if (!sessionFile) return;
+	sendDaemonEvent({
+		type: "pi_session_event",
+		sessionFile,
+		cwd: ctx.cwd,
+		pid: process.pid,
+		bridgeSocket: piBridgeSocketPath(sessionFile),
+		at: new Date().toISOString(),
+		...event,
+	});
+}
+
 export default function miExtension(pi: ExtensionAPI) {
+	let assistantProgress = "";
+	let lastProgressPublish = 0;
+
+	pi.on("session_start", async (_event, ctx) => {
+		await startPiSessionBridge(pi, ctx).catch(() => undefined);
+		publishPiSessionEvent(ctx, { kind: "session_start", status: "running", progress: "pi session connected" });
+	});
+
+	pi.on("session_shutdown", async () => {
+		stopPiSessionBridge(pi);
+	});
+
+	pi.on("agent_start", async (_event, ctx) => {
+		assistantProgress = "";
+		publishPiSessionEvent(ctx, { kind: "agent_start", status: "running", progress: "thinking" });
+	});
+
+	pi.on("message_start", async (event, ctx) => {
+		const role = sessionEventRole(event);
+		if (role !== "user") return;
+		const text = sessionEventText(event);
+		publishPiSessionEvent(ctx, { kind: "user_message", status: "running", role, text, lastInput: text });
+	});
+
+	pi.on("message_update", async (event: any, ctx) => {
+		const delta = String(event?.assistantMessageEvent?.delta || "");
+		if (!delta) return;
+		assistantProgress = `${assistantProgress}${delta}`.replace(/\s+/g, " ").trim().slice(-500);
+		const nowMs = Date.now();
+		if (nowMs - lastProgressPublish < 1000) return;
+		lastProgressPublish = nowMs;
+		publishPiSessionEvent(ctx, { kind: "assistant_delta", status: "running", role: "assistant", progress: assistantProgress });
+	});
+
+	pi.on("tool_execution_start", async (event: any, ctx) => {
+		publishPiSessionEvent(ctx, { kind: "tool_start", status: "running", progress: `tool: ${String(event.toolName || "tool")}` });
+	});
+
+	pi.on("agent_end", async (event: any, ctx) => {
+		const text = lastAssistantTextFromMessages(event.messages || []);
+		publishPiSessionEvent(ctx, { kind: "agent_end", status: "complete", role: "assistant", text, progress: text || "completed" });
+	});
+
 	if (process.env.MI_MAIN === "1") {
 		pi.on("session_start", async (_event, ctx) => {
 			pi.setSessionName("Mi: main");
