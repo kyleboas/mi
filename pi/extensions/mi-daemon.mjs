@@ -444,8 +444,10 @@ async function listPiSessionTasks() {
   const tasks = parsedTasks.map((task) => {
     const openPiSession = openPiSessions.get(task.sessionFile);
     const status = String(task.status || "").toLowerCase();
-    if (openPiSession && ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
-      return { ...task, status: "running", finishedAt: undefined, openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput };
+    if (openPiSession) {
+      const openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput };
+      if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) return { ...task, ...openFields, status: "running", finishedAt: undefined };
+      return { ...task, ...openFields };
     }
     if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
       return enrichTask({
