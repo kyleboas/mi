@@ -90,12 +90,15 @@ try {
 
   const workingSortTasksPath = join(root, 'working-sort-tasks.json');
   await writeFile(workingSortTasksPath, JSON.stringify([
-    { id: 'needs-oldest-update', name: 'render-needs-old', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(30000), updatedAt: iso(30000) },
-    { id: 'needs-newest-update', name: 'render-needs-new', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(1000), updatedAt: iso(40000) },
-    { id: 'needs-middle-update', name: 'render-needs-mid', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(20000), updatedAt: iso(35000) },
-    { id: 'working-oldest-update', name: 'render-work-old', status: 'running', startedAt: iso(30000), updatedAt: iso(30000) },
-    { id: 'working-newest-update', name: 'render-work-new', status: 'running', startedAt: iso(1000), updatedAt: iso(40000) },
-    { id: 'working-middle-update', name: 'render-work-mid', status: 'running', startedAt: iso(20000), updatedAt: iso(35000) },
+    { id: 'needs-oldest-transition', name: 'render-needs-old', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(30000), updatedAt: iso(90000), notifiedNeedsUserAt: iso(30000) },
+    { id: 'needs-newest-transition', name: 'render-needs-new', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(1000), updatedAt: iso(40000), notifiedNeedsUserAt: iso(50000) },
+    { id: 'needs-middle-transition', name: 'render-needs-mid', status: 'paused', needsUser: true, needsUserReason: 'needs reply', startedAt: iso(20000), updatedAt: iso(100000), notifiedNeedsUserAt: iso(45000) },
+    { id: 'working-oldest-start', name: 'render-work-old', status: 'running', startedAt: iso(10000), updatedAt: iso(70000) },
+    { id: 'working-newest-start', name: 'render-work-new', status: 'running', startedAt: iso(30000), updatedAt: iso(31000) },
+    { id: 'working-middle-start', name: 'render-work-mid', status: 'running', startedAt: iso(20000), updatedAt: iso(60000) },
+    { id: 'completed-oldest-finish', name: 'render-done-old', status: 'complete', startedAt: iso(10000), updatedAt: iso(90000), finishedAt: iso(30000), text: 'old done' },
+    { id: 'completed-newest-finish', name: 'render-done-new', status: 'complete', startedAt: iso(1000), updatedAt: iso(40000), finishedAt: iso(50000), text: 'new done' },
+    { id: 'completed-middle-finish', name: 'render-done-mid', status: 'complete', startedAt: iso(20000), updatedAt: iso(100000), finishedAt: iso(45000), text: 'mid done' },
   ], null, 2));
   const workingSortResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
     cwd: new URL('..', import.meta.url),
@@ -104,7 +107,7 @@ try {
       MI_AGENT_RENDER_TEST: '1',
       MI_AGENT_RENDER_TEST_TASKS: workingSortTasksPath,
       MI_AGENT_RENDER_TEST_EVENTS: '',
-      MI_AGENT_RENDER_TEST_ROWS: '18',
+      MI_AGENT_RENDER_TEST_ROWS: '26',
       MI_AGENT_RENDER_TEST_COLS: '80',
     },
     encoding: 'utf8',
@@ -117,14 +120,22 @@ try {
       < workingSortRows.findIndex((line) => line.includes('render-needs-mid'))
       && workingSortRows.findIndex((line) => line.includes('render-needs-mid'))
       < workingSortRows.findIndex((line) => line.includes('render-needs-old')),
-    'needs input section sorts newest activity at top and oldest at bottom',
+    'needs input section sorts newest needs-input transition at top and oldest at bottom, even when updatedAt differs',
   );
   assert.ok(
     workingSortRows.findIndex((line) => line.includes('render-work-new'))
       < workingSortRows.findIndex((line) => line.includes('render-work-mid'))
       && workingSortRows.findIndex((line) => line.includes('render-work-mid'))
       < workingSortRows.findIndex((line) => line.includes('render-work-old')),
-    'working section sorts newest activity at top and oldest at bottom',
+    'working section sorts newest task start/continuation at top and oldest at bottom, even when updatedAt differs',
+  );
+
+  assert.ok(
+    workingSortRows.findIndex((line) => line.includes('render-done-new'))
+      < workingSortRows.findIndex((line) => line.includes('render-done-mid'))
+      && workingSortRows.findIndex((line) => line.includes('render-done-mid'))
+      < workingSortRows.findIndex((line) => line.includes('render-done-old')),
+    'completed section sorts newest finish at top and oldest at bottom, even when updatedAt differs',
   );
 
   assert.equal(snapshot.frames[1].selectedTask, 'render-done-01', 'PageDown moves selection through task rows');

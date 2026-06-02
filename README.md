@@ -1,10 +1,11 @@
 # Mi
 
-Mi is a small local assistant interface built around three surfaces only:
+Mi is a small local assistant interface built around four surfaces only:
 
 1. `mi` — the main Mi conversation.
 2. `mi agents` — the live background-agent view.
-3. the Mi pi extension — side-channel Mi commands inside pi.
+3. `mi check` — one minimal proactive check-in.
+4. the Mi pi extension — side-channel Mi commands inside pi.
 
 Everything else in this repo exists to support those surfaces.
 
@@ -70,6 +71,24 @@ Useful in-view commands:
 - `/mi <question>` asks Mi main about the selected task context without steering the worker.
 
 Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged `mi agents` view so tasks do not disappear unless cleared.
+
+## `mi check`
+
+`mi check` is the minimal proactive loop. It reads local Mi state, runs a small fixed set of checks, dedupes repeated observations, appends one useful message to the main Mi thread, and optionally sends a notification.
+
+Shape: read state → run checks → dedupe → append message → maybe notify.
+
+Default checks:
+
+- `pendingApprovals`
+- `failedCrons`
+- `dailyBrief`
+
+It never repairs, inspects with pi, starts workers, edits files, deploys, merges, deletes, changes config, or approves anything. Every proactive message ends with `No action taken.`
+
+```bash
+mi check
+```
 
 ## Mi pi extension
 

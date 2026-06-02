@@ -8,10 +8,11 @@ Product definition:
 assistant = instructions + trigger + tools + permissions
 ```
 
-Mi is not a DevOps platform, workflow builder, or repair bot. It is the event-started companion to pi:
+Mi is not a DevOps platform, workflow builder, or repair bot. Its minimal proactive mode only notices, summarizes, and nudges:
 
 - pi starts when you ask.
-- Mi starts when something happens.
+- Mi can check local signals and tell you what it noticed.
+- Proactive Mi does not act on its own.
 
 ## Product layers
 
@@ -80,9 +81,10 @@ Keep the public Mi surface small:
 ```bash
 mi          # open Mi chat
 mi agents   # open the live background-agent view
+mi check    # check local Mi state and report observations
 ```
 
-From this repo before install, use `npm run mi --` and `npm run mi -- agents`.
+From this repo before install, use `npm run mi --`, `npm run mi -- agents`, and `npm run mi -- check`.
 
 Other lower-level/debug commands may exist in the CLI, but docs and user flows should point to `mi` for chat and `mi agents` for background work.
 
