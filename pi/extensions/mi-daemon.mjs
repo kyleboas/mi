@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import net from "node:net";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { appendFile, chmod, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
@@ -25,6 +26,7 @@ const MI_DAEMON_LOCK_START_GRACE_MS = Number(process.env.MI_DAEMON_LOCK_START_GR
 const MI_DAEMON_LOCK_STALE_MS = Number(process.env.MI_DAEMON_LOCK_STALE_MS || 120000);
 const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_MS || 2000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
+const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const THREAD_INDEX_PATH = join(THREADS_DIR, "index.json");
 const NICE_BIN = process.env.MI_NICE_BIN || "/usr/bin/nice";
@@ -445,7 +447,7 @@ async function listPiSessionTasks() {
     const openPiSession = openPiSessions.get(task.sessionFile);
     const status = String(task.status || "").toLowerCase();
     if (openPiSession) {
-      const openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput };
+      const openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput, bridgeSocket: piBridgeSocketPath(task.actualSessionFile || task.sessionFile) };
       if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) return { ...task, ...openFields, status: "running", finishedAt: undefined };
       return { ...task, ...openFields };
     }
@@ -1297,6 +1299,56 @@ async function runWorker(request) {
   }
 }
 
+function piBridgeSocketPath(sessionFile) {
+  return join(MI_PI_BRIDGE_DIR, `${createHash("sha1").update(String(sessionFile || "")).digest("hex")}.sock`);
+}
+
+function sendBridgeRequest(socketPath, payload, timeoutMs = 1500) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    let data = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("Timed out waiting for pi bridge"));
+    }, timeoutMs);
+    socket.on("connect", () => socket.write(`${JSON.stringify(payload)}\n`));
+    socket.on("data", (chunk) => {
+      data += chunk.toString("utf8");
+      if (!data.includes("\n")) return;
+      clearTimeout(timer);
+      socket.end();
+      try {
+        const response = JSON.parse(data.slice(0, data.indexOf("\n")));
+        response.ok ? resolve(response) : reject(new Error(response.error || "pi bridge returned an error"));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    socket.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+async function sendMessageIntoPiBridge(task, message, deliverAs = "steer") {
+  const sessionFile = task.actualSessionFile || task.sessionFile;
+  if (!sessionFile || isSlashCommand(message)) return false;
+  const socketPath = task.bridgeSocket || piBridgeSocketPath(sessionFile);
+  if (!existsSync(socketPath)) return false;
+  await sendBridgeRequest(socketPath, { type: "send_user_message", message, deliverAs, source: "mi-agents", sourcePid: process.pid });
+  return true;
+}
+
+async function mirrorMessageIntoPiBridge(task, message, role = "user", sourcePid) {
+  const sessionFile = task.actualSessionFile || task.sessionFile;
+  if (!sessionFile || !message) return false;
+  const socketPath = task.bridgeSocket || piBridgeSocketPath(sessionFile);
+  if (!existsSync(socketPath)) return false;
+  await sendBridgeRequest(socketPath, { type: "mirror_message", message, role, source: "mi-daemon", sourcePid });
+  return true;
+}
+
 function sanitizeTerminalPaste(text) {
   return String(text || "")
     .replace(/\r\n?/g, "\n")
@@ -1305,13 +1357,14 @@ function sanitizeTerminalPaste(text) {
 }
 
 async function queueMessageIntoOpenPiSession(task, message) {
+  const body = sanitizeTerminalPaste(message);
+  if (!body) throw new Error("Message is empty");
+  if (await sendMessageIntoPiBridge(task, body).catch(() => false)) return true;
   const input = String(task.openPiInput || "");
   if (!task.openPiSession || !input) return false;
   if (!input.startsWith("/dev/pts/") && !input.startsWith("/dev/tty")) throw new Error(`Open Pi session has no safe terminal input path: ${task.name || task.id}`);
   const pid = Number(task.openPiPid || 0);
   if (pid && !existsSync(`/proc/${pid}`)) return false;
-  const body = sanitizeTerminalPaste(message);
-  if (!body) throw new Error("Message is empty");
   await appendFile(input, `\x1b[200~${body}\x1b[201~\r`);
   return true;
 }
@@ -1385,6 +1438,41 @@ async function continueWorker(request) {
   }
 }
 
+async function handlePiSessionEvent(request) {
+  const sessionFile = String(request.sessionFile || "").trim();
+  if (!sessionFile) throw new Error("sessionFile required");
+  const tasks = await readTasks();
+  const existing = tasks.find((task) => task.sessionFile === sessionFile || task.actualSessionFile === sessionFile || sessionFingerprint(task) === sessionFingerprint({ sessionFile }));
+  const text = String(request.text || "").trim();
+  const progress = String(request.progress || text || "pi session activity").trim().slice(0, 500);
+  const status = String(request.status || existing?.status || "running").trim();
+  const isComplete = ["complete", "completed", "done"].includes(status.toLowerCase());
+  const task = await upsertTask({
+    ...(existing || {}),
+    id: existing?.id || `pi-session:${request.sessionId || sessionFile}`,
+    name: existing?.name || existing?.sessionName || (text ? taskNameFromText(text) : "Pi session"),
+    cwd: request.cwd || existing?.cwd || HOME,
+    source: "pi-session",
+    status: isComplete ? "complete" : "running",
+    startedAt: existing?.startedAt || request.at || new Date().toISOString(),
+    updatedAt: request.at || new Date().toISOString(),
+    lastEventAt: request.at || new Date().toISOString(),
+    finishedAt: isComplete ? (request.at || new Date().toISOString()) : undefined,
+    text: isComplete && text ? text : existing?.text,
+    progress,
+    sessionFile,
+    actualSessionFile: sessionFile,
+    sessionId: request.sessionId || existing?.sessionId,
+    sessionName: existing?.sessionName || existing?.name,
+    openPiSession: true,
+    openPiPid: request.pid || existing?.openPiPid,
+    bridgeSocket: request.bridgeSocket || piBridgeSocketPath(sessionFile),
+    lastInput: request.lastInput || existing?.lastInput,
+  });
+  if (request.kind === "user_message" && text) await mirrorMessageIntoPiBridge(task, text, "user", Number(request.pid || 0)).catch(() => false);
+  return { text: "Recorded pi session event", taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: task.sessionName || task.name };
+}
+
 async function handle(socket, request) {
   if (request.type === "prompt") {
     const message = String(request.message || "").trim();
@@ -1395,6 +1483,11 @@ async function handle(socket, request) {
   }
   if (request.type === "health") {
     socket.end(JSON.stringify({ ok: true, pi: !!piProc && !piProc.killed }) + "\n");
+    return;
+  }
+  if (request.type === "pi_session_event") {
+    const result = await handlePiSessionEvent(request);
+    socket.end(JSON.stringify({ ok: true, ...result }) + "\n");
     return;
   }
   if (request.type === "abort") {
