@@ -194,7 +194,7 @@ function taskDismissKeys(task) {
 
 function taskPersistentDismissKeys(task) {
   const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
-  if (isPiSession) return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId].filter(Boolean).map(String);
+  if (isPiSession) return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, task?.sessionName, task?.name].filter(Boolean).map(String);
   return taskDismissKeys(task);
 }
 
@@ -798,13 +798,14 @@ async function upsertTask(task) {
   const taskIsPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
   const index = tasks.findIndex((entry) => entry.id === task.id || sameLogicalTask(entry, task));
   const previous = index >= 0 ? tasks[index] : undefined;
-  const next = enrichTask({ ...task, updatedAt: new Date().toISOString() });
+  const nowIso = new Date().toISOString();
+  const next = enrichTask({ ...task, updatedAt: nowIso });
   const merged = index >= 0 ? enrichTask({ ...previous, ...next }) : next;
-  if (merged.needsUser && !previous?.notifiedNeedsUserAt) {
-    merged.notifiedNeedsUserAt = new Date().toISOString();
+  if (merged.needsUser && !previous?.needsUser) {
+    merged.notifiedNeedsUserAt = nowIso;
   }
-  if (merged.status === "paused" && previous?.status !== "paused" && !previous?.notifiedPausedAt) {
-    merged.notifiedPausedAt = new Date().toISOString();
+  if (merged.status === "paused" && previous?.status !== "paused") {
+    merged.notifiedPausedAt = nowIso;
   }
   if (index >= 0) tasks[index] = merged;
   else tasks.unshift(merged);
@@ -1165,13 +1166,14 @@ function installTaskHeartbeat(worker, task) {
   });
 }
 
-async function finishTask({ task, worker, before, sessionFile, name, done, kind }) {
+async function finishTask({ task, worker, before, sessionFile, name, done, kind, reportToMain = false }) {
   try {
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
     const text = lastAssistantText(end.messages) || "Worker completed without text.";
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
     await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model });
+    if (reportToMain) await appendMainThreadMessage(text, "mi-worker-result");
   } catch (error) {
     if (worker.expectedStop) {
       await log(`worker_expected_stop ${name}`);
@@ -1268,7 +1270,7 @@ async function runWorker(request) {
     await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
     if (request.background) {
       trackActiveWorker(task, name, worker);
-      void finishTask({ task, worker, before, name, done, kind: "Task complete" });
+      void finishTask({ task, worker, before, name, done, kind: "Task complete", reportToMain: Boolean(request.reportToMain) });
       return { text: `Started background task: ${name}`, taskId: task.id, sessionFile: visibleSessionFile, sessionId: before.sessionId, sessionName: before.sessionName || name, model: before.model };
     }
     const end = await done;
@@ -1353,7 +1355,7 @@ async function continueWorker(request) {
       installTaskHeartbeat(worker, updated);
       const done = worker.waitAgentEnd();
       await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
-      void finishTask({ task: updated, worker, before, sessionFile, name, done, kind: "Task updated" });
+      void finishTask({ task: updated, worker, before, sessionFile, name, done, kind: "Task updated", reportToMain: Boolean(request.reportToMain) });
     })().catch(async (error) => {
       if (worker.expectedStop) {
         await log(`worker_expected_stop ${name}`);
