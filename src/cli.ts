@@ -1956,16 +1956,16 @@ function miUserName() {
   if (envName) return envName;
   try {
     const preferences = readFileSync(MI_PREFERENCES_PATH, 'utf8');
-    const match = preferences.match(/^\s*-\s*(?:User(?:'s)?(?: display)? name|Name):\s*(.+?)\s*$/im);
+    const match = preferences.match(/^\s*-\s*(?:Owner|\{owner\}|User(?:'s)?(?: display)? name|Name):\s*(.+?)\s*$/im);
     const name = match?.[1]?.trim().replace(/[.。]+$/, '');
     if (name) return name;
   } catch {}
-  return 'the user';
+  return 'the owner';
 }
 
 function miUserPossessive({ capitalize = false } = {}) {
   const name = miUserName();
-  if (name.toLowerCase() === 'the user') return capitalize ? "The user's" : "the user's";
+  if (name.toLowerCase() === 'the owner') return capitalize ? "The owner's" : "the owner's";
   return name.endsWith('s') ? `${name}'` : `${name}'s`;
 }
 
