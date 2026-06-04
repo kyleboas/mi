@@ -25,18 +25,124 @@ function redactSecrets(text: string) {
 }
 
 function fallbackReply(message: string, error?: string): FlueChatResult {
-  const trimmed = message.trim();
+  const trimmed = currentUserText(message).trim();
   const reply = /^(hi|hello|hey|yo)\.?$/i.test(trimmed) ? 'Hello.' : 'Got it.';
   return { reply, ok: false, source: 'fallback', error };
 }
 
+function currentUserText(message: string) {
+  return message.split(/(?:^|\n)Current user message:\n/i).pop() || message;
+}
+
+function directChatReply(message: string) {
+  const trimmed = currentUserText(message).trim();
+  if (/^(hi|hello|hey|yo)\.?$/i.test(trimmed)) return 'Hello.';
+  if (/^(thanks|thank you|ty)\.?$/i.test(trimmed)) return 'You’re welcome.';
+  if (/^(ok|okay|got it|cool|nice)\.?$/i.test(trimmed)) return 'Got it.';
+  return '';
+}
+
+function enabledFlag(value: string | undefined) {
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
+function wantsLookup(message: string) {
+  return /\b(look\s*up|lookup|check|verify|find\s*out|search|current|today|tonight|tomorrow|latest|schedule|score|game|weather|news|time)\b/i.test(currentUserText(message));
+}
+
+function easternDate() {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const get = (type: string) => parts.find((part) => part.type === type)?.value || '';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+function easternTime(iso: string) {
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(new Date(iso));
+}
+
+function decodeHtml(text: string) {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ');
+}
+
+async function philliesGamesToday() {
+  const date = easternDate();
+  const res = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&teamId=143&date=${date}`);
+  if (!res.ok) return { date, games: [] as any[] };
+  const data: any = await res.json();
+  const games = data?.dates?.flatMap((day: any) => day.games || []) || [];
+  return { date, games };
+}
+
+async function directLookupAnswer(message: string) {
+  const query = currentUserText(message);
+  if (!/\b(phillies|phils)\b/i.test(query) || !/\b(when|play|game|schedule|today|tonight|time)\b/i.test(query)) return '';
+  const { games } = await philliesGamesToday();
+  if (games.length === 0) return 'The Phillies do not have a game listed today.';
+  const game = games[0];
+  const away = game?.teams?.away?.team?.name || 'Away';
+  const home = game?.teams?.home?.team?.name || 'Home';
+  const opponent = /Phillies/i.test(home) ? away : home;
+  const venue = game?.venue?.name || 'venue TBD';
+  const time = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(new Date(game.gameDate));
+  const status = game?.status?.detailedState || '';
+  const statusText = /scheduled|preview/i.test(status) ? '' : ` (${status})`;
+  return `The Phillies play the ${opponent} today at ${time} at ${venue}.${statusText}`;
+}
+
+async function mlbLookupContext(query: string) {
+  if (!/\b(phillies|phils)\b/i.test(query)) return '';
+  const { date, games } = await philliesGamesToday();
+  if (games.length === 0) return `MLB schedule lookup for Philadelphia Phillies on ${date}: no game listed.`;
+  const lines = games.map((game: any) => {
+    const away = game?.teams?.away?.team?.name || 'Away';
+    const home = game?.teams?.home?.team?.name || 'Home';
+    const venue = game?.venue?.name || 'venue TBD';
+    const status = game?.status?.detailedState || game?.status?.abstractGameState || 'scheduled';
+    return `${away} at ${home} — ${easternTime(game.gameDate)} — ${venue} — ${status}`;
+  });
+  return `MLB schedule lookup for Philadelphia Phillies on ${date}:\n${lines.join('\n')}`;
+}
+
+async function searchLookupContext(query: string) {
+  const res = await fetch(`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 Mi private lookup' },
+  });
+  if (!res.ok) return '';
+  const html = await res.text();
+  const snippets = [...html.matchAll(/<a[^>]+class="result__a"[^>]*>(.*?)<\/a>|<a[^>]+class="result-link"[^>]*>(.*?)<\/a>|<div[^>]+class="result__snippet"[^>]*>(.*?)<\/div>/gis)]
+    .map((match) => decodeHtml(String(match[1] || match[2] || match[3] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()))
+    .filter(Boolean)
+    .slice(0, 8);
+  return snippets.length ? `Search snippets for ${query}:\n- ${snippets.join('\n- ')}` : '';
+}
+
+async function lookupContextFor(message: string) {
+  const query = currentUserText(message).trim();
+  const sections = [await mlbLookupContext(query), await searchLookupContext(query)].filter(Boolean);
+  return sections.join('\n\n').slice(0, 6000);
+}
+
 async function runPiChat(message: string, error?: string): Promise<FlueChatResult> {
   const cmd = process.env.PI_CMD || 'pi';
-  const prompt = `Normal chat only. Do not use tools. Do not inspect local files. Do not modify anything. Do not expose secrets. Keep the reply concise.\n\nUser: ${message}`;
+  const needsLookup = (process.env.MI_CHAT_LOOKUP_TOOLS === '1' || process.env.MI_CHAT_LOOKUP_TOOLS === 'true') && wantsLookup(message);
+  const directAnswer = needsLookup ? await directLookupAnswer(message).catch(() => '') : directChatReply(message);
+  if (directAnswer) return { reply: directAnswer, ok: true, source: 'fallback' };
+  const lookupContext = needsLookup ? await lookupContextFor(message).catch(() => '') : '';
+  const prompt = needsLookup
+    ? `You are Mi in a private chat. Be concise. Use the lookup context below to answer the current user request. Do not output tool calls, JSON, commands, or code blocks. If the lookup context is insufficient, say you couldn't verify it.\n\nLookup context:\n${lookupContext || 'No lookup results available.'}\n\nUser: ${message}`
+    : `You are Mi in a private chat. Be concise. You may use the exposed tools when the current user request explicitly asks you to inspect, check, verify, or monitor local files, logs, state, or service status. Tool use is read-only: use bash only for non-mutating commands such as pwd, ls, find, rg, tail, ps, or systemctl status. Do not edit files, write files, deploy, publish, merge, delete, spend money, send external messages, kill processes, restart services, or change settings without explicit approval. Never expose secrets. If you use tools, summarize only safe findings.\n\nUser: ${message}`;
 
   return await new Promise((resolve) => {
     const model = process.env.PI_CHAT_MODEL || process.env.PI_MODEL;
-    const args = model ? ['--mode', 'json', '--model', model, '--tools', '', prompt] : ['--mode', 'json', '--tools', '', prompt];
+    const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes'];
+    const chatTools = process.env.MI_CHAT_TOOLS || 'read,bash';
+    const args = model ? [...baseArgs, '--model', model, '--tools', chatTools, prompt] : [...baseArgs, '--tools', chatTools, prompt];
     const child = spawn(cmd, args, {
       cwd: process.env.HOME || process.cwd(),
       env: process.env,
@@ -75,7 +181,7 @@ async function runPiChat(message: string, error?: string): Promise<FlueChatResul
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
       consume();
-      finish(text.trim() ? { reply: text.trim(), ok: false, source: 'fallback', error } : fallbackReply(message, error || 'pi chat timed out'));
+      finish(text.trim() ? { reply: text.trim(), ok: true, source: 'fallback', error } : fallbackReply(message, error || 'pi chat timed out'));
     }, Number(process.env.PI_CHAT_TIMEOUT_MS || 45_000));
 
     child.stdout.on('data', (d) => { stdout += d.toString(); consume(); });
@@ -83,7 +189,7 @@ async function runPiChat(message: string, error?: string): Promise<FlueChatResul
     child.on('error', (e) => finish(fallbackReply(message, `${error || ''} ${e.message}`.trim())));
     child.on('close', () => {
       consume();
-      finish(text.trim() ? { reply: text.trim(), ok: false, source: 'fallback', error } : fallbackReply(message, error || stderr.trim()));
+      finish(text.trim() ? { reply: text.trim(), ok: true, source: 'fallback', error } : fallbackReply(message, error || stderr.trim()));
     });
   });
 }
@@ -132,7 +238,8 @@ async function runPersistentFlueChat(message: string, payload: string, timeoutMs
 }
 
 export async function runFlueChat(message: string): Promise<FlueChatResult> {
-  if (process.env.FLUE_ENABLED === 'false') return runPiChat(message, 'FLUE_ENABLED=false');
+  const flueConfigured = Boolean(process.env.FLUE_URL || process.env.FLUE_CHAT_URL || process.env.FLUE_CMD || enabledFlag(process.env.FLUE_ENABLED));
+  if (process.env.FLUE_ENABLED === 'false' || !flueConfigured) return runPiChat(message, process.env.FLUE_ENABLED === 'false' ? 'FLUE_ENABLED=false' : 'Flue not configured');
 
   const timeoutMs = Number(process.env.FLUE_TIMEOUT_MS || 30_000);
   const id = process.env.FLUE_CHAT_SESSION || 'mi-chat';

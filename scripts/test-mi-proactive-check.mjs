@@ -9,18 +9,26 @@ const cli = await readFile(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
 
 assert.match(proactive, /export type ProactiveCheck = \{[\s\S]*run: \(\) => Promise<null \| ProactiveNotice>/, 'proactive checks use the minimal check contract');
-assert.match(proactive, /export type ProactiveNotice = \{[\s\S]*message: string;[\s\S]*notify\?: boolean;[\s\S]*dedupeKey\?: string;/, 'notices use the minimal notice contract');
+assert.match(proactive, /export type ProactiveNotice = \{[\s\S]*message: string;[\s\S]*notify\?: boolean;[\s\S]*dedupeKey\?: string;[\s\S]*repairPrompt\?: string;/, 'notices support optional repair worker prompts');
 assert.match(proactive, /export const checks: ProactiveCheck\[] = \[[\s\S]*id: 'pendingApprovals'[\s\S]*id: 'failedCrons'[\s\S]*id: 'dailyBrief'/, 'default proactive checks stay small and fixed');
 assert.match(proactive, /appendThreadMessage\('main', 'assistant', message, \{ unread: true, source: 'mi:check' \}\)/, 'mi check appends one summary to the main thread');
 assert.match(proactive, /sendNotification\('Mi check', message\)/, 'mi check may notify after appending the summary');
-assert.match(proactive, /No action taken\./, 'proactive messages explicitly say no action was taken');
-assert.doesNotMatch(proactive, /child_process|runWorker|pi\.inspect|pi\.repair|createApproval|ActionResult|ProactivePolicy|mi\.policy/, 'proactive loop does not import or model autonomous actions');
+assert.match(proactive, /No action taken\./, 'non-repair proactive messages explicitly say no action was taken');
+assert.match(proactive, /Starting a background repair worker now\./, 'error notices report that a repair worker is starting');
+assert.match(proactive, /Good morning, Kyle\. Here is your daily briefing for \$\{briefDate\(\)\}\./, 'daily brief includes the requested greeting and full date');
+assert.match(proactive, /TODAY’S FOCUS[\s\S]*ACTION ITEMS[\s\S]*PROJECTS IN MOTION/, 'daily brief prioritizes current work, projects, and actionable items');
+assert.match(proactive, /recentWorkTasks[\s\S]*tasks\.json[\s\S]*web-workers\.json/, 'daily brief draws from both Mi task state and web-chat worker state');
+assert.match(proactive, /Pending approvals: \$\{pending\.length\}[\s\S]*pending\.slice\(0, 5\)\.map\(formatApprovalLine\)/, 'daily brief lists pending approval details');
+assert.match(proactive, /Summary: \$\{failed\.length\} failed crons, \$\{enabledCrons\.length\} enabled crons, \$\{crons\.length\} total tracked\./, 'daily brief includes monitor health counts');
+assert.match(proactive, /Recent monitor runs:/, 'daily brief includes recent monitor activity');
+assert.match(proactive, /type: 'run_worker'/, 'error notices can request a background repair worker');
+assert.doesNotMatch(proactive, /child_process|runWorker|pi\.inspect|pi\.repair|createApproval|ActionResult|ProactivePolicy|mi\.policy/, 'proactive loop does not import old policy/approval action machinery');
 
 assert.match(cli, /import \{ runMiCheck \} from '\.\/proactive\.js';/, 'CLI imports the proactive check runner');
 assert.match(cli, /mi check\s+Run one proactive Mi check-in/, 'usage exposes mi check as the proactive name');
 assert.match(cli, /if \(command === 'check' &&[\s\S]*return proactiveCheckCommand\(args\);/, 'mi check runs the proactive loop');
-assert.match(readme, /## `mi check`[\s\S]*read state → run checks → dedupe → append message → maybe notify/, 'README documents the minimal proactive loop');
-assert.match(readme, /Every proactive message ends with `No action taken\.`/, 'README documents the no-action invariant');
+assert.match(readme, /## `mi check`[\s\S]*read state → run checks → dedupe → append message → maybe start repair worker for errors → maybe notify/, 'README documents the proactive loop');
+assert.match(readme, /Non-error proactive messages do not take action and end with `No action taken\.`/, 'README documents the non-error no-action invariant');
 
 const root = await mkdtemp(join(tmpdir(), 'mi-proactive-'));
 try {

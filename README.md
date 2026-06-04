@@ -76,7 +76,7 @@ Mi discovers pi sessions from the default pi session store (`~/.pi/agent/session
 
 `mi check` is the minimal proactive loop. It reads local Mi state, runs a small fixed set of checks, dedupes repeated observations, appends one useful message to the main Mi thread, and optionally sends a notification.
 
-Shape: read state → run checks → dedupe → append message → maybe notify.
+Shape: read state → run checks → dedupe → append message → maybe start repair worker for errors → maybe notify.
 
 Default checks:
 
@@ -84,7 +84,7 @@ Default checks:
 - `failedCrons`
 - `dailyBrief`
 
-It never repairs, inspects with pi, starts workers, edits files, deploys, merges, deletes, changes config, or approves anything. Every proactive message ends with `No action taken.`
+Non-error proactive messages do not take action and end with `No action taken.` Error notices, such as failed crons or crashed checks, report the error in the main thread and automatically request a background repair worker. The proactive loop itself still does not edit files, deploy, merge, delete, change config, or approve anything.
 
 ```bash
 mi check
