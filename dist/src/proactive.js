@@ -313,7 +313,7 @@ export async function dailyBrief() {
     ];
     return {
         message: [
-            `Good morning, Kyle. Here is your daily briefing for ${briefDate()}.`,
+            `Good morning. Here is your daily briefing for ${briefDate()}.`,
             '',
             'TODAY’S FOCUS',
             compactLines(work.active.slice(0, 5), '- No active background work is currently open.'),
