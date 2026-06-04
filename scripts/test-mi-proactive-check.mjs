@@ -15,7 +15,7 @@ assert.match(proactive, /appendThreadMessage\('main', 'assistant', message, \{ u
 assert.match(proactive, /sendNotification\('Mi check', message\)/, 'mi check may notify after appending the summary');
 assert.match(proactive, /No action taken\./, 'non-repair proactive messages explicitly say no action was taken');
 assert.match(proactive, /Starting a background repair worker now\./, 'error notices report that a repair worker is starting');
-assert.match(proactive, /Good morning, Kyle\. Here is your daily briefing for \$\{briefDate\(\)\}\./, 'daily brief includes the requested greeting and full date');
+assert.match(proactive, /Good morning\. Here is your daily briefing for \$\{briefDate\(\)\}\./, 'daily brief includes the requested greeting and full date');
 assert.match(proactive, /TODAY’S FOCUS[\s\S]*ACTION ITEMS[\s\S]*PROJECTS IN MOTION/, 'daily brief prioritizes current work, projects, and actionable items');
 assert.match(proactive, /recentWorkTasks[\s\S]*tasks\.json[\s\S]*web-workers\.json/, 'daily brief draws from both Mi task state and web-chat worker state');
 assert.match(proactive, /Pending approvals: \$\{pending\.length\}[\s\S]*pending\.slice\(0, 5\)\.map\(formatApprovalLine\)/, 'daily brief lists pending approval details');

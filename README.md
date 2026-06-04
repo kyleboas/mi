@@ -14,7 +14,7 @@ Everything else in this repo exists to support those surfaces.
 Requires Node.js and npm. Install Mi directly from the GitHub repo:
 
 ```bash
-npm install -g git+https://github.com/kyleboas/mi.git
+npm install -g git+https://github.com/<owner>/mi.git
 ```
 
 Then run:
@@ -26,7 +26,7 @@ mi
 To update, reinstall from the same Git URL:
 
 ```bash
-npm install -g git+https://github.com/kyleboas/mi.git
+npm install -g git+https://github.com/<owner>/mi.git
 ```
 
 ## `mi`

@@ -272,7 +272,7 @@ async function notifyUser(reply, threadId) {
 async function vapidConfig() {
   const config = await readJsonFile(vapidPath, undefined);
   if (!config?.publicKey || !config?.privateKey) throw new Error('missing web push VAPID keys');
-  webpush.setVapidDetails(config.subject || 'mailto:kyle@example.invalid', config.publicKey, config.privateKey);
+  webpush.setVapidDetails(config.subject || 'mailto:mi@example.invalid', config.publicKey, config.privateKey);
   return config;
 }
 
@@ -451,7 +451,7 @@ async function sendTaskSocketRequest(payload, timeoutMs = 30000) {
 }
 
 function ownerPossessive() {
-  const name = (process.env.MI_USER_NAME || 'Kyle').trim();
+  const name = (process.env.MI_USER_NAME || 'User').trim();
   return name.endsWith('s') ? `${name}'` : `${name}'s`;
 }
 
