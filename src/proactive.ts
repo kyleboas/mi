@@ -43,7 +43,9 @@ const DEFAULT_DEDUPE_MS = Number(process.env.MI_PROACTIVE_DEDUPE_MS || 6 * 60 * 
 const DAILY_DEDUPE_MS = 36 * 60 * 60_000;
 const miRoot = process.env.MI_ROOT || join(homedir(), 'assistant');
 const stateDir = resolve(miRoot, 'state');
-const miStateDir = process.env.MI_TASK_STATE_DIR || join(homedir(), 'mi', 'state');
+const miTasksDir = join(homedir(), 'mi');
+const miStateDir = process.env.MI_TASK_STATE_DIR || join(miTasksDir, 'state');
+const miPreferencesPath = join(miTasksDir, 'preferences.md');
 const dedupePath = join(stateDir, 'proactive-dedupe.json');
 const runtimeDir = process.env.MI_RUNTIME_DIR || join(homedir(), '.pi', 'agent', 'mi');
 const socketPath = process.env.MI_SOCKET_PATH || join(runtimeDir, 'main.sock');
@@ -66,6 +68,18 @@ function briefDate() {
     month: 'long',
     day: 'numeric',
   }).format(new Date());
+}
+
+async function miOwnerName() {
+  const envName = (process.env.MI_OWNER_NAME || process.env.MI_USER_NAME || '').trim();
+  if (envName) return envName;
+  try {
+    const preferences = await readFile(miPreferencesPath, 'utf8');
+    const match = preferences.match(/^\s*-\s*(?:Owner|\{owner\}|User(?:'s)?(?: display)? name|Name):\s*(.+?)\s*$/im);
+    const name = match?.[1]?.trim().replace(/[.。]+$/, '');
+    if (name) return name;
+  } catch {}
+  return 'owner';
 }
 
 function compactLines(lines: string[], empty = 'None.') {
@@ -345,6 +359,7 @@ export async function failedCrons(): Promise<null | ProactiveNotice> {
 
 export async function dailyBrief(): Promise<null | ProactiveNotice> {
   if (process.env.MI_DAILY_BRIEF === 'false') return null;
+  const owner = await miOwnerName();
   const pending = (await readApprovals()).filter((approval) => approval.status === 'pending');
   const crons = await readCrons().catch(() => []);
   const enabledCrons = crons.filter((cron) => cron.enabled);
@@ -363,7 +378,7 @@ export async function dailyBrief(): Promise<null | ProactiveNotice> {
   ];
   return {
     message: [
-      `Good morning. Here is your daily briefing for ${briefDate()}.`,
+      `Good morning, ${owner}. Here is your daily briefing for ${briefDate()}.`,
       '',
       'TODAY’S FOCUS',
       compactLines(work.active.slice(0, 5), '- No active background work is currently open.'),

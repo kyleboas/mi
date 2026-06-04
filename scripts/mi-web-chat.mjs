@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
@@ -31,6 +31,7 @@ const pushDir = path.join(root, 'state', 'web-push');
 const vapidPath = path.join(pushDir, 'vapid.json');
 const subscriptionsPath = path.join(pushDir, 'subscriptions.json');
 const webWorkersPath = path.join(root, 'state', 'web-workers.json');
+const miPreferencesPath = path.join(home, 'mi', 'preferences.md');
 const miRuntimeDir = process.env.MI_RUNTIME_DIR || path.join(home, '.pi', 'agent', 'mi');
 const miSocketPath = process.env.MI_SOCKET_PATH || path.join(miRuntimeDir, 'main.sock');
 const miDaemonPath = process.env.MI_DAEMON_PATH || path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
@@ -450,8 +451,20 @@ async function sendTaskSocketRequest(payload, timeoutMs = 30000) {
   }
 }
 
+function ownerName() {
+  const envName = (process.env.MI_OWNER_NAME || process.env.MI_USER_NAME || '').trim();
+  if (envName) return envName;
+  try {
+    const preferences = readFileSync(miPreferencesPath, 'utf8');
+    const match = preferences.match(/^\s*-\s*(?:Owner|\{owner\}|User(?:'s)?(?: display)? name|Name):\s*(.+?)\s*$/im);
+    const name = match?.[1]?.trim().replace(/[.。]+$/, '');
+    if (name) return name;
+  } catch {}
+  return 'owner';
+}
+
 function ownerPossessive() {
-  const name = (process.env.MI_USER_NAME || 'User').trim();
+  const name = ownerName();
   return name.endsWith('s') ? `${name}'` : `${name}'s`;
 }
 
