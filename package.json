@@ -4,7 +4,7 @@
   "description": "Tiny private assistant harness: Markdown assistants plus triggers, tools, permissions, and workers.",
   "main": "dist/src/cli.js",
   "scripts": {
-    "test": "node scripts/test-mi-security-hardening.mjs && node scripts/test-mi-extension-ui.mjs && node scripts/test-mi-agent-view.mjs && node scripts/test-mi-worker-result-report.mjs && node scripts/test-mi-proactive-check.mjs && node scripts/test-mi-main-queue-render.mjs && node scripts/test-mi-agent-render-snapshot.mjs && node scripts/test-mi-agent-dedupe.mjs && node scripts/test-mi-daemon-pi-session-e2e.mjs",
+    "test": "node scripts/test-mi-security-hardening.mjs && node scripts/test-mi-extension-ui.mjs && node scripts/test-mi-agent-view.mjs && node scripts/test-mi-web-chat-routing.mjs && node scripts/test-mi-worker-result-report.mjs && node scripts/test-mi-proactive-check.mjs && node scripts/test-mi-main-queue-render.mjs && node scripts/test-mi-agent-render-snapshot.mjs && node scripts/test-mi-agent-dedupe.mjs && node scripts/test-mi-daemon-pi-session-e2e.mjs",
     "build": "tsc",
     "proactive": "tsx scripts/proactive.ts",
     "proactive:brief": "tsx scripts/proactive.ts daily-brief",
@@ -25,8 +25,10 @@
     "@flue/cli": "^0.3.10",
     "@flue/sdk": "^0.3.10",
     "@mariozechner/pi-coding-agent": "^0.73.1",
+    "@types/web-push": "^3.6.4",
     "dotenv": "^17.4.2",
-    "valibot": "^1.3.1"
+    "valibot": "^1.3.1",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

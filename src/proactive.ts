@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import net from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { cronPaths, readCrons } from './crons.js';
@@ -12,6 +14,8 @@ export type ProactiveNotice = {
   message: string;
   notify?: boolean;
   dedupeKey?: string;
+  repairPrompt?: string;
+  repairName?: string;
 };
 
 export type ProactiveCheck = {
@@ -39,14 +43,222 @@ const DEFAULT_DEDUPE_MS = Number(process.env.MI_PROACTIVE_DEDUPE_MS || 6 * 60 * 
 const DAILY_DEDUPE_MS = 36 * 60 * 60_000;
 const miRoot = process.env.MI_ROOT || join(homedir(), 'assistant');
 const stateDir = resolve(miRoot, 'state');
+const miStateDir = process.env.MI_TASK_STATE_DIR || join(homedir(), 'mi', 'state');
 const dedupePath = join(stateDir, 'proactive-dedupe.json');
+const runtimeDir = process.env.MI_RUNTIME_DIR || join(homedir(), '.pi', 'agent', 'mi');
+const socketPath = process.env.MI_SOCKET_PATH || join(runtimeDir, 'main.sock');
+const repairModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';
 
 function today() {
-  return new Date().toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+function briefDate() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(new Date());
 }
 
 function compactLines(lines: string[], empty = 'None.') {
   return lines.length > 0 ? lines.join('\n') : empty;
+}
+
+function truncateLine(value: string, max = 180) {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > max ? `${compact.slice(0, max - 1)}…` : compact;
+}
+
+function approvalSummary(approval: Awaited<ReturnType<typeof readApprovals>>[number]) {
+  const reason = String(approval.reason || '');
+  const prompt = String(approval.prompt || '').trim();
+  if (/Matched risky action pattern/i.test(reason) && prompt) return prompt;
+  return reason || prompt || 'pending review';
+}
+
+function formatApprovalLine(approval: Awaited<ReturnType<typeof readApprovals>>[number]) {
+  return `- ${approval.id}: ${truncateLine(approvalSummary(approval))}`;
+}
+
+function formatCronLine(cron: Awaited<ReturnType<typeof readCrons>>[number]) {
+  const schedule = cron.every ? `every ${cron.every}` : cron.at ? `at ${cron.at}` : 'unscheduled';
+  const status = cron.lastStatus ? `last ${cron.lastStatus}${cron.lastRunAt ? ` at ${cron.lastRunAt}` : ''}` : 'never run';
+  return `- ${cron.name}: ${schedule}; ${status}`;
+}
+
+function formatFailedCronLine(cron: Awaited<ReturnType<typeof readCrons>>[number]) {
+  const output = cron.lastOutput ? ` — ${truncateLine(cron.lastOutput, 220)}` : '';
+  return `- ${cron.name}: ${cron.lastRunAt || 'never run'}${output}`;
+}
+
+type BriefTask = {
+  name?: string;
+  status?: string;
+  text?: string;
+  progress?: string;
+  lastInput?: string;
+  cwd?: string;
+  updatedAt?: string;
+  finishedAt?: string;
+  startedAt?: string;
+  needsUser?: boolean;
+  needsUserReason?: string;
+};
+
+async function readJsonArray<T>(path: string): Promise<T[]> {
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function taskTime(task: BriefTask) {
+  return Date.parse(task.updatedAt || task.finishedAt || task.startedAt || '') || 0;
+}
+
+function briefTaskTitle(task: BriefTask) {
+  const title = String(task.text || task.lastInput || task.name || task.progress || 'Mi task')
+    .replace(/^Background worker handoff from Mi web chat\.\s*/i, '')
+    .replace(/^Follow-up from Mi web chat for the active background worker\.\s*/i, '')
+    .replace(/-/g, ' ');
+  return truncateLine(title, 86);
+}
+
+function formatTaskLine(task: BriefTask) {
+  const status = String(task.status || 'open');
+  const cwd = task.cwd && task.cwd !== homedir() ? ` (${task.cwd.replace(homedir(), '~')})` : '';
+  const detail = truncateLine(String(task.text || task.progress || task.lastInput || '').replace(/```[\s\S]*?```/g, '').replace(/\n+/g, ' '), 140);
+  return `- ${briefTaskTitle(task)}: ${status}${task.needsUser ? `; needs input${task.needsUserReason ? ` — ${truncateLine(task.needsUserReason, 90)}` : ''}` : ''}${cwd}${detail ? ` — ${detail}` : ''}`;
+}
+
+async function recentWorkTasks() {
+  const miTasks = await readJsonArray<BriefTask>(join(miStateDir, 'tasks.json'));
+  const webWorkers = (await readJsonArray<BriefTask>(join(stateDir, 'web-workers.json')))
+    .map((worker) => ({
+      ...worker,
+      text: worker.text || worker.progress,
+      updatedAt: worker.updatedAt || worker.finishedAt || worker.startedAt,
+    }));
+  return [...miTasks, ...webWorkers]
+    .filter((task) => task.name || task.text || task.progress || task.lastInput)
+    .sort((a, b) => taskTime(b) - taskTime(a));
+}
+
+function isBriefableTask(task: BriefTask) {
+  const title = briefTaskTitle(task).toLowerCase();
+  const detail = String(task.text || task.progress || task.lastInput || '').toLowerCase();
+  if (/^(continue|ok|okay|thanks|yes|no)$/.test(title.trim())) return false;
+  if (/^running shell command$/.test(detail.trim())) return false;
+  return title.length > 8 || detail.length > 24;
+}
+
+async function currentWorkLines() {
+  const tasks = (await recentWorkTasks()).filter(isBriefableTask);
+  const seen = new Set<string>();
+  const unique = tasks.filter((task) => {
+    const key = briefTaskTitle(task).toLowerCase().replace(/\W+/g, ' ').slice(0, 72);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const active = unique.filter((task) => ['running', 'active', 'queued', 'paused', 'error'].includes(String(task.status || '').toLowerCase()) || task.needsUser).slice(0, 6);
+  const recent = unique.filter((task) => !active.includes(task)).slice(0, 8);
+  return {
+    active: active.map(formatTaskLine),
+    recent: recent.map(formatTaskLine),
+  };
+}
+
+function projectFromTask(task: BriefTask) {
+  const text = `${task.cwd || ''} ${task.name || ''} ${task.lastInput || ''} ${task.text || ''}`.toLowerCase();
+  if (/38-0|38and0/.test(text)) return '38-0 / 38and0.com';
+  if (/tacticsjournal|detect|research/.test(text)) return 'Tactics Journal research/detect pipeline';
+  if (/mi|briefing|worker|handoff|web chat|routing|assistant/.test(text)) return 'Mi assistant / background workers';
+  if (/railrat|train-112/.test(text)) return 'Railrat train 112 monitor';
+  if (/cloudflare|budget/.test(text)) return 'Cloudflare / budget guard';
+  const cwd = task.cwd?.replace(homedir(), '~');
+  return cwd && cwd !== '~' ? cwd : '';
+}
+
+async function projectLines() {
+  const tasks = await recentWorkTasks();
+  const projects = new Map<string, number>();
+  for (const task of tasks.slice(0, 120)) {
+    const project = projectFromTask(task);
+    if (project) projects.set(project, Math.max(projects.get(project) || 0, taskTime(task)));
+  }
+  return [...projects.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([project]) => `- ${project}`);
+}
+
+function taskNameFromPrompt(prompt: string) {
+  return prompt
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32) || `repair-${Date.now().toString(36)}`;
+}
+
+function sendSocketRequest(payload: unknown, timeoutMs = 30000): Promise<{ ok?: boolean; error?: string; text?: string; taskId?: string; sessionFile?: string }> {
+  return new Promise((resolve, reject) => {
+    if (!existsSync(socketPath)) {
+      reject(new Error(`Mi main socket not found: ${socketPath}`));
+      return;
+    }
+    const socket = net.createConnection(socketPath);
+    let data = '';
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('Timed out waiting for Mi main'));
+    }, timeoutMs);
+    socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`));
+    socket.on('data', (chunk) => {
+      data += chunk.toString('utf8');
+      if (!data.includes('\n')) return;
+      clearTimeout(timer);
+      socket.end();
+      try {
+        const response = JSON.parse(data.slice(0, data.indexOf('\n'))) as { ok?: boolean; error?: string; text?: string; taskId?: string; sessionFile?: string };
+        if (response.ok) resolve(response);
+        else reject(new Error(response.error || 'Mi main returned an error'));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    socket.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+async function startRepairWorker(notice: ProactiveNotice) {
+  if (!notice.repairPrompt) return null;
+  const name = notice.repairName || taskNameFromPrompt(notice.repairPrompt);
+  const result = await sendSocketRequest({
+    type: 'run_worker',
+    name,
+    cwd: homedir(),
+    message: notice.repairPrompt,
+    lastInput: notice.message,
+    background: true,
+    reportToMain: true,
+    model: repairModel,
+  }, 30000);
+  return { name, taskId: result.taskId, sessionFile: result.sessionFile };
 }
 
 function noticeHash(checkId: string, notice: ProactiveNotice) {
@@ -102,16 +314,32 @@ export async function failedCrons(): Promise<null | ProactiveNotice> {
   const failed = crons.filter((cron) => cron.lastStatus === 'error');
   if (failed.length === 0) return null;
   const paths = cronPaths();
+  const failedSummary = compactLines(failed.map((cron) => `- ${cron.name}: ${cron.lastOutput || 'failed'}`));
   return {
     message: [
       failed.length === 1 ? 'Mi noticed 1 failed cron run.' : `Mi noticed ${failed.length} failed cron runs.`,
       'Failed:',
-      compactLines(failed.map((cron) => `- ${cron.name}: ${cron.lastOutput || 'failed'}`)),
+      failedSummary,
       `State: ${paths.cronsPath}`,
       `Log: ${paths.logPath}`,
+      'Starting a background repair worker now.',
     ].join('\n'),
     notify: true,
     dedupeKey: `failedCrons:${failed.map((cron) => `${cron.name}:${cron.lastRunAt || ''}:${cron.lastOutput || ''}`).sort().join('|')}`,
+    repairName: 'repair-failed-mi-crons',
+    repairPrompt: [
+      'Background repair worker launched automatically by Mi after detecting failed cron runs.',
+      'Report the root cause and repair the failing cron/task without exposing secrets.',
+      '',
+      `Failed crons:\n${failedSummary}`,
+      `Cron state file: ${paths.cronsPath}`,
+      `Cron log: ${paths.logPath}`,
+      '',
+      'Instructions:',
+      '- Inspect the cron state/logs and relevant repo/service files.',
+      '- Fix the failure or document exactly what user action/credential is required if it cannot be repaired safely.',
+      '- Summarize changes, files touched, test/check results, and remaining user action.',
+    ].join('\n'),
   };
 }
 
@@ -119,13 +347,52 @@ export async function dailyBrief(): Promise<null | ProactiveNotice> {
   if (process.env.MI_DAILY_BRIEF === 'false') return null;
   const pending = (await readApprovals()).filter((approval) => approval.status === 'pending');
   const crons = await readCrons().catch(() => []);
+  const enabledCrons = crons.filter((cron) => cron.enabled);
   const failed = crons.filter((cron) => cron.lastStatus === 'error');
+  const recentCrons = [...crons]
+    .filter((cron) => cron.lastRunAt)
+    .sort((a, b) => Date.parse(b.lastRunAt || '') - Date.parse(a.lastRunAt || ''))
+    .slice(0, 5);
+  const paths = cronPaths();
+  const work = await currentWorkLines();
+  const projects = await projectLines();
+  const actionItems = [
+    ...pending.slice(0, 3).map((approval) => `- Review approval ${approval.id}: ${truncateLine(approvalSummary(approval), 120)}`),
+    ...failed.slice(0, 3).map((cron) => `- Fix failed cron ${cron.name}: ${truncateLine(cron.lastOutput || 'failed', 120)}`),
+    ...work.active.filter((line) => /needs input|error|paused/i.test(line)).slice(0, 3),
+  ];
   return {
     message: [
-      'Daily Mi brief.',
-      `Pending approvals: ${pending.length}`,
-      `Failed crons: ${failed.length}`,
-    ].join('\n'),
+      `Good morning, Kyle. Here is your daily briefing for ${briefDate()}.`,
+      '',
+      'TODAY’S FOCUS',
+      compactLines(work.active.slice(0, 5), '- No active background work is currently open.'),
+      '',
+      'ACTION ITEMS',
+      compactLines(actionItems.slice(0, 8), '- No urgent approvals, failed monitors, or blocked tasks found.'),
+      '',
+      'PROJECTS IN MOTION',
+      compactLines(projects, '- No recent project activity found.'),
+      '',
+      'RECENT WORK / CONTEXT',
+      compactLines(work.recent.slice(0, 6), '- No recent completed task history found.'),
+      '',
+      'MONITORING HEALTH',
+      `- Summary: ${failed.length} failed crons, ${enabledCrons.length} enabled crons, ${crons.length} total tracked.`,
+      failed.length > 0 ? '- Failed monitors:' : '- Failed monitors: none.',
+      failed.length > 0 ? compactLines(failed.slice(0, 5).map(formatFailedCronLine)) : '',
+      recentCrons.length > 0 ? '- Recent monitor runs:' : '',
+      recentCrons.length > 0 ? compactLines(recentCrons.map(formatCronLine)) : '',
+      '',
+      'APPROVALS',
+      `- Pending approvals: ${pending.length}`,
+      pending.length > 0 ? compactLines(pending.slice(0, 5).map(formatApprovalLine)) : '',
+      pending.length > 5 ? `- ...and ${pending.length - 5} more.` : '',
+      '',
+      'REFERENCE',
+      `- State: ${paths.cronsPath}`,
+      `- Log: ${paths.logPath}`,
+    ].filter((line) => line !== '').join('\n'),
     notify: process.env.MI_DAILY_BRIEF_NOTIFY !== 'false',
     dedupeKey: `dailyBrief:${today()}`,
   };
@@ -159,7 +426,8 @@ function resolveChecks(ids: string[] | undefined) {
 function formatCheckMessage(notices: Array<{ checkId: string; notice: ProactiveNotice }>) {
   if (notices.length === 0) return 'Mi check found no new notices.';
   const body = notices.map(({ notice }) => notice.message).join('\n\n');
-  return String(redactSecrets(`${body}\n\nNo action taken.`));
+  const hasRepair = notices.some(({ notice }) => Boolean(notice.repairPrompt));
+  return String(redactSecrets(`${body}\n\n${hasRepair ? 'Repair worker requested.' : 'No action taken.'}`));
 }
 
 export async function runMiCheck(options: ProactiveCheckRunOptions = {}): Promise<ProactiveCheckRunResult> {
@@ -172,10 +440,22 @@ export async function runMiCheck(options: ProactiveCheckRunOptions = {}): Promis
     try {
       notice = await check.run();
     } catch (error) {
+      const errorText = error instanceof Error ? error.message : String(error);
       notice = {
-        message: `Mi proactive check failed: ${check.id}\n${error instanceof Error ? error.message : String(error)}`,
+        message: `Mi proactive check failed: ${check.id}\n${errorText}\nStarting a background repair worker now.`,
         notify: true,
-        dedupeKey: `checkError:${check.id}:${error instanceof Error ? error.message : String(error)}`,
+        dedupeKey: `checkError:${check.id}:${errorText}`,
+        repairName: `repair-mi-check-${check.id}`,
+        repairPrompt: [
+          'Background repair worker launched automatically by Mi after a proactive check crashed.',
+          `Failed check: ${check.id}`,
+          `Error: ${errorText}`,
+          '',
+          'Instructions:',
+          '- Inspect the Mi proactive check implementation and state files.',
+          '- Repair the failing check without exposing secrets, or document the required user action if blocked.',
+          '- Summarize changes, files touched, test/check results, and remaining user action.',
+        ].join('\n'),
       };
     }
     if (!notice) continue;
@@ -195,6 +475,17 @@ export async function runMiCheck(options: ProactiveCheckRunOptions = {}): Promis
   if (notices.length > 0 && !options.dryRun) {
     await appendThreadMessage('main', 'assistant', message, { unread: true, source: 'mi:check' });
     appended = true;
+    for (const { checkId, notice } of notices) {
+      if (!notice.repairPrompt) continue;
+      try {
+        const repair = await startRepairWorker(notice);
+        await logEvent('mi.check.repair_worker.started', { checkId, repair });
+      } catch (error) {
+        const errorText = redactSecrets(error instanceof Error ? error.message : String(error));
+        await logEvent('mi.check.repair_worker.error', { checkId, error: errorText });
+        await appendThreadMessage('main', 'assistant', `Mi could not start the background repair worker for ${checkId}: ${errorText}`, { unread: true, source: 'mi:check' });
+      }
+    }
   }
 
   if (options.notify !== false && notices.some(({ notice }) => notice.notify) && !options.dryRun) {

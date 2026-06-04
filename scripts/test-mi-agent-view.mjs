@@ -5,6 +5,7 @@ import { matchesKey } from '@mariozechner/pi-tui';
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
+const miExtension = readFileSync(new URL('../pi/extensions/mi.ts', import.meta.url), 'utf8');
 
 assert.match(cli, /mi agents\s+Open mi agents live background agent view/, 'usage documents mi agents startup command and mi agents name');
 assert.match(cli, /AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTheme, UserMessageComponent/, 'CLI imports pi message components and theme');
@@ -240,10 +241,14 @@ assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, on
 assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, onData\), \{ clearScreen: false \}\)/, 'main Mi TUI avoids alternate screen so tmux scrollback works');
 assert.match(cli, /leave conversation history in normal terminal scrollback/, 'main Mi TUI documents why it avoids alternate screen');
 assert.match(cli, /if \(options\.alternateScreen\) process\.stdout\.write\('\\x1b\[\?1049l'\)/, 'alternate-screen mi agents restores the normal screen on cleanup');
-assert.match(cli, /function shouldStartBackgroundWorkerFromMi\(text: string\)[\s\S]*does\(\?:n't\| not\) work[\s\S]*broken[\s\S]*bug[\s\S]*issue/, 'main Mi detects actionable bug/work requests for background workers');
-assert.match(cli, /async function buildBackgroundWorkerPromptFromMi\(text: string\)[\s\S]*Background worker handoff from Mi main chat[\s\S]*Current user request:[\s\S]*Relevant Mi main chat context/, 'main Mi builds a self-contained worker handoff with recent chat context');
-assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string\)[\s\S]*const message = await buildBackgroundWorkerPromptFromMi\(text\)[\s\S]*type: 'run_worker'[\s\S]*message, lastInput: text[\s\S]*background: true, reportToMain: true/, 'main Mi starts background workers with handoff context, preserves the user request as task input, and requests a main-chat result report');
-assert.match(cli, /shouldStartBackgroundWorkerFromMi\(text\)[\s\S]*await startBackgroundWorkerFromMi\(text\)[\s\S]*await sendToMiMain\(await buildMiTurnPrompt\(text\)\)/, 'main Mi routes actionable work to a background worker and chatty messages to Mi main');
+assert.match(cli, /function miMessageLooksLikeInlineChat\(text: string\)[\s\S]*draft\|write\|rewrite\|compose\|wordsmith[\s\S]*return true/, 'main Mi handles writing/drafting requests inline unless they are code work');
+assert.match(cli, /function miWorkerRoutingDecision\(text: string\): MiWorkerRoutingDecision[\s\S]*miMessageLooksLikeInlineChat\(normalized\)[\s\S]*reason: 'inline-chat'/, 'main Mi keeps inline chat/drafting requests out of background workers');
+assert.match(cli, /function miWorkerRoutingDecision\(text: string\): MiWorkerRoutingDecision[\s\S]*localTarget && \(actionable \|\| complaint\)[\s\S]*repo\/app work/, 'main Mi detects actionable local bug/work requests for background workers');
+assert.match(cli, /function shouldStartBackgroundWorkerFromMi\(text: string\)[\s\S]*miWorkerRoutingDecision\(text\)\.start/, 'main Mi worker routing goes through the smarter routing decision');
+assert.match(cli, /async function buildBackgroundWorkerPromptFromMi\(text: string, decision = miWorkerRoutingDecision\(text\)\)[\s\S]*Background worker handoff from Mi main chat[\s\S]*Handoff reason: \$\{decision\.reason\}\.[\s\S]*Current user request:[\s\S]*Relevant Mi main chat context/, 'main Mi builds a self-contained worker handoff with recent chat context and route reason');
+assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string, decision = miWorkerRoutingDecision\(text\)\)[\s\S]*const message = await buildBackgroundWorkerPromptFromMi\(text, decision\)[\s\S]*type: 'run_worker'[\s\S]*message, lastInput: text[\s\S]*background: true, reportToMain: true[\s\S]*miHandoffReasonSentence\(decision\)/, 'main Mi starts background workers with handoff context and returns an intelligent acknowledgement');
+assert.match(cli, /const decision = miWorkerRoutingDecision\(text\);[\s\S]*decision\.start[\s\S]*await startBackgroundWorkerFromMi\(text, decision\)[\s\S]*await sendToMiMain\(await buildMiTurnPrompt\(text\)\)/, 'main Mi routes actionable work to a background worker and chatty messages to Mi main');
+assert.match(miExtension, /Route deliberately instead of reflexively handing everything off[\s\S]*specific acknowledgement/, 'Mi main system prompt discourages reflexive/generic handoffs');
 assert.match(cli, /async function buildMiTurnPrompt\(text: string\)/, 'main Mi TUI builds pi-chat-style turn prompts');
 assert.match(cli, /readThreadMessages\('main', 15\)/, 'main Mi TUI includes last 15 messages as context');
 assert.doesNotMatch(cli, /Selected agent context:/, 'main Mi TUI does not include selected agent context');
@@ -269,8 +274,8 @@ assert.match(daemon, /const MI_DAEMON_LOCK_START_GRACE_MS = Number\(process\.env
 assert.match(daemon, /const MI_DAEMON_LOCK_STALE_MS = Number\(process\.env\.MI_DAEMON_LOCK_STALE_MS \|\| 120000\)/, 'daemon requires a stale heartbeat before killing a lock owner');
 assert.match(daemon, /function startDaemonHeartbeat\(\)[\s\S]*setInterval\(\(\) => void writeDaemonHeartbeat\(\), MI_DAEMON_LOCK_HEARTBEAT_MS\)/, 'daemon refreshes the lock heartbeat while it owns workers');
 assert.match(daemon, /ownerAlive && lockAgeMs < MI_DAEMON_LOCK_START_GRACE_MS[\s\S]*waiting for daemon lock[\s\S]*continue/, 'daemon waits for a just-starting lock owner instead of killing it and racing duplicate daemons');
-assert.match(daemon, /ownerAlive && lockAgeMs < MI_DAEMON_LOCK_STALE_MS[\s\S]*singleton exit; daemon lock owner/, 'daemon exits instead of killing a live daemon with a fresh heartbeat');
-assert.match(daemon, /removing stale unhealthy daemon lock[\s\S]*process\.kill\(lock\.pid, "SIGTERM"\)/, 'daemon recovers only when a lock-owning process has a stale heartbeat and unhealthy socket');
+assert.match(daemon, /ownerAlive && lockAgeMs < MI_DAEMON_LOCK_STALE_MS && existsSync\(SOCKET_PATH\)[\s\S]*singleton exit; daemon lock owner/, 'daemon exits instead of killing a live daemon with a fresh heartbeat and socket');
+assert.match(daemon, /missing socket[\s\S]*removing stale unhealthy daemon lock[\s\S]*process\.kill\(lock\.pid, "SIGTERM"\)/, 'daemon recovers when a lock-owning process is alive but never created its socket');
 assert.match(daemon, /file\.startsWith\(SESSION_DIR\) \|\| file\.includes\("\/sessions\/mi-main\/"\)/, 'daemon excludes mi-chat/mi-main sessions from mi agents');
 assert.match(daemon, /starts lazily on prompt\/state\/model requests/, 'daemon does not eagerly spawn Mi main pi on startup');
 assert.match(daemon, /const MI_MAIN_IDLE_MS = Number\(process\.env\.MI_MAIN_IDLE_MS \|\| 120000\)/, 'daemon keeps Mi main pi warm briefly to avoid repeated cold starts');
@@ -297,12 +302,14 @@ assert.match(daemon, /function inferOpenPiSessions[\s\S]*inferred\.set\(proc\.se
 assert.match(daemon, /async function sendMessageIntoPiBridge[\s\S]*type: "send_user_message"[\s\S]*async function queueMessageIntoOpenPiSession[\s\S]*sendMessageIntoPiBridge\(task, body\)[\s\S]*appendFile\(input, `\\x1b\[200~\$\{body\}\\x1b\[201~\\r`\)/, 'daemon sends replies through the live pi bridge first and falls back to terminal paste');
 assert.match(daemon, /if \(request\.type === "pi_session_event"\)[\s\S]*handlePiSessionEvent\(request\)/, 'daemon accepts live pi session events from the extension');
 assert.match(daemon, /async function handlePiSessionEvent[\s\S]*upsertTask[\s\S]*mirrorMessageIntoPiBridge/, 'daemon updates mi agents task state from live pi events and mirrors external user messages to open pi');
+assert.match(daemon, /function normalizePiSessionProgress\(progress, text = ""\)[\s\S]*rawTool[\s\S]*summarizeToolStart\(rawTool, \{\}\)/, 'daemon normalizes legacy raw tool progress from live pi session events');
+assert.match(daemon, /async function handlePiSessionEvent[\s\S]*needsUser: false,[\s\S]*needsUserReason: undefined,[\s\S]*openPiSession: true/, 'live pi session events clear stale needs-input flags');
 assert.match(daemon, /if \(task\.openPiSession\) \{[\s\S]*queueMessageIntoOpenPiSession\(task, workerInputMessage\(message, request\.useGoal\)\)[\s\S]*Queued message in open Pi session/, 'daemon replies to an open interactive pi session by queueing into that pi instead of opening a competing worker');
 assert.match(daemon, /status: "paused",[\s\S]*needsUser: true,[\s\S]*needsUserReason: stoppedPiNeedsInputReason\(task\)/, 'daemon marks naturally stopped busy interactive pi sessions as needs input');
 assert.match(daemon, /if \(liveTrackedWorker\) \{[\s\S]*\.\.\.task,[\s\S]*sessionFile: task\.sessionFile \|\| activeSession\.sessionFile/, 'daemon preserves live tracked worker status over passive session scans');
 assert.match(daemon, /const staleBusySession = \["running", "active", "queued", "thinking", "thinkingqueued"\]\.includes\(activeStatus\)/, 'daemon detects stale busy pi sessions');
 assert.match(daemon, /const scannedPausedFromMissingInteractiveProcess = activeStatus === "paused"[\s\S]*preserveStoredWorking = storedWorking[\s\S]*scannedPausedFromMissingInteractiveProcess/, 'daemon does not let passive session scans pause a stored working background task');
-assert.match(daemon, /const preserveStoredTerminal = terminalTask && \(staleBusySession \|\| taskStatus === "paused"\)/, 'daemon always preserves paused stored task state over busy session scans');
+assert.match(daemon, /const preserveStoredTerminal = terminalTask && \(staleBusySession \|\| taskStatus === "paused" \|\| scannedPausedFromMissingInteractiveProcess\)/, 'daemon preserves terminal stored task state over busy or passively paused session scans');
 assert.match(daemon, /const preserveStoredWorking = storedWorking && \(\(scannedComplete && storedWorkingIsNewerThanScan\(task, activeSession\)\) \|\| scannedPausedFromMissingInteractiveProcess\)/, 'daemon keeps working state over older completed scans and passive paused scans');
 assert.match(daemon, /const preserveStoredState = preserveStoredTerminal \|\| preserveStoredWorking[\s\S]*status: preserveStoredState \? task\.status : \(activeSession\.status \|\| task\.status\)/, 'daemon preserves stored task state only when the stored state is newer or terminal');
 assert.match(daemon, /lastInput: activeSession\.lastInput \|\| task\.lastInput/, 'daemon merges scanned session last input into stored task rows');

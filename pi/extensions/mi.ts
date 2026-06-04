@@ -280,7 +280,9 @@ async function startMiDaemon() {
 }
 
 function normalizeMiResponse(text: string) {
-	return text.trim() || "Mi completed without text.";
+	const trimmed = text.trim();
+	if (!trimmed) throw new Error("Mi produced no response text.");
+	return trimmed;
 }
 
 function miPrompt(message: string) {
@@ -615,7 +617,7 @@ function lastAssistantTextFromMessages(messages: unknown[] = []) {
 }
 
 async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
-	if (process.env.MI_MAIN === "1") return;
+	if (process.env.MI_MAIN === "1" || process.env.MI_WORKER === "1") return;
 	const sessionFile = ctx.sessionManager.getSessionFile?.();
 	if (!sessionFile) return;
 	await mkdir(MI_PI_BRIDGE_DIR, { recursive: true });
@@ -697,6 +699,24 @@ function publishPiSessionEvent(ctx: any, event: Record<string, unknown>) {
 	});
 }
 
+function compactProgressValue(value: unknown, fallback = "") {
+	return String(value || fallback).replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+function toolEventInput(event: any) {
+	return event?.input || event?.args || event?.toolInput || event?.arguments || {};
+}
+
+function summarizePiSessionToolStart(toolName: unknown, input: Record<string, unknown> = {}) {
+	const name = String(toolName || "tool");
+	if (name === "bash") return "running shell command";
+	if (name === "read") return `reading ${compactProgressValue(input.path, "file")}`;
+	if (name === "edit") return `editing ${compactProgressValue(input.path, "file")}`;
+	if (name === "write") return `writing ${compactProgressValue(input.path, "file")}`;
+	if (name.includes("fetch") || name.includes("browser")) return `checking ${compactProgressValue(input.url || input.path, name)}`;
+	return `using ${compactProgressValue(name, "tool")}`;
+}
+
 export default function miExtension(pi: ExtensionAPI) {
 	let assistantProgress = "";
 	let lastProgressPublish = 0;
@@ -733,7 +753,7 @@ export default function miExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_start", async (event: any, ctx) => {
-		publishPiSessionEvent(ctx, { kind: "tool_start", status: "running", progress: `tool: ${String(event.toolName || "tool")}` });
+		publishPiSessionEvent(ctx, { kind: "tool_start", status: "running", progress: summarizePiSessionToolStart(event.toolName, toolEventInput(event)) });
 	});
 
 	pi.on("agent_end", async (event: any, ctx) => {
@@ -752,7 +772,7 @@ export default function miExtension(pi: ExtensionAPI) {
 				event.systemPrompt +
 				`
 
-Mi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under \`${MI_TASKS_DIR}/\` (for example \`${join(MI_TASKS_DIR, "TODO.md")}\`, \`${join(MI_TASKS_DIR, "goals.md")}\`, or task-specific \`.md\` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send \`prompt\` commands, queue \`steer\`/\`follow_up\`, inspect \`get_state\`/\`get_messages\`, \`abort\` if needed, and \`new_session\` for fresh threads. Keep worker conversations visible in normal \`/resume\` by using the default pi session store: run \`pi --mode rpc\` from the relevant project cwd, or explicitly \`pi --mode rpc --session-dir ${PI_SESSION_DIR}\`. Do not create worker sessions under nested custom session dirs like \`${join(PI_SESSION_DIR, "mi-workers")}\` unless the user asks for hidden/isolated sessions. Set helpful session names with \`set_session_name\` so they are easy to find in \`/resume\`. If useful, write small Node/shell supervisor scripts under ${MI_RUNTIME_DIR}/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available. When ${miUserName()} asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring manual cron syntax. Mi crons live in \`${join(MI_TASKS_DIR, "state", "crons.json")}\` and are managed with \`mi cron add <name> --every 1h [--cwd <path>] -- <command>\`, \`mi cron list\`, \`mi cron tick\`, and \`mi cron remove <name>\`. Ask only for missing repo/path, cadence, health command, and alert behavior. When ${miUserName()} gives Mi a substantive task that needs coding, repo inspection, testing, research, or multi-step work, immediately hand it off to a background pi worker instead of doing the work in Mi. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with \`mi task <name> [--cwd <path>] -- <task prompt>\`. Name it clearly. Mi task sends the prompt as written by default; therefore every background-worker prompt you create from Mi main must be a self-contained handoff, not just the last user sentence. Include the current request, relevant Mi main thread context, repo/path/cwd, constraints, prior decisions, artifacts/files/URLs, approval/risk notes, acceptance criteria, and what the worker should report back. Do not assume the worker can see Mi main chat unless you include it in the handoff. If the handoff is too long or awkward for one shell command, write it to a temporary Markdown file under ${MI_RUNTIME_DIR}/ and pass it with command substitution or another safe local mechanism. ${miUserName()} may still start a task prompt with \`/goal\` when explicit standing-goal behavior is wanted. This command returns after the worker starts; do not wait for the task to finish before replying. Worker sessions use ${PI_SESSION_DIR} so they are visible in \`/resume\`. Use \`mi task list\` to inspect background task status. When ${miUserName()} responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: \`mi task reply <task-id-or-name> -- <follow-up prompt>\`. Follow-ups are sent as written too; include any new Mi-main context that the worker needs, and if ${miUserName()} starts the follow-up with \`/goal\`, it is forwarded as a pi slash command. Escalate to ${miUserName()} when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs ${miUserName()} review/merge.`,
+Mi-specific capability note: You are the persistent Mi main agent. Store every Mi task, goal, objective, todo list, plan, or work queue as Markdown files under \`${MI_TASKS_DIR}/\` (for example \`${join(MI_TASKS_DIR, "TODO.md")}\`, \`${join(MI_TASKS_DIR, "goals.md")}\`, or task-specific \`.md\` files). Keep those Markdown files current as work starts, changes, or completes; do not keep durable Mi tasks/goals only in chat memory. You can launch, manage, and actively interact with separate pi conversations yourself. Do not treat them as human-only TUI sessions. Use pi RPC mode for headless worker conversations and drive them programmatically over stdin/stdout: send \`prompt\` commands, queue \`steer\`/\`follow_up\`, inspect \`get_state\`/\`get_messages\`, \`abort\` if needed, and \`new_session\` for fresh threads. Keep worker conversations visible in normal \`/resume\` by using the default pi session store: run \`pi --mode rpc\` from the relevant project cwd, or explicitly \`pi --mode rpc --session-dir ${PI_SESSION_DIR}\`. Do not create worker sessions under nested custom session dirs like \`${join(PI_SESSION_DIR, "mi-workers")}\` unless the user asks for hidden/isolated sessions. Set helpful session names with \`set_session_name\` so they are easy to find in \`/resume\`. If useful, write small Node/shell supervisor scripts under ${MI_RUNTIME_DIR}/ to keep worker processes, send prompts, collect results, monitor completion, and coordinate multiple worker conversations. You may tell the user you cannot operate an interactive TUI like a human, but you can get work done through RPC-backed pi conversations. Do not say you cannot launch/manage/interact with separate pi conversations just because you are inside Mi; the pi CLI/RPC API is available. When ${miUserName()} asks in plain English to monitor, periodically check, alert on, or schedule something, create or update a Mi cron instead of requiring manual cron syntax. Mi crons live in \`${join(MI_TASKS_DIR, "state", "crons.json")}\` and are managed with \`mi cron add <name> --every 1h [--cwd <path>] -- <command>\`, \`mi cron list\`, \`mi cron tick\`, and \`mi cron remove <name>\`. Ask only for missing repo/path, cadence, health command, and alert behavior. Route deliberately instead of reflexively handing everything off. Keep normal conversation, quick answers, drafts, summaries, planning, and handoff meta-questions in Mi main. Use a background pi worker only when the current request clearly needs coding, repo/file/service inspection, testing, research, or multi-step execution. When you do hand off, first understand the request, choose or continue the relevant worker, then reply to ${miUserName()} with a concise, specific acknowledgement that says what you understood, why it needs a worker, and that the result will be posted back here. If there is already a relevant running/background task, continue that same session; otherwise create a new background pi worker conversation with \`mi task <name> [--cwd <path>] -- <task prompt>\`. Name it clearly. Mi task sends the prompt as written by default; therefore every background-worker prompt you create from Mi main must be a self-contained handoff, not just the last user sentence. Include the current request, relevant Mi main thread context, repo/path/cwd, constraints, prior decisions, artifacts/files/URLs, approval/risk notes, acceptance criteria, and what the worker should report back. Do not assume the worker can see Mi main chat unless you include it in the handoff. If the handoff is too long or awkward for one shell command, write it to a temporary Markdown file under ${MI_RUNTIME_DIR}/ and pass it with command substitution or another safe local mechanism. ${miUserName()} may still start a task prompt with \`/goal\` when explicit standing-goal behavior is wanted. This command returns after the worker starts; do not wait for the task to finish before replying. Worker sessions use ${PI_SESSION_DIR} so they are visible in \`/resume\`. Use \`mi task list\` to inspect background task status. When ${miUserName()} responds to a task result or asks for changes/follow-up on a task, continue the same worker conversation with: \`mi task reply <task-id-or-name> -- <follow-up prompt>\`. Follow-ups are sent as written too; include any new Mi-main context that the worker needs, and if ${miUserName()} starts the follow-up with \`/goal\`, it is forwarded as a pi slash command. Escalate to ${miUserName()} when approval, ambiguity, or risk blocks progress. If the worker opens or updates a PR, it must include the full GitHub PR URL in its final answer and state whether it needs ${miUserName()} review/merge.`,
 		}));
 
 		// Socket/UI clients own thread persistence. Do not mirror raw Mi-main

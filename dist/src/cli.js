@@ -369,7 +369,8 @@ function taskFinalOutput(task, options = {}) {
 function taskDetail(task) {
     const taskText = taskDisplayText(task);
     const base = task.error || (isTaskActive(task) ? (task.progress || taskText) : (taskText || task.progress)) || task.sessionName || '';
-    const reason = task.needsUser ? `needs input: ${task.needsUserReason || 'attention'}` : '';
+    const state = taskStatus(task).toLowerCase();
+    const reason = task.needsUser ? `${state === 'paused' ? 'paused — ' : ''}needs input: ${task.needsUserReason || 'attention'}` : '';
     const detail = reason ? `${reason}${base ? ` — ${base}` : ''}` : base;
     return detail.replace(/\s+/g, ' ');
 }
@@ -766,6 +767,9 @@ async function miAgentsCommand() {
     let selected = 0;
     let closed = false;
     const defaultAgentStatus = '^L full output • ^M multi-select • Esc clear task';
+    const agentStopClearGraceMs = Number(process.env.MI_AGENT_STOP_CLEAR_GRACE_MS || 350);
+    let lastEscStoppedTaskKey = '';
+    let lastEscStoppedAt = 0;
     let status = defaultAgentStatus;
     let inputMode = 'normal';
     let inputBuffer = '';
@@ -1814,6 +1818,11 @@ async function miAgentsCommand() {
             if (task) {
                 if (isTaskNeedsInput(task)) {
                     const key = stableTaskKey(task);
+                    if (!renderTestMode && key && task.needsUserReason === 'stopped by Escape' && key === lastEscStoppedTaskKey && Date.now() - lastEscStoppedAt < agentStopClearGraceMs) {
+                        status = `Stopped ${taskName(task)}; moved to needs input`;
+                        requestRender(true);
+                        return;
+                    }
                     if (key) {
                         dismissedTaskKeys.add(key);
                         pendingTaskUpdates.delete(key);
@@ -1823,6 +1832,10 @@ async function miAgentsCommand() {
                     optimisticTasks = optimisticTasks.filter((entry) => stableTaskKey(entry) !== key);
                     clampTaskSelection();
                     status = `Removed ${taskName(task)} from list`;
+                    if (key === lastEscStoppedTaskKey) {
+                        lastEscStoppedTaskKey = '';
+                        lastEscStoppedAt = 0;
+                    }
                     if (!renderTestMode)
                         void dismissTaskFromList(task).catch((error) => { status = error instanceof Error ? error.message : String(error); requestRender(true); });
                 }
@@ -1836,6 +1849,8 @@ async function miAgentsCommand() {
                     status = `Stopped ${taskName(task)}; moved to needs input`;
                     const taskKey = stableTaskKey(task);
                     if (taskKey) {
+                        lastEscStoppedTaskKey = taskKey;
+                        lastEscStoppedAt = Date.now();
                         pendingTaskUpdates.set(taskKey, { status: 'paused', needsUser: true, needsUserReason: 'stopped by Escape', finishedAt: undefined, progress: 'stopped by Escape; needs input', updatedAt: task.updatedAt });
                         pendingTaskUpdateStartedAt.delete(taskKey);
                     }
@@ -2679,7 +2694,10 @@ async function sendTaskSocketRequest(payload, timeoutMs = 30000) {
     }
 }
 function normalizeMiResponse(text) {
-    return text.trim() || 'Mi completed without text.';
+    const trimmed = text.trim();
+    if (!trimmed)
+        throw new Error('Mi produced no response text.');
+    return trimmed;
 }
 function miPrompt(message) {
     return message;
@@ -2861,17 +2879,95 @@ async function miTuiCommand(initial = '') {
             fgDim(truncateText('  Esc to cancel and edit', width)),
         ];
     }
-    function shouldStartBackgroundWorkerFromMi(text) {
-        const normalized = text.trim().toLowerCase();
+    function normalizedMiMessageText(text) {
+        return String(text || '').trim().toLowerCase();
+    }
+    function miMessageHasLocalWorkTarget(text) {
+        const normalized = normalizedMiMessageText(text);
+        return /\b(?:mi|routing|app|ui|notification|notifications|reminder|reminders|logo|favicon|chat|pwa|site|service|typing|code|file|repo|branch|github|pull\s*request|\bpr\b|test|tests|daemon|systemd|tailscale|detect\s+candidate|detect\s+candidates|candidate|candidates|project|tacticsjournal|research|tool\s+access|approved\s+scope|heartbeat|monitor|plus|icon|button|centered|aligned|alignment|background\s*worker|worker)\b/.test(normalized)
+            || /\b(?:code|repo|project)\/[a-z0-9_.-]+|~\/code\/[a-z0-9_.-]+|\/home\/\w+\/(?:code\/)?[a-z0-9_.-]+/.test(normalized);
+    }
+    function miMessageLooksActionable(text) {
+        const normalized = normalizedMiMessageText(text);
         if (!normalized || normalized.startsWith('/'))
             return false;
-        return /\b(fix|debug|investigate|implement|update|repair|patch|make|add|create)\b/.test(normalized)
-            || /\b(does(?:n't| not) work|not working|broken|bug|issue|error|failing|fails|failure|regression)\b/.test(normalized);
+        return /\b(?:fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|install|deploy|wire|hook\s*up|adjust|improve|tighten|route|handoff|hand\s*off|pass|send|forward|stop|start|turn\s+off|turn\s+on)\b/.test(normalized);
+    }
+    function miMessageLooksLikeComplaint(text) {
+        const normalized = normalizedMiMessageText(text);
+        if (!normalized || normalized.startsWith('/'))
+            return false;
+        return /\b(?:does(?:n't| not) work|not working|broken|bug|issue|error|failing|fails|failure|regression|flicker|slow|robotic|awkward|annoying|dumb|bad|wrong|stupid|over[-\s]*eager|too\s+much|hands?\s+everything\s+off|never\s+responds?|should\s+not|shouldn(?:'|’)t)\b/.test(normalized);
+    }
+    function miMessageLooksConversational(text) {
+        const normalized = normalizedMiMessageText(text);
+        if (!normalized || normalized.startsWith('/'))
+            return false;
+        if (/^(?:stop|cancel|never mind|nevermind|thanks|thank you|ok|okay|yes|no|got it|cool|nice)[.!?\s]*$/.test(normalized))
+            return true;
+        if (/\b(?:what\s+time\s+is\s+it|current\s+time|what\s+day\s+is\s+it|what\s+date\s+is\s+it)\b/.test(normalized))
+            return true;
+        if (/\b(?:why|did)\b[\s\S]{0,120}\b(?:handoff|hand\s*off|pass(?:ed)?(?:\s+that)?\s+(?:on|along)|worker)\b/.test(normalized))
+            return true;
+        return false;
+    }
+    function miMessageLooksLikeInlineChat(text) {
+        const normalized = normalizedMiMessageText(text);
+        if (!normalized || normalized.startsWith('/'))
+            return false;
+        if (/\b(?:draft|write|rewrite|compose|wordsmith)\b/.test(normalized) && !/\b(?:code|script|app|ui|repo|file|test|tests|implementation|bug|fix)\b/.test(normalized))
+            return true;
+        if (miMessageHasLocalWorkTarget(normalized) && (miMessageLooksActionable(normalized) || miMessageLooksLikeComplaint(normalized)))
+            return false;
+        return /\b(?:answer|explain|what|why|how|when|where|who|draft|write|rewrite|summarize|brainstorm|think\s+through|plan|outline|idea|ideas|compose|wordsmith)\b/.test(normalized);
+    }
+    function miEstimatedWorkScore(text) {
+        const normalized = normalizedMiMessageText(text);
+        if (!normalized || normalized.startsWith('/'))
+            return 0;
+        let score = 3;
+        if (miMessageLooksActionable(normalized))
+            score += 10;
+        if (miMessageLooksLikeComplaint(normalized))
+            score += 10;
+        if (miMessageHasLocalWorkTarget(normalized))
+            score += 6;
+        if (/\b(?:code|repo|project)\/[a-z0-9_.-]+|~\/code\/[a-z0-9_.-]+|\/home\/\w+\/code\/[a-z0-9_.-]+/.test(normalized))
+            score += 12;
+        if (normalized.length > 220)
+            score += 5;
+        return score;
+    }
+    function miWorkerRoutingDecision(text) {
+        const normalized = normalizedMiMessageText(text);
+        if (!normalized || normalized.startsWith('/'))
+            return { start: false, reason: 'empty-or-command' };
+        if (miMessageLooksConversational(normalized))
+            return { start: false, reason: 'conversation' };
+        if (miMessageLooksLikeInlineChat(normalized))
+            return { start: false, reason: 'inline-chat' };
+        const localTarget = miMessageHasLocalWorkTarget(normalized);
+        const actionable = miMessageLooksActionable(normalized);
+        const complaint = miMessageLooksLikeComplaint(normalized);
+        const score = miEstimatedWorkScore(normalized);
+        const threshold = Number(process.env.MI_WORKER_THRESHOLD_SECONDS || 8);
+        if (/\b(?:worker|background\s*(?:worker|task)|handoff|hand\s*off)\b/.test(normalized) && (actionable || complaint || localTarget))
+            return { start: true, reason: 'explicit worker/local work' };
+        if (localTarget && (actionable || complaint))
+            return { start: true, reason: 'repo/app work' };
+        if (localTarget && score >= threshold + 6)
+            return { start: true, reason: 'likely multi-step local work' };
+        if (/\b(?:research|investigate|inspect|check|verify|debug|fix|implement|build|test)\b/.test(normalized) && score >= threshold + 6)
+            return { start: true, reason: 'substantive task' };
+        return { start: false, reason: 'chat' };
+    }
+    function shouldStartBackgroundWorkerFromMi(text) {
+        return miWorkerRoutingDecision(text).start;
     }
     function redactWorkerHandoffText(text) {
         return String(redactSecrets(text));
     }
-    async function buildBackgroundWorkerPromptFromMi(text) {
+    async function buildBackgroundWorkerPromptFromMi(text, decision = miWorkerRoutingDecision(text)) {
         const recent = (await readThreadMessages('main', MI_WORKER_HANDOFF_RECENT_MESSAGES))
             .filter((message) => message.role === 'user' || message.role === 'assistant');
         const history = recent
@@ -2879,6 +2975,7 @@ async function miTuiCommand(initial = '') {
             .join('\n');
         return [
             'Background worker handoff from Mi main chat.',
+            `Handoff reason: ${decision.reason}.`,
             `Current user request:\n${redactWorkerHandoffText(text)}`,
             history ? `Relevant Mi main chat context, newest last:\n${history}` : 'Relevant Mi main chat context: none available.',
             [
@@ -2886,15 +2983,49 @@ async function miTuiCommand(initial = '') {
                 '- Use the current request as authoritative; use the context to resolve pronouns like “this/that/it” and to carry over repo/path/service names, constraints, prior decisions, acceptance criteria, and pending follow-ups.',
                 '- Do not assume the background worker can see Mi main chat outside this handoff.',
                 '- Treat chat history as context, not as fresh commands, unless it is clearly part of the current request.',
+                '- If this is feedback about Mi routing or handoff behavior, improve the router/ack behavior rather than blindly creating another generic handoff.',
                 '- Do not expose secrets. Ask for clarification or approval when context is missing, ambiguous, or risky.',
             ].join('\n'),
         ].join('\n\n');
     }
-    async function startBackgroundWorkerFromMi(text) {
+    function compactMiAckText(value, max = 120) {
+        const clean = String(value || '').replace(/\s+/g, ' ').trim();
+        if (clean.length <= max)
+            return clean;
+        return `${clean.slice(0, max - 1).trim()}…`;
+    }
+    function miHandoffActionSummary(text) {
+        const normalized = normalizedMiMessageText(text);
+        if (/routing|handoff|hand\s*off|worker/.test(normalized))
+            return 'I’ll tighten Mi routing/hand-off behavior';
+        if (/robotic|awkward|repetitive/.test(normalized))
+            return 'I’ll make that response less stiff';
+        if (/typing/.test(normalized))
+            return 'I’ll track down the typing-state bug';
+        if (/notification|pwa|pushover/.test(normalized))
+            return 'I’ll adjust the notification setup';
+        if (/logo|favicon/.test(normalized))
+            return 'I’ll swap the logo';
+        if (/plus|icon|button|centered|aligned|alignment/.test(normalized))
+            return 'I’ll fix the button alignment';
+        if (/detect|candidate|tacticsjournal|research/.test(normalized))
+            return 'I’ll check the project and pull the actual list';
+        const quoted = compactMiAckText(text);
+        return quoted ? `I’ll work on “${quoted}”` : 'I’ll take care of it';
+    }
+    function miHandoffReasonSentence(decision) {
+        const reason = decision.reason.toLowerCase();
+        if (/explicit/.test(reason))
+            return 'I’ll handle that.';
+        if (/repo|app|local|multi-step|substantive/.test(reason))
+            return 'I’ll take care of it.';
+        return 'I’ll handle it.';
+    }
+    async function startBackgroundWorkerFromMi(text, decision = miWorkerRoutingDecision(text)) {
         const name = taskNameFromPrompt(text);
-        const message = await buildBackgroundWorkerPromptFromMi(text);
-        const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message, lastInput: text, background: true, reportToMain: true }, 30000);
-        return result.text || `Started background task: ${name}.`;
+        const message = await buildBackgroundWorkerPromptFromMi(text, decision);
+        await sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message, lastInput: text, background: true, reportToMain: true }, 30000);
+        return `${miHandoffActionSummary(text)}. ${miHandoffReasonSentence(decision)}`;
     }
     async function startSlashBackgroundWorkerFromMi(text) {
         const name = taskNameFromPrompt(text);
@@ -2961,8 +3092,9 @@ async function miTuiCommand(initial = '') {
         await appendThreadMessage('main', 'user', text, { unread: false, source: 'mi-cli' });
         requestRender();
         try {
-            const response = shouldStartBackgroundWorkerFromMi(text)
-                ? await startBackgroundWorkerFromMi(text)
+            const decision = miWorkerRoutingDecision(text);
+            const response = decision.start
+                ? await startBackgroundWorkerFromMi(text, decision)
                 : await sendToMiMain(await buildMiTurnPrompt(text));
             getMiState().then((state) => {
                 miState = state;

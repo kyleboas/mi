@@ -140,22 +140,29 @@ async function acquireDaemonLock() {
       const lockStats = await stat(LOCK_PATH).catch(() => undefined);
       const lock = parseDaemonLock(lockText, lockStats);
       const lockAgeMs = lock.updatedAtMs ? Date.now() - lock.updatedAtMs : Number.POSITIVE_INFINITY;
+      const lockLifetimeMs = lockStats?.birthtimeMs ? Date.now() - lockStats.birthtimeMs : lockAgeMs;
       const ownerAlive = lock.pid && existsSync(`/proc/${lock.pid}`);
-      if (ownerAlive && lockAgeMs < MI_DAEMON_LOCK_START_GRACE_MS) {
+      const socketExists = existsSync(SOCKET_PATH);
+      if (ownerAlive && lockAgeMs < MI_DAEMON_LOCK_START_GRACE_MS && !socketExists && lockLifetimeMs < MI_DAEMON_LOCK_START_GRACE_MS) {
         await log(`waiting for daemon lock ${LOCK_PATH} owned by starting pid ${lock.pid}`);
         await new Promise((resolve) => setTimeout(resolve, 250));
         continue;
       }
-      if (ownerAlive && lockAgeMs < MI_DAEMON_LOCK_STALE_MS) {
+      if (ownerAlive && lockAgeMs < MI_DAEMON_LOCK_STALE_MS && existsSync(SOCKET_PATH)) {
         await log(`singleton exit; daemon lock owner ${lock.pid} is alive with fresh heartbeat (${Math.round(lockAgeMs)}ms old)`);
         return false;
       }
       if (ownerAlive) {
-        await log(`removing stale unhealthy daemon lock ${LOCK_PATH} owned by pid ${lock.pid}; heartbeat age ${Math.round(lockAgeMs)}ms`);
+        const reason = lockAgeMs < MI_DAEMON_LOCK_STALE_MS && !socketExists ? "missing socket" : "stale heartbeat";
+        await log(`removing stale unhealthy daemon lock ${LOCK_PATH} owned by pid ${lock.pid}; ${reason}; heartbeat age ${Math.round(lockAgeMs)}ms; lock lifetime ${Math.round(lockLifetimeMs)}ms`);
         try { process.kill(lock.pid, "SIGTERM"); } catch {}
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
-      await rm(LOCK_PATH, { force: true }).catch(() => undefined);
+      const currentLockText = await readFile(LOCK_PATH, "utf8").catch(() => "");
+      const currentLock = parseDaemonLock(currentLockText, await stat(LOCK_PATH).catch(() => undefined));
+      if (currentLock.pid === lock.pid && currentLock.updatedAtMs === lock.updatedAtMs) {
+        await rm(LOCK_PATH, { force: true }).catch(() => undefined);
+      }
     }
   }
   return false;
@@ -515,6 +522,14 @@ function taskInputFromRequest(request, fallback) {
   return text || fallback;
 }
 
+function similarTaskTopic(task) {
+  const text = normalizeLastInputText(`${task?.lastInput || ""} ${task?.name || ""} ${task?.sessionName || ""}`).toLowerCase();
+  if (/\b(?:worker|background\s*(?:worker|task)|handoff|hand\s*off|routing|router|route)\b/.test(text) && /\b(?:worker|background|handoff|hand\s*off|routing|router|route|task|similar|dedupe|duplicate|old)\b/.test(text)) return "mi-routing-worker-behavior";
+  if (/\b(?:morning|daily)\s+brief(?:ing)?\b|\bbriefing\b/.test(text)) return "mi-morning-briefing";
+  if (/\b(?:detect\s+candidate|detect\s+candidates|tacticsjournal|research)\b/.test(text)) return "detect-review";
+  return "";
+}
+
 function sameLogicalTask(a, b) {
   if (samePiSessionTask(a, b)) return true;
   const sameCwd = String(a?.cwd || "") === String(b?.cwd || "");
@@ -524,6 +539,9 @@ function sameLogicalTask(a, b) {
   const aLastInput = normalizedLastInput(a);
   const bLastInput = normalizedLastInput(b);
   if (sameCwd && aLastInput && aLastInput === bLastInput) return true;
+  const aTopic = similarTaskTopic(a);
+  const bTopic = similarTaskTopic(b);
+  if (sameCwd && aTopic && aTopic === bTopic) return true;
   return false;
 }
 
@@ -539,6 +557,10 @@ function stoppedPiNeedsInputReason(task) {
 }
 
 function reconcileStoredTask(task) {
+  if (task?.openPiPid && !existsSync(`/proc/${Number(task.openPiPid)}`)) {
+    const { openPiSession, openPiPid, openPiInput, bridgeSocket, ...rest } = task;
+    task = rest;
+  }
   const status = String(task.status || "").toLowerCase();
   const working = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status);
   if (working && !taskHasActiveWorker(task)) {
@@ -643,8 +665,8 @@ async function mergeOpenPiSessions(tasks, dismissed) {
     const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus);
     const storedWorking = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(taskStatus) && !task.finishedAt;
     const scannedComplete = ["complete", "completed", "done", "inactive"].includes(activeStatus) || activeSession.finishedAt;
-    const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused");
     const scannedPausedFromMissingInteractiveProcess = activeStatus === "paused" && /no longer running|stopped before replying/i.test(activeSession.needsUserReason || "");
+    const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused" || scannedPausedFromMissingInteractiveProcess);
     const preserveStoredWorking = storedWorking && ((scannedComplete && storedWorkingIsNewerThanScan(task, activeSession)) || scannedPausedFromMissingInteractiveProcess);
     const preserveStoredState = preserveStoredTerminal || preserveStoredWorking;
     return {
@@ -959,7 +981,8 @@ function onStdout(chunk) {
     } else if (payload.type === "agent_end" && activePrompt) {
       const entry = activePrompt;
       activePrompt = undefined;
-      entry.resolve(lastAssistantText(payload.messages) || "Mi completed without text.");
+      const text = lastAssistantText(payload.messages);
+      text ? entry.resolve(text) : entry.reject(new Error("Mi produced no response text."));
       maybeStartNextPrompt();
       scheduleStopPi();
     }
@@ -1043,6 +1066,13 @@ function summarizeWorkerEvent(event) {
   if (event.type === "compaction_start") return "compacting context";
   if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") return String(event.assistantMessageEvent.delta || "");
   return undefined;
+}
+
+function normalizePiSessionProgress(progress, text = "") {
+  const value = String(progress || text || "pi session activity").replace(/\s+/g, " ").trim();
+  const rawTool = value.match(/^tool:\s*([A-Za-z0-9_-]+)\b/i)?.[1];
+  if (!rawTool) return value.slice(0, 500);
+  return summarizeToolStart(rawTool, {}).slice(0, 500);
 }
 
 function rpcLaunchCommand(args, env = {}) {
@@ -1174,7 +1204,8 @@ async function finishTask({ task, worker, before, sessionFile, name, done, kind,
   try {
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
-    const text = lastAssistantText(end.messages) || "Worker completed without text.";
+    const text = lastAssistantText(end.messages);
+    if (!text) throw new Error("Worker produced no response text.");
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
     await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model });
     if (reportToMain) await appendMainThreadMessage(text, "mi-worker-result");
@@ -1279,7 +1310,8 @@ async function runWorker(request) {
     }
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
-    const text = lastAssistantText(end.messages) || "Worker completed without text.";
+    const text = lastAssistantText(end.messages);
+    if (!text) throw new Error("Worker produced no response text.");
     await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text });
     return { text, sessionFile: await mirrorSessionToHome(after.sessionFile || before.sessionFile), sessionId: after.sessionId || before.sessionId, sessionName: after.sessionName || name, model: after.model || before.model };
   } catch (error) {
@@ -1429,7 +1461,8 @@ async function continueWorker(request) {
     await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
-    const text = lastAssistantText(end.messages) || "Worker completed without text.";
+    const text = lastAssistantText(end.messages);
+    if (!text) throw new Error("Worker produced no response text.");
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile);
     await upsertTask({ ...updated, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile, sessionFile: visibleSessionFile });
     return { text, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name };
@@ -1444,7 +1477,7 @@ async function handlePiSessionEvent(request) {
   const tasks = await readTasks();
   const existing = tasks.find((task) => task.sessionFile === sessionFile || task.actualSessionFile === sessionFile || sessionFingerprint(task) === sessionFingerprint({ sessionFile }));
   const text = String(request.text || "").trim();
-  const progress = String(request.progress || text || "pi session activity").trim().slice(0, 500);
+  const progress = normalizePiSessionProgress(request.progress, text);
   const status = String(request.status || existing?.status || "running").trim();
   const isComplete = ["complete", "completed", "done"].includes(status.toLowerCase());
   const task = await upsertTask({
@@ -1464,6 +1497,8 @@ async function handlePiSessionEvent(request) {
     actualSessionFile: sessionFile,
     sessionId: request.sessionId || existing?.sessionId,
     sessionName: existing?.sessionName || existing?.name,
+    needsUser: false,
+    needsUserReason: undefined,
     openPiSession: true,
     openPiPid: request.pid || existing?.openPiPid,
     bridgeSocket: request.bridgeSocket || piBridgeSocketPath(sessionFile),

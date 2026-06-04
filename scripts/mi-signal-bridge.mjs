@@ -359,8 +359,8 @@ async function handleEvent(config, event, seen, statePath, state) {
 async function receiveOnce(config) {
   const args = [
     ...signalGlobalArgs(config),
+    '--output', 'json',
     'receive',
-    '--json',
     '--ignore-attachments',
     '--ignore-stories',
     '--ignore-avatars',
