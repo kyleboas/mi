@@ -200,6 +200,37 @@ try {
   const withInput = visible(fullSnapshot.frames[4]).join('\n');
   assert.ok(withInput.includes('reply text'), 'input remains visible and usable in full output mode');
 
+  const jumpTasksPath = join(root, 'jump-tasks.json');
+  const jumpReloadPath = join(root, 'jump-tasks-reload.json');
+  await writeFile(jumpTasksPath, JSON.stringify([
+    { id: 'jump-a', name: 'render-jump-a', status: 'running', startedAt: iso(1000), updatedAt: iso(1000) },
+    { id: 'jump-b', name: 'render-jump-b', status: 'running', startedAt: iso(2000), updatedAt: iso(2000) },
+    { id: 'jump-c', name: 'render-jump-c', status: 'running', startedAt: iso(3000), updatedAt: iso(3000) },
+  ], null, 2));
+  await writeFile(jumpReloadPath, JSON.stringify([
+    { id: 'jump-c', name: 'render-jump-c', status: 'running', startedAt: iso(3000), updatedAt: iso(9000) },
+    { id: 'jump-a', name: 'render-jump-a', status: 'running', startedAt: iso(1000), updatedAt: iso(8000) },
+    { id: 'jump-b', name: 'render-jump-b', status: 'running', startedAt: iso(2000), updatedAt: iso(7000) },
+  ], null, 2));
+  const jumpResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: jumpTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: `down,reload:${jumpReloadPath},down`,
+      MI_AGENT_RENDER_TEST_ROWS: '14',
+      MI_AGENT_RENDER_TEST_COLS: '80',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(jumpResult.status, 0, jumpResult.stderr || jumpResult.stdout);
+  const jumpFrames = JSON.parse(jumpResult.stdout).frames;
+  assert.equal(jumpFrames[1].selectedTask, 'render-jump-b', 'first Down selects the second visible task');
+  assert.equal(jumpFrames[2].selectedTask, 'render-jump-b', 'refresh/reorder preserves the selected logical task');
+  assert.equal(jumpFrames[3].selectedTask, 'render-jump-c', 'next Down moves to the next stable visible task, not a refreshed random neighbor');
+
   const longActivitySessionPath = join(root, 'long-activity-session.jsonl');
   await writeFile(longActivitySessionPath, `${JSON.stringify({
     type: 'message',

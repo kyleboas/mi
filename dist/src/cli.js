@@ -815,6 +815,47 @@ async function miAgentsCommand() {
     let agentThinkingLevel = String(MI_MODEL).match(/:(off|minimal|low|medium|high|xhigh)$/)?.[1];
     let agentModelPicker;
     const dismissedTaskKeys = new Set();
+    const taskDisplayOrder = new Map();
+    let nextTaskDisplayOrder = 0;
+    function rememberTaskDisplayOrder(newTasks, previousTasks = tasks) {
+        const previousForOrderKey = (key) => previousTasks.find((entry) => stableTaskKey(entry) === key);
+        const unseen = [];
+        for (const task of newTasks) {
+            const key = stableTaskKey(task);
+            if (!key || taskDisplayOrder.has(key))
+                continue;
+            const previous = previousTasks.find((entry) => tasksSameIdentity(entry, task));
+            const previousKey = previous ? stableTaskKey(previous) : '';
+            const previousOrder = previousKey ? taskDisplayOrder.get(previousKey) : undefined;
+            if (previousOrder !== undefined)
+                taskDisplayOrder.set(key, previousOrder);
+            else
+                unseen.push(task);
+        }
+        if (unseen.length > 0) {
+            const orders = [...taskDisplayOrder.values()];
+            const orderedUnseen = orders.length === 0
+                ? [...unseen].sort((a, b) => taskSectionRank(a) - taskSectionRank(b) || taskSectionMovedMs(b) - taskSectionMovedMs(a) || taskStartedMs(b) - taskStartedMs(a) || taskUpdatedMs(b) - taskUpdatedMs(a))
+                : unseen;
+            let insertOrder = orders.length > 0 ? Math.min(...orders) - orderedUnseen.length : nextTaskDisplayOrder;
+            for (const task of orderedUnseen) {
+                const key = stableTaskKey(task);
+                if (!key)
+                    continue;
+                taskDisplayOrder.set(key, insertOrder++);
+            }
+            nextTaskDisplayOrder = Math.max(nextTaskDisplayOrder, ...taskDisplayOrder.values(), 0) + 1;
+        }
+        for (const [key] of [...taskDisplayOrder.entries()]) {
+            const previous = previousForOrderKey(key);
+            if (!newTasks.some((task) => stableTaskKey(task) === key || (previous && tasksSameIdentity(task, previous))))
+                taskDisplayOrder.delete(key);
+        }
+    }
+    function taskDisplayOrderValue(task) {
+        const key = stableTaskKey(task);
+        return key ? taskDisplayOrder.get(key) ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+    }
     const renderTestRows = Number(process.env.MI_AGENT_RENDER_TEST_ROWS || '') || undefined;
     const renderTestCols = Number(process.env.MI_AGENT_RENDER_TEST_COLS || '') || undefined;
     const rows = () => renderTestRows || process.stdout.rows || 24;
@@ -869,7 +910,9 @@ async function miAgentsCommand() {
             const selectedKey = previouslySelectedTask ? stableTaskKey(previouslySelectedTask) : '';
             const listedTasks = dedupeTasksByStableKey((await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task))));
             optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic)));
-            tasks = dedupeTasksByStableKey([...optimisticTasks, ...listedTasks]).map((task) => {
+            const nextTasks = dedupeTasksByStableKey([...optimisticTasks, ...listedTasks]);
+            rememberTaskDisplayOrder(nextTasks, tasks);
+            tasks = nextTasks.map((task) => {
                 const key = stableTaskKey(task);
                 const terminal = ['complete', 'error', 'stopped', 'paused'].includes(String(task.status || '').toLowerCase());
                 if (terminal) {
@@ -1146,7 +1189,7 @@ async function miAgentsCommand() {
         return tasks
             .map((task, index) => ({ task, index }))
             .filter((item) => taskSection(item.task) === label)
-            .sort((a, b) => taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task));
+            .sort((a, b) => taskDisplayOrderValue(a.task) - taskDisplayOrderValue(b.task) || taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task));
     }
     function navigationTaskIndexes() {
         return ['needs input', 'working', 'completed'].flatMap((label) => sectionTaskItems(label).map((item) => item.index));
@@ -1454,6 +1497,7 @@ async function miAgentsCommand() {
         };
         optimisticTasks = [optimisticTask, ...optimisticTasks];
         tasks = [optimisticTask, ...tasks];
+        rememberTaskDisplayOrder(tasks, tasks.slice(1));
         selected = 0;
         status = `Starting ${value} in background...`;
         agentSubmitting = true;
@@ -1533,6 +1577,7 @@ async function miAgentsCommand() {
             };
             optimisticTasks = [optimisticTask, ...optimisticTasks];
             tasks = [optimisticTask, ...tasks];
+            rememberTaskDisplayOrder(tasks, tasks.slice(1));
             selected = 0;
             status = `Starting ${name} with ${turn.model}...`;
             agentSubmitting = true;
@@ -1925,7 +1970,9 @@ async function miAgentsCommand() {
         const fixturePath = process.env.MI_AGENT_RENDER_TEST_TASKS;
         if (fixturePath)
             tasks = dedupeTasksByStableKey(JSON.parse(readFileSync(fixturePath, 'utf8')));
+        rememberTaskDisplayOrder(tasks, []);
         clampTaskSelection();
+        selected = navigationTaskIndexes()[0] ?? selected;
         const width = cols();
         const frames = [];
         const snapshot = (event) => frames.push({
@@ -1965,8 +2012,21 @@ async function miAgentsCommand() {
                 const name = event.slice('add:'.length).trim() || `render-added-${Date.now().toString(36)}`;
                 const ts = new Date().toISOString();
                 const task = { id: `render-test-${name}`, name, cwd: HOME, status: 'running', progress: `test-added ${name}`, startedAt: ts, updatedAt: ts };
+                const previousTasks = tasks;
                 tasks = dedupeTasksByStableKey([task, ...tasks]);
+                rememberTaskDisplayOrder(tasks, previousTasks);
                 selected = 0;
+                clampTaskSelection();
+            }
+            else if (event.startsWith('reload:')) {
+                const previouslySelectedTask = selectedTask();
+                const selectedKey = previouslySelectedTask ? stableTaskKey(previouslySelectedTask) : '';
+                const previousTasks = tasks;
+                tasks = dedupeTasksByStableKey(JSON.parse(readFileSync(event.slice('reload:'.length), 'utf8')));
+                rememberTaskDisplayOrder(tasks, previousTasks);
+                const nextSelected = findTaskIndexByIdentity(tasks, previouslySelectedTask, selectedKey);
+                if (nextSelected >= 0)
+                    selected = nextSelected;
                 clampTaskSelection();
             }
             else {
@@ -2718,7 +2778,7 @@ async function startMiDaemonWithSystemd() {
         return false;
     if (!await runQuiet('/usr/bin/systemctl', ['--user', 'start', unit], 10000))
         return false;
-    return waitForMiDaemonHealth(10000);
+    return waitForMiDaemonHealth(30000);
 }
 async function startMiDaemon() {
     await mkdir(dirname(MI_SOCKET_PATH), { recursive: true });
@@ -2730,7 +2790,7 @@ async function startMiDaemon() {
         env: { ...process.env, MI_SOCKET_PATH, MI_RUNTIME_DIR },
     });
     child.unref();
-    if (await waitForMiDaemonHealth(5000))
+    if (await waitForMiDaemonHealth(30000))
         return;
     throw new Error('Mi main did not start');
 }

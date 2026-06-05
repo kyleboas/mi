@@ -126,7 +126,7 @@ assert.match(cli, /function tasksSameIdentity\(a: MiTask, b: MiTask\)[\s\S]*task
 assert.match(cli, /function mergeTaskIdentity\(previous: MiTask, next: MiTask\)/, 'agent view merges duplicate row data instead of dropping session details');
 assert.match(cli, /function dedupeTasksByStableKey\(list: MiTask\[\]\)[\s\S]*tasksSameIdentity\(entry, task\)/, 'agent view dedupes visible rows by broad stable identity');
 assert.match(cli, /const listedTasks = dedupeTasksByStableKey\(\(await listTasks\(\)\)/, 'agent refresh dedupes daemon task list before rendering');
-assert.match(cli, /tasks = dedupeTasksByStableKey\(\[\.\.\.optimisticTasks, \.\.\.listedTasks\]\)\.map/, 'agent refresh dedupes optimistic and daemon rows together');
+assert.match(cli, /const nextTasks = dedupeTasksByStableKey\(\[\.\.\.optimisticTasks, \.\.\.listedTasks\]\)[\s\S]*rememberTaskDisplayOrder\(nextTasks, tasks\)[\s\S]*tasks = nextTasks\.map/, 'agent refresh dedupes optimistic and daemon rows together before preserving display order');
 assert.match(cli, /function normalizeVisibleTasks\(\)[\s\S]*dedupeTasksByStableKey\(tasks\)[\s\S]*function renderAgentLines[\s\S]*normalizeVisibleTasks\(\)/, 'agent render also dedupes in-memory rows before drawing so selection cannot multiply pi sessions');
 assert.match(cli, /const update = pendingTaskUpdates\.get\(key\)/, 'refresh overlays pending updates so reply UI does not flicker stale state');
 assert.match(cli, /inputMode === 'normal' && value[\s\S]*replyTarget = task;[\s\S]*inputMode = 'reply';/, 'normal submitted text falls back to replying to the selected task');
@@ -208,7 +208,7 @@ assert.match(cli, /function taskTimeLabel\(task: MiTask\)[\s\S]*Date\.parse\(tas
 assert.match(cli, /function sectionTaskItems\(label: 'needs input' \| 'working' \| 'completed'\)/, 'mi agents builds sorted section task lists');
 assert.match(cli, /function taskStartedMs\(task: MiTask\)[\s\S]*Date\.parse\(task\.startedAt \|\| task\.continuedAt \|\| task\.updatedAt/, 'task ordering can use task start time');
 assert.match(cli, /function taskSectionMovedMs\(task: MiTask\)[\s\S]*section === 'needs input'[\s\S]*task\.notifiedNeedsUserAt \|\| task\.notifiedPausedAt[\s\S]*section === 'working'[\s\S]*task\.continuedAt \|\| task\.startedAt[\s\S]*task\.finishedAt/, 'section ordering uses the timestamp when each task entered its current section');
-assert.match(cli, /\.sort\(\(a, b\) => taskSectionMovedMs\(b\.task\) - taskSectionMovedMs\(a\.task\) \|\| taskStartedMs\(b\.task\) - taskStartedMs\(a\.task\) \|\| taskUpdatedMs\(b\.task\) - taskUpdatedMs\(a\.task\)\)/, 'each mi agents section sorts newest to oldest without live update churn');
+assert.match(cli, /\.sort\(\(a, b\) => taskDisplayOrderValue\(a\.task\) - taskDisplayOrderValue\(b\.task\)[\s\S]*taskSectionMovedMs\(b\.task\) - taskSectionMovedMs\(a\.task\)/, 'each mi agents section uses stable display order first so live updates do not churn navigation');
 assert.match(cli, /for \(const label of \['needs input', 'working', 'completed'\] as const\)/, 'mi agents splits tasks into needs input, working, and completed sections');
 assert.match(cli, /label === 'completed' && selectedSection !== 'completed'[\s\S]*sectionTasks\.slice\(0, 3\)/, 'mi agents initially shows only the newest three completed tasks');
 assert.match(cli, /`completed \(\$\{visibleSectionTasks\.length\} shown of \$\{sectionTasks\.length\}\)`/, 'mi agents indicates completed list count when capped');
