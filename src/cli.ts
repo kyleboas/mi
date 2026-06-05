@@ -34,7 +34,7 @@ import {
 
 initTheme(process.env.PI_THEME, false);
 
-const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 10000);
+const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 1000);
 const MI_AGENT_CLOCK_MS = Number(process.env.MI_AGENT_CLOCK_MS || 1000);
 const PI_LOADER_INTERVAL_MS = 80;
 const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
@@ -496,8 +496,13 @@ function readSessionFinalOutput(sessionFile: string, options: { full?: boolean }
   return '';
 }
 
+const sessionFullTranscriptCache = new Map<string, { size: number; mtimeMs: number; value: Array<{ role: 'user' | 'assistant'; text: string }> }>();
+
 function readSessionFullTranscript(sessionFile: string) {
   try {
+    const stats = statSync(sessionFile);
+    const cached = sessionFullTranscriptCache.get(sessionFile);
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) return cached.value;
     const raw = readSessionOutputSync(sessionFile, true);
     const items: Array<{ role: 'user' | 'assistant'; text: string }> = [];
     for (const line of raw.trim().split(/\r?\n/)) {
@@ -514,6 +519,7 @@ function readSessionFullTranscript(sessionFile: string) {
       if (!text || isNonFinalAssistantText(text)) continue;
       items.push({ role, text });
     }
+    sessionFullTranscriptCache.set(sessionFile, { size: stats.size, mtimeMs: stats.mtimeMs, value: items });
     return items;
   } catch {}
   return [];
@@ -680,6 +686,13 @@ function dedupeTasksByStableKey(list: MiTask[]) {
   return merged;
 }
 
+function findTaskIndexByIdentity(list: MiTask[], selectedTask: MiTask | undefined, selectedKey = selectedTask ? stableTaskKey(selectedTask) : '') {
+  if (!selectedTask && !selectedKey) return -1;
+  const byStableKey = selectedKey ? list.findIndex((task) => stableTaskKey(task) === selectedKey) : -1;
+  if (byStableKey >= 0) return byStableKey;
+  return selectedTask ? list.findIndex((task) => tasksSameIdentity(task, selectedTask)) : -1;
+}
+
 async function stopTaskInList(task: MiTask) {
   const taskId = task.id || task.sessionFile || task.sessionName || task.name;
   if (!taskId) return;
@@ -842,7 +855,8 @@ async function miAgentsCommand() {
     let forceFullRender = false;
     try {
       const beforeRenderSignature = tasks.map(taskRenderSignature).join('\u001e');
-      const selectedKey = selectedTask() ? stableTaskKey(selectedTask()!) : '';
+      const previouslySelectedTask = selectedTask();
+      const selectedKey = previouslySelectedTask ? stableTaskKey(previouslySelectedTask) : '';
       const listedTasks = dedupeTasksByStableKey((await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task))));
       optimisticTasks = optimisticTasks.filter((optimistic) => !listedTasks.some((task) => tasksSameIdentity(task, optimistic)));
       tasks = dedupeTasksByStableKey([...optimisticTasks, ...listedTasks]).map((task) => {
@@ -859,8 +873,8 @@ async function miAgentsCommand() {
         const update = pendingTaskUpdates.get(key);
         return update ? { ...task, ...update } : task;
       });
-      if (selectedKey) {
-        const nextSelected = tasks.findIndex((task) => stableTaskKey(task) === selectedKey);
+      if (selectedKey || previouslySelectedTask) {
+        const nextSelected = findTaskIndexByIdentity(tasks, previouslySelectedTask, selectedKey);
         if (nextSelected >= 0) selected = nextSelected;
       }
       clampTaskSelection();
@@ -1206,14 +1220,13 @@ async function miAgentsCommand() {
   }
 
   function normalizeVisibleTasks() {
-    const selectedKey = selectedTask() ? stableTaskKey(selectedTask()!) : '';
+    const previouslySelectedTask = selectedTask();
+    const selectedKey = previouslySelectedTask ? stableTaskKey(previouslySelectedTask) : '';
     const deduped = dedupeTasksByStableKey(tasks);
     if (deduped.length !== tasks.length) {
       tasks = deduped;
-      if (selectedKey) {
-        const nextSelected = tasks.findIndex((task) => stableTaskKey(task) === selectedKey);
-        if (nextSelected >= 0) selected = nextSelected;
-      }
+      const nextSelected = findTaskIndexByIdentity(tasks, previouslySelectedTask, selectedKey);
+      if (nextSelected >= 0) selected = nextSelected;
       clampTaskSelection();
     }
   }
@@ -1266,13 +1279,20 @@ async function miAgentsCommand() {
             ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
           ])
         : renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
-      // Like pi: render the conversation above the normal input footer instead
-      // of fitting it into an internal viewport. The terminal/tmux scrollback
-      // owns scrolling; because the footer is last, the visible screen lands at
-      // the latest output with input still usable.
-      lines.push(...outputLines);
+      // Keep full-output mode bounded to the visible pane. Rendering the entire
+      // transcript on every keypress makes typing laggy in large sessions; PageUp
+      // and PageDown move this internal viewport instead.
+      const viewportHeight = Math.max(1, contentHeight - lines.length);
+      const hasScrollHint = outputLines.length > viewportHeight;
+      const outputViewportHeight = Math.max(1, viewportHeight - (hasScrollHint ? 1 : 0));
+      const maxScroll = Math.max(0, outputLines.length - outputViewportHeight);
+      fullLastOutputScroll = Math.max(0, Math.min(fullLastOutputScroll, maxScroll));
+      const start = Math.max(0, outputLines.length - outputViewportHeight - fullLastOutputScroll);
+      if (hasScrollHint) lines.push(fgDim(truncateText(fullLastOutputScroll > 0 ? '↓ PageDown for newer output' : '↑ PageUp for older output', width)));
+      lines.push(...outputLines.slice(start, start + outputViewportHeight));
+      while (lines.length < contentHeight) lines.push('');
       lines.push(...footerLines);
-      return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
+      return lines.slice(0, height).map((line) => padVisibleEnd(truncateText(line, width), width));
     }
     lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
     lines.push(fgThinking(undefined, '─'.repeat(width)));
@@ -1719,12 +1739,8 @@ async function miAgentsCommand() {
       return;
     }
     if (fullLastOutputMode && !inputBuffer && (isPageUpKey(data) || isPageDownKey(data))) {
-      // Do not implement an internal full-output pager. Native terminal/tmux
-      // scrollback handles long output like pi; PageUp/PageDown switch the
-      // selected task whose full output is shown.
-      if (tasks.length > 0) selected = Math.max(0, Math.min(tasks.length - 1, selected + (isPageUpKey(data) ? -1 : 1)));
-      fullLastOutputScroll = 0;
-      requestRender();
+      fullLastOutputScroll = Math.max(0, fullLastOutputScroll + (isPageUpKey(data) ? 12 : -12));
+      requestRender(true);
       return;
     }
     if (isPageUpKey(data) || isPageDownKey(data)) {
@@ -1947,6 +1963,7 @@ const MI_TASKS_DIR = join(HOME, 'mi');
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 'mi');
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
+const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const MI_MODEL = process.env.MI_MODEL || 'openai-codex/gpt-5.5:low';
 const PI_CYCLE_PATH = join(HOME, '.pi', 'agent', 'pi-cycle.json');
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, 'preferences.md');
@@ -2656,22 +2673,55 @@ function isStaleMiSocketError(error: unknown) {
   return message.includes('ECONNREFUSED') || message.includes('ENOENT') || message.includes('Timed out waiting for Mi main');
 }
 
+function runQuiet(command: string, args: string[], timeoutMs = 10000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: 'ignore' });
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      resolve(false);
+    }, timeoutMs);
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve(code === 0);
+    });
+  });
+}
+
+async function waitForMiDaemonHealth(timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await sendSocketRequest({ type: 'health' }, 500);
+      return true;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  return false;
+}
+
+async function startMiDaemonWithSystemd() {
+  const unit = String(MI_DAEMON_SYSTEMD_UNIT || '').trim();
+  if (!unit || process.env.MI_DAEMON_SYSTEMD === '0' || !existsSync('/usr/bin/systemctl')) return false;
+  if (!await runQuiet('/usr/bin/systemctl', ['--user', 'cat', unit], 3000)) return false;
+  if (!await runQuiet('/usr/bin/systemctl', ['--user', 'start', unit], 10000)) return false;
+  return waitForMiDaemonHealth(10000);
+}
+
 async function startMiDaemon() {
   await mkdir(dirname(MI_SOCKET_PATH), { recursive: true });
+  if (await startMiDaemonWithSystemd()) return;
   const child = spawn(process.execPath, [MI_DAEMON_PATH], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, MI_SOCKET_PATH, MI_RUNTIME_DIR },
   });
   child.unref();
-  for (let i = 0; i < 20; i++) {
-    try {
-      await sendSocketRequest({ type: 'health' }, 500);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  }
+  if (await waitForMiDaemonHealth(5000)) return;
   throw new Error('Mi main did not start');
 }
 

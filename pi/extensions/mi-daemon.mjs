@@ -20,7 +20,7 @@ const DISMISSED_TASKS_PATH = join(HOME, "mi", "state", "dismissed-tasks.json");
 const MI_PREFERENCES_PATH = join(HOME, "mi", "preferences.md");
 const PI_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const ACTIVE_SESSION_WINDOW_MS = Number(process.env.MI_ACTIVE_PI_SESSION_WINDOW_MS || 7 * 24 * 60 * 60_000);
-const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 5000);
+const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 1000);
 const MI_MAIN_IDLE_MS = Number(process.env.MI_MAIN_IDLE_MS || 120000);
 const MI_DAEMON_LOCK_START_GRACE_MS = Number(process.env.MI_DAEMON_LOCK_START_GRACE_MS || 30000);
 const MI_DAEMON_LOCK_STALE_MS = Number(process.env.MI_DAEMON_LOCK_STALE_MS || 120000);
@@ -1391,14 +1391,10 @@ function sanitizeTerminalPaste(text) {
 async function queueMessageIntoOpenPiSession(task, message) {
   const body = sanitizeTerminalPaste(message);
   if (!body) throw new Error("Message is empty");
-  if (await sendMessageIntoPiBridge(task, body).catch(() => false)) return true;
-  const input = String(task.openPiInput || "");
-  if (!task.openPiSession || !input) return false;
-  if (!input.startsWith("/dev/pts/") && !input.startsWith("/dev/tty")) throw new Error(`Open Pi session has no safe terminal input path: ${task.name || task.id}`);
-  const pid = Number(task.openPiPid || 0);
-  if (pid && !existsSync(`/proc/${pid}`)) return false;
-  await appendFile(input, `\x1b[200~${body}\x1b[201~\r`);
-  return true;
+  return await sendMessageIntoPiBridge(task, body).catch(async (error) => {
+    await log(`pi_bridge_queue_failed ${task.name || task.id || "unknown"}: ${String(error.message || error)}`);
+    return false;
+  });
 }
 
 async function continueWorker(request) {
@@ -1631,6 +1627,7 @@ await chmod(SESSION_DIR, 0o700).catch(() => undefined);
 
 const server = net.createServer((socket) => {
   let data = "";
+  socket.on("error", (error) => void log(`client_socket_error ${String(error.message || error)}`));
   socket.on("data", (chunk) => {
     data += chunk.toString("utf8");
     if (!data.includes("\n")) return;
