@@ -23,8 +23,8 @@ import { readRecentEvents, logEvent } from './state.js';
 import { redactSecrets } from './redact.js';
 import { appendThreadMessage, compactThread, createTempThread, getThread, listThreads, markThreadRead, readThreadMessages, threadContext, } from './threads.js';
 initTheme(process.env.PI_THEME, false);
-const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 1000);
-const MI_IDLE_TASK_POLL_MS = Number(process.env.MI_IDLE_TASK_POLL_MS || 5000);
+const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 3000);
+const MI_IDLE_TASK_POLL_MS = Number(process.env.MI_IDLE_TASK_POLL_MS || 10000);
 const MI_AGENT_CLOCK_MS = Number(process.env.MI_AGENT_CLOCK_MS || 1000);
 const PI_LOADER_INTERVAL_MS = 80;
 const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
@@ -904,10 +904,14 @@ async function miAgentsCommand() {
     function taskRenderSignature(task) {
         return [stableTaskKey(task), task.status, task.needsUser, task.needsUserReason, task.error, task.progress, task.text, task.finishedAt, task.updatedAt].map((value) => String(value ?? '')).join('\u001f');
     }
+    function taskLayoutSignature(task) {
+        return [stableTaskKey(task), taskSection(task), task.status, task.needsUser, task.needsUserReason, task.finishedAt].map((value) => String(value ?? '')).join('\u001f');
+    }
     async function refresh() {
         let forceFullRender = false;
         try {
             const beforeRenderSignature = tasks.map(taskRenderSignature).join('\u001e');
+            const beforeLayoutSignature = tasks.map(taskLayoutSignature).join('\u001e');
             const previouslySelectedTask = selectedTask();
             const selectedKey = previouslySelectedTask ? stableTaskKey(previouslySelectedTask) : '';
             const listedTasks = dedupeTasksByStableKey((await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task))));
@@ -934,7 +938,10 @@ async function miAgentsCommand() {
                     selected = nextSelected;
             }
             clampTaskSelection();
-            forceFullRender = beforeRenderSignature !== tasks.map(taskRenderSignature).join('\u001e');
+            const changed = beforeRenderSignature !== tasks.map(taskRenderSignature).join('\u001e');
+            forceFullRender = beforeLayoutSignature !== tasks.map(taskLayoutSignature).join('\u001e');
+            if (!changed)
+                forceFullRender = false;
             status = inputMode === 'normal' && !agentSubmitting ? (multiSelectMode ? multiSelectStatus() : defaultAgentStatus) : status;
         }
         catch (error) {
