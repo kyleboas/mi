@@ -35,6 +35,7 @@ import {
 initTheme(process.env.PI_THEME, false);
 
 const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 1000);
+const MI_IDLE_TASK_POLL_MS = Number(process.env.MI_IDLE_TASK_POLL_MS || 5000);
 const MI_AGENT_CLOCK_MS = Number(process.env.MI_AGENT_CLOCK_MS || 1000);
 const PI_LOADER_INTERVAL_MS = 80;
 const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
@@ -796,6 +797,7 @@ async function miAgentsCommand() {
   let tui: TUI | undefined;
   let pollTimer: NodeJS.Timeout | undefined;
   let clockTimer: NodeJS.Timeout | undefined;
+  let lastIdlePollAt = 0;
   const renderTestMode = process.env.MI_AGENT_RENDER_TEST === '1';
   let piCycleConfig = renderTestMode ? { shortcut: 'z', tiers: { '1': [MI_MODEL], '2': [MI_MODEL], '3': [MI_MODEL] }, thinkingLevels: {} } : await loadPiCycleConfig();
   const piCycleNextIndex: Record<string, number> = { '1': 0, '2': 0, '3': 0 };
@@ -1319,20 +1321,13 @@ async function miAgentsCommand() {
             ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
           ])
         : renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
-      // Keep full-output mode bounded to the visible pane. Rendering the entire
-      // transcript on every keypress makes typing laggy in large sessions; PageUp
-      // and PageDown move this internal viewport instead.
-      const viewportHeight = Math.max(1, contentHeight - lines.length);
-      const hasScrollHint = outputLines.length > viewportHeight;
-      const outputViewportHeight = Math.max(1, viewportHeight - (hasScrollHint ? 1 : 0));
-      const maxScroll = Math.max(0, outputLines.length - outputViewportHeight);
-      fullLastOutputScroll = Math.max(0, Math.min(fullLastOutputScroll, maxScroll));
-      const start = Math.max(0, outputLines.length - outputViewportHeight - fullLastOutputScroll);
-      if (hasScrollHint) lines.push(fgDim(truncateText(fullLastOutputScroll > 0 ? '↓ PageDown for newer output' : '↑ PageUp for older output', width)));
-      lines.push(...outputLines.slice(start, start + outputViewportHeight));
-      while (lines.length < contentHeight) lines.push('');
+      // Like pi: render the conversation above the normal input footer instead
+      // of fitting it into an internal viewport. The terminal/tmux scrollback
+      // owns scrolling; because the footer is last, the visible screen lands at
+      // the latest output with input still usable.
+      lines.push(...outputLines);
       lines.push(...footerLines);
-      return lines.slice(0, height).map((line) => padVisibleEnd(truncateText(line, width), width));
+      return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
     }
     lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
     lines.push(fgThinking(undefined, '─'.repeat(width)));
@@ -1677,6 +1672,7 @@ async function miAgentsCommand() {
       for (const keyPart of keyParts) onData(keyPart);
       return;
     }
+    if (isTerminalKeyRelease(data)) return;
     if (agentModelPicker) {
       agentModelPicker.handleInput(data);
       requestRender();
@@ -1781,8 +1777,12 @@ async function miAgentsCommand() {
       return;
     }
     if (fullLastOutputMode && !inputBuffer && (isPageUpKey(data) || isPageDownKey(data))) {
-      fullLastOutputScroll = Math.max(0, fullLastOutputScroll + (isPageUpKey(data) ? 12 : -12));
-      requestRender(true);
+      // Do not implement an internal full-output pager. Native terminal/tmux
+      // scrollback handles long output like pi; PageUp/PageDown switch the
+      // selected task whose full output is shown.
+      if (tasks.length > 0) selected = Math.max(0, Math.min(tasks.length - 1, selected + (isPageUpKey(data) ? -1 : 1)));
+      fullLastOutputScroll = 0;
+      requestRender();
       return;
     }
     if (isPageUpKey(data) || isPageDownKey(data)) {
@@ -1955,9 +1955,14 @@ async function miAgentsCommand() {
   // and look like duplicate tasks after section/status changes.
   tui = startPiTuiScreen(new FunctionScreen(renderAgentLines, onData), { alternateScreen: true });
   await refresh();
-  pollTimer = setInterval(() => void refresh(), MI_TASK_POLL_MS);
+  pollTimer = setInterval(() => {
+    const hasLiveWork = agentSubmitting || resumeLoading || tasks.some(isTaskActive) || optimisticTasks.some(isTaskActive);
+    if (!hasLiveWork && Date.now() - lastIdlePollAt < MI_IDLE_TASK_POLL_MS) return;
+    if (!hasLiveWork) lastIdlePollAt = Date.now();
+    void refresh();
+  }, MI_TASK_POLL_MS);
   clockTimer = setInterval(() => {
-    if (tasks.length === 0 && resumeSessions.length === 0) return;
+    if (!resumeLoading && !tasks.some(isTaskActive) && !optimisticTasks.some(isTaskActive)) return;
     requestRender();
   }, MI_AGENT_CLOCK_MS);
   // Working background agents use a static filled dot; task state arrives via polling,
@@ -2598,11 +2603,16 @@ function renderMiTranscript(transcript: Array<MiTranscriptItem>, width: number) 
 }
 
 function isPageUpKey(data: string) {
-  return matchesKey(data, 'pageUp') || /\x1b\[5(?:;\d+)?~/.test(data);
+  return matchesKey(data, 'pageUp') || /\x1b\[5(?:;\d+)?(?::\d+)?~/.test(data);
 }
 
 function isPageDownKey(data: string) {
-  return matchesKey(data, 'pageDown') || /\x1b\[6(?:;\d+)?~/.test(data);
+  return matchesKey(data, 'pageDown') || /\x1b\[6(?:;\d+)?(?::\d+)?~/.test(data);
+}
+
+function isTerminalKeyRelease(data: string) {
+  if (data.includes('\x1b[200~') || data.includes('\x1b[201~')) return false;
+  return /\x1b\[(?:\d+(?::\d*)?(?::\d+)?(?:;\d+)?:3u|\d+:3u|\d+(?:;\d+)?:3[~ABCDHF]|\d+:3[~ABCDHF])/.test(data);
 }
 
 function isUpKey(data: string) {
@@ -2623,7 +2633,7 @@ function isCtrlMShortcut(data: string) {
 
 function splitTerminalInput(data: string) {
   if (data.includes('\x1b[200~') || data.includes('\x1b[201~')) return [data];
-  return data.match(/\x1b\[27;\d+;\d+~|\x1b\[\d+(?::\d*)?(?::\d+)?(?:;\d+)?(?::\d+)?u|\x1b\[5(?:;\d+)?~|\x1b\[6(?:;\d+)?~|\x1b\[1;2Z|\x1b\[Z|\x1b\t|\x1b\[[ABCD]|\x1bO[ABCD]|\r|\n|\x03|\x0c|\x1b|[^\x1b\r\n\x03\x0c]+/gs) || [];
+  return data.match(/\x1b\[27;\d+;\d+~|\x1b\[\d+(?::\d*)?(?::\d+)?(?:;\d+)?(?::\d+)?u|\x1b\[[56](?:;\d+)?(?::\d+)?~|\x1b\[1;2Z|\x1b\[Z|\x1b\t|\x1b\[[ABCD]|\x1bO[ABCD]|\r|\n|\x03|\x0c|\x1b|[^\x1b\r\n\x03\x0c]+/gs) || [];
 }
 
 function renderPiEditor(editor: Editor, width: number) {

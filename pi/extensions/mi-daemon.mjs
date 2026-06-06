@@ -720,7 +720,8 @@ async function listAllTasks(options = {}) {
   const reconciledRawTasks = rawTasks.map(reconcileStoredTask);
   if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
   const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
-  if (options.lazy !== false && activeWorkers.size === 0) {
+  const hasStoredActiveTask = storedTasks.some((task) => !task.finishedAt && ["running", "waiting", "active", "queued", "thinking", "thinkingqueued"].includes(String(task.status || "").toLowerCase()));
+  if (options.lazy !== false && PI_SESSION_SCAN_CACHE_MS !== 0 && activeWorkers.size === 0 && !hasStoredActiveTask) {
     scheduleTaskDiscovery();
     return storedTasks;
   }
