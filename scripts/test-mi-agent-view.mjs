@@ -18,6 +18,7 @@ assert.match(cli, /function renderMiTranscript\(transcript:[\s\S]*if \(body\.len
 assert.match(cli, /function renderPiEditorText\(text: string, width: number, terminalRows: number\)[\s\S]*new Editor\(tui, piEditorTheme\(\)\)/, 'Mi renders input with pi Editor styling');
 assert.match(cli, /async function miAgentsCommand\(\)/, 'cli defines mi agents view command');
 assert.match(cli, /pollTimer\s*=\s*setInterval\(\(\) => \{[\s\S]*hasLiveWork[\s\S]*MI_IDLE_TASK_POLL_MS[\s\S]*void refresh\(\);[\s\S]*\}, MI_TASK_POLL_MS\)/, 'agent view polls live task state and backs off when idle');
+assert.match(cli, /function taskLayoutSignature\(task: MiTask\)[\s\S]*taskSection\(task\)[\s\S]*forceFullRender = beforeLayoutSignature !== tasks\.map\(taskLayoutSignature\)/, 'agent view only forces full renders for layout changes, not live progress updates');
 assert.match(cli, /const MI_TASK_POLL_MS = Number\(process\.env\.MI_TASK_POLL_MS \|\| 3000\)/, 'agent view uses a bounded active polling cadence');
 assert.match(cli, /const MI_IDLE_TASK_POLL_MS = Number\(process\.env\.MI_IDLE_TASK_POLL_MS \|\| 10000\)/, 'agent view backs off polling when idle');
 assert.match(cli, /const MI_AGENT_CLOCK_MS = Number\(process\.env\.MI_AGENT_CLOCK_MS \|\| 1000\)/, 'agent view uses a local clock redraw for elapsed time labels');

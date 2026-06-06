@@ -891,10 +891,15 @@ async function miAgentsCommand() {
     return [stableTaskKey(task), task.status, task.needsUser, task.needsUserReason, task.error, task.progress, task.text, task.finishedAt, task.updatedAt].map((value) => String(value ?? '')).join('\u001f');
   }
 
+  function taskLayoutSignature(task: MiTask) {
+    return [stableTaskKey(task), taskSection(task), task.status, task.needsUser, task.needsUserReason, task.finishedAt].map((value) => String(value ?? '')).join('\u001f');
+  }
+
   async function refresh() {
     let forceFullRender = false;
     try {
       const beforeRenderSignature = tasks.map(taskRenderSignature).join('\u001e');
+      const beforeLayoutSignature = tasks.map(taskLayoutSignature).join('\u001e');
       const previouslySelectedTask = selectedTask();
       const selectedKey = previouslySelectedTask ? stableTaskKey(previouslySelectedTask) : '';
       const listedTasks = dedupeTasksByStableKey((await listTasks()).filter((task) => !dismissedTaskKeys.has(stableTaskKey(task))));
@@ -920,7 +925,9 @@ async function miAgentsCommand() {
         if (nextSelected >= 0) selected = nextSelected;
       }
       clampTaskSelection();
-      forceFullRender = beforeRenderSignature !== tasks.map(taskRenderSignature).join('\u001e');
+      const changed = beforeRenderSignature !== tasks.map(taskRenderSignature).join('\u001e');
+      forceFullRender = beforeLayoutSignature !== tasks.map(taskLayoutSignature).join('\u001e');
+      if (!changed) forceFullRender = false;
       status = inputMode === 'normal' && !agentSubmitting ? (multiSelectMode ? multiSelectStatus() : defaultAgentStatus) : status;
     } catch (error) {
       status = error instanceof Error ? error.message : String(error);
