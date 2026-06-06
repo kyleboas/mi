@@ -2024,6 +2024,7 @@ const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
 const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
 const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
+const MI_DAEMON_HOST = process.env.MI_DAEMON_HOST || join(HOME, 'bin', 'mi-daemon-host');
 const MI_MODEL = process.env.MI_MODEL || 'openai-codex/gpt-5.5:low';
 const PI_CYCLE_PATH = join(HOME, '.pi', 'agent', 'pi-cycle.json');
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, 'preferences.md');
@@ -2780,6 +2781,7 @@ async function startMiDaemonWithSystemd() {
 async function startMiDaemon() {
   await mkdir(dirname(MI_SOCKET_PATH), { recursive: true });
   if (await startMiDaemonWithSystemd()) return;
+  if (existsSync(MI_DAEMON_HOST) && await runQuiet(MI_DAEMON_HOST, [], 30000) && await waitForMiDaemonHealth(5000)) return;
   const child = spawn(process.execPath, [MI_DAEMON_PATH], {
     detached: true,
     stdio: 'ignore',
