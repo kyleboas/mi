@@ -28,6 +28,7 @@ const MI_DAEMON_LOCK_START_GRACE_MS = Number(process.env.MI_DAEMON_LOCK_START_GR
 const MI_DAEMON_LOCK_STALE_MS = Number(process.env.MI_DAEMON_LOCK_STALE_MS || 120000);
 const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_MS || 2000);
 const MI_DAEMON_IDLE_EXIT_MS = Number(process.env.MI_DAEMON_IDLE_EXIT_MS || 60000);
+const MI_TASK_DISCOVERY_DELAY_MS = Number(process.env.MI_TASK_DISCOVERY_DELAY_MS || 1500);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
@@ -52,6 +53,9 @@ let idleExitTimer;
 let activeRequestCount = 0;
 let lastClientActivityAt = Date.now();
 let piSessionTaskCache = { at: 0, tasks: [] };
+let taskDiscoveryTimer;
+let taskDiscoveryPromise;
+let lastTaskDiscoveryAt = 0;
 
 function miUserName() {
   const envName = process.env.MI_USER_NAME?.trim();
@@ -699,12 +703,28 @@ async function mergeOpenPiSessions(tasks, dismissed) {
   return dedupePiSessionTasks(merged);
 }
 
-async function listAllTasks() {
+function scheduleTaskDiscovery() {
+  if (taskDiscoveryTimer || taskDiscoveryPromise) return;
+  if (Date.now() - lastTaskDiscoveryAt < PI_IDLE_SESSION_SCAN_CACHE_MS) return;
+  taskDiscoveryTimer = setTimeout(() => {
+    taskDiscoveryTimer = undefined;
+    taskDiscoveryPromise = listAllTasks({ lazy: false })
+      .catch((error) => log(`task_discovery_error ${String(error.message || error)}`))
+      .finally(() => { taskDiscoveryPromise = undefined; });
+  }, MI_TASK_DISCOVERY_DELAY_MS);
+}
+
+async function listAllTasks(options = {}) {
   const dismissed = await readDismissedTaskKeys();
   const rawTasks = await readTasks();
   const reconciledRawTasks = rawTasks.map(reconcileStoredTask);
   if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
   const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
+  if (options.lazy !== false && activeWorkers.size === 0) {
+    scheduleTaskDiscovery();
+    return storedTasks;
+  }
+  lastTaskDiscoveryAt = Date.now();
   const mergedTasks = await mergeOpenPiSessions(storedTasks, dismissed);
   // Anything that appears in mi agents should stay there until the user clears it.
   // Discovered/open pi sessions used to disappear after the recent-session window;
