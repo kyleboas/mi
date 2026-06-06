@@ -21,10 +21,13 @@ const MI_PREFERENCES_PATH = join(HOME, "mi", "preferences.md");
 const PI_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const ACTIVE_SESSION_WINDOW_MS = Number(process.env.MI_ACTIVE_PI_SESSION_WINDOW_MS || 7 * 24 * 60 * 60_000);
 const PI_SESSION_SCAN_CACHE_MS = Number(process.env.MI_PI_SESSION_SCAN_CACHE_MS || 1000);
+const PI_IDLE_SESSION_SCAN_CACHE_MS = Number(process.env.MI_IDLE_PI_SESSION_SCAN_CACHE_MS || 30000);
+const PI_SESSION_SCAN_LIMIT = Number(process.env.MI_PI_SESSION_SCAN_LIMIT || 40);
 const MI_MAIN_IDLE_MS = Number(process.env.MI_MAIN_IDLE_MS || 120000);
 const MI_DAEMON_LOCK_START_GRACE_MS = Number(process.env.MI_DAEMON_LOCK_START_GRACE_MS || 30000);
 const MI_DAEMON_LOCK_STALE_MS = Number(process.env.MI_DAEMON_LOCK_STALE_MS || 120000);
 const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_MS || 2000);
+const MI_DAEMON_IDLE_EXIT_MS = Number(process.env.MI_DAEMON_IDLE_EXIT_MS || 60000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
@@ -45,6 +48,9 @@ const activeWorkers = new Map();
 const startingWorkerKeys = new Set();
 let activePrompt;
 let piIdleTimer;
+let idleExitTimer;
+let activeRequestCount = 0;
+let lastClientActivityAt = Date.now();
 let piSessionTaskCache = { at: 0, tasks: [] };
 
 function miUserName() {
@@ -425,6 +431,8 @@ async function listPiSessionTasks() {
   const now = Date.now();
   if (now - piSessionTaskCache.at < PI_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const activeProcesses = await listActivePiProcesses();
+  const idle = activeWorkers.size === 0 && activeProcesses.length === 0;
+  if (idle && now - piSessionTaskCache.at < PI_IDLE_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const files = await walkSessionFiles();
   const withStats = [];
   for (const file of files) {
@@ -435,7 +443,7 @@ async function listPiSessionTasks() {
   const selected = [];
   const selectedFiles = new Set();
   for (const entry of withStats) {
-    if (selected.length < 80 || explicitSessionFiles.has(entry.file)) {
+    if (selected.length < PI_SESSION_SCAN_LIMIT || explicitSessionFiles.has(entry.file)) {
       selected.push(entry);
       selectedFiles.add(entry.file);
     }
@@ -1627,14 +1635,20 @@ await chmod(SESSION_DIR, 0o700).catch(() => undefined);
 
 const server = net.createServer((socket) => {
   let data = "";
+  lastClientActivityAt = Date.now();
+  socket.on("close", () => { lastClientActivityAt = Date.now(); });
   socket.on("error", (error) => void log(`client_socket_error ${String(error.message || error)}`));
   socket.on("data", (chunk) => {
+    lastClientActivityAt = Date.now();
     data += chunk.toString("utf8");
     if (!data.includes("\n")) return;
     const line = data.slice(0, data.indexOf("\n"));
     let request;
     try { request = JSON.parse(line); } catch (error) { socket.end(JSON.stringify({ ok: false, error: String(error.message || error) }) + "\n"); return; }
-    handle(socket, request).catch((error) => socket.end(JSON.stringify({ ok: false, error: String(error.message || error) }) + "\n"));
+    activeRequestCount += 1;
+    handle(socket, request)
+      .catch((error) => socket.end(JSON.stringify({ ok: false, error: String(error.message || error) }) + "\n"))
+      .finally(() => { activeRequestCount = Math.max(0, activeRequestCount - 1); lastClientActivityAt = Date.now(); });
   });
 });
 
@@ -1642,8 +1656,27 @@ server.listen(SOCKET_PATH, () => {
   chmod(SOCKET_PATH, 0o600).catch(() => undefined);
   log(`listening ${SOCKET_PATH}`);
 });
-process.on("SIGTERM", async () => {
+
+function daemonIsBusy() {
+  return activeWorkers.size > 0 || startingWorkerKeys.size > 0 || pending.size > 0 || promptQueue.length > 0 || Boolean(activePrompt) || Boolean(piProc);
+}
+
+function startIdleExitTimer() {
+  if (!MI_DAEMON_IDLE_EXIT_MS) return;
+  if (idleExitTimer) clearInterval(idleExitTimer);
+  idleExitTimer = setInterval(() => {
+    if (daemonIsBusy()) return;
+    if (Date.now() - lastClientActivityAt < MI_DAEMON_IDLE_EXIT_MS) return;
+    void shutdown("idle");
+  }, Math.min(30000, Math.max(5000, Math.floor(MI_DAEMON_IDLE_EXIT_MS / 2))));
+}
+
+startIdleExitTimer();
+
+async function shutdown(signal = "shutdown") {
+  await log(`shutting down ${signal}`);
   if (daemonHeartbeatTimer) clearInterval(daemonHeartbeatTimer);
+  if (idleExitTimer) clearInterval(idleExitTimer);
   server.close();
   piProc?.kill();
   for (const worker of activeWorkers.values()) worker.proc?.kill();
@@ -1651,4 +1684,7 @@ process.on("SIGTERM", async () => {
   await rm(LOCK_PATH, { force: true }).catch(() => undefined);
   await daemonLockHandle?.close().catch(() => undefined);
   process.exit(0);
-});
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
