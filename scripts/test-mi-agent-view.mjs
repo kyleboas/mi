@@ -18,8 +18,8 @@ assert.match(cli, /function renderMiTranscript\(transcript:[\s\S]*if \(body\.len
 assert.match(cli, /function renderPiEditorText\(text: string, width: number, terminalRows: number\)[\s\S]*new Editor\(tui, piEditorTheme\(\)\)/, 'Mi renders input with pi Editor styling');
 assert.match(cli, /async function miAgentsCommand\(\)/, 'cli defines mi agents view command');
 assert.match(cli, /pollTimer\s*=\s*setInterval\(\(\) => \{[\s\S]*hasLiveWork[\s\S]*MI_IDLE_TASK_POLL_MS[\s\S]*void refresh\(\);[\s\S]*\}, MI_TASK_POLL_MS\)/, 'agent view polls live task state and backs off when idle');
-assert.match(cli, /const MI_TASK_POLL_MS = Number\(process\.env\.MI_TASK_POLL_MS \|\| 1000\)/, 'agent view uses a near-real-time active polling cadence');
-assert.match(cli, /const MI_IDLE_TASK_POLL_MS = Number\(process\.env\.MI_IDLE_TASK_POLL_MS \|\| 5000\)/, 'agent view backs off polling when idle');
+assert.match(cli, /const MI_TASK_POLL_MS = Number\(process\.env\.MI_TASK_POLL_MS \|\| 3000\)/, 'agent view uses a bounded active polling cadence');
+assert.match(cli, /const MI_IDLE_TASK_POLL_MS = Number\(process\.env\.MI_IDLE_TASK_POLL_MS \|\| 10000\)/, 'agent view backs off polling when idle');
 assert.match(cli, /const MI_AGENT_CLOCK_MS = Number\(process\.env\.MI_AGENT_CLOCK_MS \|\| 1000\)/, 'agent view uses a local clock redraw for elapsed time labels');
 assert.match(cli, /const PI_LOADER_INTERVAL_MS = 80/, 'Mi defines pi loader default interval');
 assert.match(cli, /const MI_AGENT_ANIMATION_MS = Number\(process\.env\.MI_AGENT_ANIMATION_MS \|\| 250\)/, 'agent view uses a lower default animation cadence than active pi chat');
@@ -331,7 +331,8 @@ assert.match(daemon, /const task = await upsertTask\(session\)/, 'adding from re
 assert.match(daemon, /function reconcileStoredTask\(task\)/, 'daemon reconciles stale running task state after restart');
 assert.match(daemon, /authoritative[\s\S]*finishTask\(\) writes complete[\s\S]*stop_task writes[\s\S]*paused\/needsUser/, 'daemon only leaves working after final output, error, or Esc pause');
 assert.match(daemon, /return \{ \.\.\.task, status: task\.status \|\| "running", finishedAt: undefined \}/, 'daemon keeps working tasks running when worker bookkeeping is missing');
-assert.match(daemon, /const PI_SESSION_SCAN_CACHE_MS = Number\(process\.env\.MI_PI_SESSION_SCAN_CACHE_MS \|\| 1000\)/, 'daemon refreshes active pi session scan at near-real-time mi agents polling cadence by default');
+assert.match(daemon, /const PI_SESSION_SCAN_CACHE_MS = Number\(process\.env\.MI_PI_SESSION_SCAN_CACHE_MS \|\| 3000\)/, 'daemon refreshes active pi session scan at a bounded cadence by default');
+assert.match(daemon, /const PI_SESSION_SCAN_LIMIT = Number\(process\.env\.MI_PI_SESSION_SCAN_LIMIT \|\| 15\)/, 'daemon limits pi session scan breadth by default');
 assert.doesNotMatch(daemon, /const RECENT_PI_SESSION_ACTIVE_MS = Number\(process\.env\.MI_RECENT_PI_SESSION_ACTIVE_MS \|\| 2 \* 60_000\)/, 'daemon no longer drops pi-session tasks after a recent-session window');
 assert.match(daemon, /function assistantMessageHasText\(message\)[\s\S]*Boolean\(textFromMessage\(message\)\)/, 'daemon can tell final assistant text apart from thinking/tool activity');
 assert.match(daemon, /function assistantMessageIsBusy\(message\)[\s\S]*toolCall[\s\S]*assistantMessageHasText\(message\)[\s\S]*return false[\s\S]*thinking/, 'daemon treats thinking-plus-final-text assistant messages as complete, not busy');

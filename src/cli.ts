@@ -34,8 +34,8 @@ import {
 
 initTheme(process.env.PI_THEME, false);
 
-const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 1000);
-const MI_IDLE_TASK_POLL_MS = Number(process.env.MI_IDLE_TASK_POLL_MS || 5000);
+const MI_TASK_POLL_MS = Number(process.env.MI_TASK_POLL_MS || 3000);
+const MI_IDLE_TASK_POLL_MS = Number(process.env.MI_IDLE_TASK_POLL_MS || 10000);
 const MI_AGENT_CLOCK_MS = Number(process.env.MI_AGENT_CLOCK_MS || 1000);
 const PI_LOADER_INTERVAL_MS = 80;
 const DISABLE_MOUSE_TRACKING_SEQUENCE = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l';
