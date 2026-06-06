@@ -628,6 +628,7 @@ async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
 	}
 	const server = net.createServer((socket) => {
 		let data = "";
+		socket.on("error", () => undefined);
 		socket.on("data", (chunk) => {
 			data += chunk.toString("utf8");
 			if (!data.includes("\n")) return;
@@ -656,9 +657,10 @@ async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
 				}
 				if (request.type === "mirror_message") {
 					const text = String(request.message || "").trim();
-					if (text) {
-						ctx.ui.notify(`${request.role === "user" ? "External user" : "External update"}: ${text.slice(0, 500)}`, "info");
-						pi.sendMessage({ customType: "mi-sync", content: `${request.role === "user" ? "External user message" : "External session update"}:\n\n${text}`, display: true, details: { source: "mi-sync", role: request.role } } as any, { deliverAs: "nextTurn" } as any);
+					if (text && request.role === "user") {
+						pi.sendUserMessage(text, { deliverAs: request.deliverAs === "followUp" ? "followUp" : "steer" } as any);
+					} else if (text) {
+						pi.sendMessage({ customType: "mi-sync", content: text, display: false, details: { source: "mi-sync", role: request.role } } as any, { deliverAs: "nextTurn" } as any);
 					}
 					socket.end(JSON.stringify({ ok: true }) + "\n");
 					return;

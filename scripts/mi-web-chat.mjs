@@ -36,6 +36,7 @@ const miRuntimeDir = process.env.MI_RUNTIME_DIR || path.join(home, '.pi', 'agent
 const miSocketPath = process.env.MI_SOCKET_PATH || path.join(miRuntimeDir, 'main.sock');
 const miDaemonPath = process.env.MI_DAEMON_PATH || path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
 const miDaemonSystemdUnit = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
+const miDaemonHost = process.env.MI_DAEMON_HOST || path.join(home, 'bin', 'mi-daemon-host');
 const workerModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';
 const workerThresholdSeconds = Number(process.env.MI_WEB_WORKER_THRESHOLD_SECONDS || 8);
 const pushoverEndpoint = 'https://api.pushover.net/1/messages.json';
@@ -430,6 +431,7 @@ async function startMiDaemonWithSystemd() {
 async function startMiDaemon() {
   await mkdir(path.dirname(miSocketPath), { recursive: true });
   if (await startMiDaemonWithSystemd()) return;
+  if (existsSync(miDaemonHost) && await runQuiet(miDaemonHost, [], 30000) && await waitForMiDaemonHealth(5000)) return;
   const child = spawn(process.execPath, [miDaemonPath], {
     detached: true,
     stdio: 'ignore',

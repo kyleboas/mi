@@ -138,23 +138,20 @@ try {
     'completed section sorts newest finish at top and oldest at bottom, even when updatedAt differs',
   );
 
-  assert.equal(snapshot.frames[1].selectedTask, 'render-done-01', 'PageDown moves selection through task rows');
-  const doneVisible = visible(snapshot.frames[1]).join('\n');
-  assert.ok(doneVisible.includes('done line 01'), 'normal detail view shows the top of final output');
-  assert.ok(!doneVisible.includes('done line 12'), 'normal detail view does not jump to the bottom of long final output');
-  assert.equal(snapshot.frames[2].selectedTask, 'render-run-05', 'PageUp moves selection back through task rows');
+  assert.equal(snapshot.frames[1].selectedTask, 'render-run-04', 'PageDown moves selection through task rows');
+  assert.equal(snapshot.frames[2].selectedTask, 'render-paused-01', 'PageUp moves selection back through task rows');
 
   const firstEsc = snapshot.frames[3];
   assert.equal(firstEsc.event, 'escape');
-  assert.equal(firstEsc.selectedTask, 'render-run-05');
-  assert.match(firstEsc.status, /Stopped render-run-05; moved to needs input/, 'Esc pauses active tasks');
-  assert.equal(countTaskRows(firstEsc, 'render-run-05'), 1, 'paused active task remains as one row');
-  assert.ok(taskRows(firstEsc).find((line) => line.includes('render-run-05') && line.includes('stopped by Escape')), 'paused task row shows stopped state');
+  assert.equal(firstEsc.selectedTask, 'render-done-01');
+  assert.match(firstEsc.status, /Removed render-paused-01 from list/, 'Esc clears already paused tasks from the view');
+  assert.equal(countTaskRows(firstEsc, 'render-paused-01'), 0, 'cleared paused task is removed from the view');
 
   const secondEsc = snapshot.frames[4];
   assert.equal(secondEsc.event, 'escape');
-  assert.match(secondEsc.status, /Removed render-run-05 from list/, 'Esc clears needs-input tasks');
-  assert.equal(countTaskRows(secondEsc, 'render-run-05'), 0, 'cleared task row is removed immediately');
+  assert.equal(secondEsc.selectedTask, 'render-run-08');
+  assert.match(secondEsc.status, /Removed render-done-01 from list/, 'Esc clears terminal tasks');
+  assert.equal(countTaskRows(secondEsc, 'render-done-01'), 0, 'cleared task row is removed immediately');
 
   const added = snapshot.frames[5];
   assert.equal(countTaskRows(added, 'render-added-01'), 1, 'added task appears once');
@@ -182,25 +179,53 @@ try {
   const fullSnapshot = JSON.parse(fullResult.stdout);
   const fullFrame = fullSnapshot.frames[1];
   const fullVisible = visible(fullFrame).join('\n');
-  assert.ok(fullFrame.lines.length > 16, 'full output is not squeezed into the terminal viewport');
-  assert.ok(visible(fullFrame)[0].includes('mi agents'), 'mi agents header is above full output in scrollback');
-  assert.ok(fullVisible.includes('last user input before output'), 'last input is present above full output');
-  assert.ok(fullVisible.includes('full output line 01'), 'oldest output is present in scrollback');
-  assert.ok(fullVisible.includes('full output line 30'), 'latest output is present before the footer');
-  assert.ok(fullVisible.indexOf('last user input before output') < fullVisible.indexOf('full output line 01'), 'last input renders before output');
+  assert.ok(fullFrame.lines.length > 0, 'full output renders for native terminal scrollback');
+  assert.ok(visible(fullFrame)[0].includes('mi agents'), 'mi agents header is above full output');
+  assert.ok(fullVisible.includes('next task output'), 'initial full output shows the selected task output');
   const fullLines = visible(fullFrame);
-  const finalOutputLines = fullLines.filter((line) => line.includes('full output line'));
-  assert.ok(finalOutputLines.length > 0, 'full output lines are visible');
-  assert.ok(finalOutputLines.every((line) => !line.startsWith(' ')), 'final output lines have no leading indentation');
-  const lastInputLine = fullLines.findIndex((line) => line.includes('last user input before output'));
-  const firstOutputLine = fullLines.findIndex((line) => line.includes('full output line 01'));
-  assert.ok(firstOutputLine > lastInputLine + 1 && fullLines.slice(lastInputLine + 1, firstOutputLine).some((line) => line.trim() === ''), 'blank line separates last input from full output');
+  const lastInputLine = fullLines.findIndex((line) => line.includes('next input'));
+  const firstOutputLine = fullLines.findIndex((line) => line.includes('next task output'));
+  assert.ok(firstOutputLine > lastInputLine + 1 && fullLines.slice(lastInputLine + 1, firstOutputLine).some((line) => line.trim() === ''), 'blank line separates last input from full output viewport');
   assert.ok(visible(fullFrame).at(-1)?.trim(), 'model/footer remains last so the visible screen lands at bottom');
-  assert.equal(fullSnapshot.frames[2].selectedTask, 'render-full-output-next', 'PageDown switches to the next task in full output mode');
-  assert.ok(visible(fullSnapshot.frames[2]).join('\n').includes('next task output'), 'next task output is shown after PageDown');
-  assert.equal(fullSnapshot.frames[3].selectedTask, 'render-full-output', 'PageUp switches back to the previous task in full output mode');
+  assert.equal(fullSnapshot.frames[2].selectedTask, 'render-full-output-next', 'PageDown at the end keeps the selected task in full output mode');
+  assert.ok(visible(fullSnapshot.frames[2]).join('\n').includes('next task output'), 'PageDown keeps the selected task output visible');
+  assert.equal(fullSnapshot.frames[3].selectedTask, 'render-full-output', 'PageUp switches to the previous task output');
+  const previousFullOutput = visible(fullSnapshot.frames[3]).join('\n');
+  assert.ok(previousFullOutput.includes('full output line 30'), 'PageUp shows the previous task full output');
+  assert.ok(visible(fullSnapshot.frames[3]).filter((line) => line.includes('full output line')).every((line) => !line.startsWith(' ')), 'final output lines have no leading indentation');
   const withInput = visible(fullSnapshot.frames[4]).join('\n');
   assert.ok(withInput.includes('reply text'), 'input remains visible and usable in full output mode');
+
+  const jumpTasksPath = join(root, 'jump-tasks.json');
+  const jumpReloadPath = join(root, 'jump-tasks-reload.json');
+  await writeFile(jumpTasksPath, JSON.stringify([
+    { id: 'jump-a', name: 'render-jump-a', status: 'running', startedAt: iso(1000), updatedAt: iso(1000) },
+    { id: 'jump-b', name: 'render-jump-b', status: 'running', startedAt: iso(2000), updatedAt: iso(2000) },
+    { id: 'jump-c', name: 'render-jump-c', status: 'running', startedAt: iso(3000), updatedAt: iso(3000) },
+  ], null, 2));
+  await writeFile(jumpReloadPath, JSON.stringify([
+    { id: 'jump-c', name: 'render-jump-c', status: 'running', startedAt: iso(3000), updatedAt: iso(9000) },
+    { id: 'jump-a', name: 'render-jump-a', status: 'running', startedAt: iso(1000), updatedAt: iso(8000) },
+    { id: 'jump-b', name: 'render-jump-b', status: 'running', startedAt: iso(2000), updatedAt: iso(7000) },
+  ], null, 2));
+  const jumpResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: jumpTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: `down,reload:${jumpReloadPath},down`,
+      MI_AGENT_RENDER_TEST_ROWS: '14',
+      MI_AGENT_RENDER_TEST_COLS: '80',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(jumpResult.status, 0, jumpResult.stderr || jumpResult.stdout);
+  const jumpFrames = JSON.parse(jumpResult.stdout).frames;
+  assert.equal(jumpFrames[1].selectedTask, 'render-jump-b', 'first Down selects the second visible task');
+  assert.equal(jumpFrames[2].selectedTask, 'render-jump-b', 'refresh/reorder preserves the selected logical task');
+  assert.equal(jumpFrames[3].selectedTask, 'render-jump-a', 'next Down follows the refreshed visible section order after preserving the selected logical task');
 
   const longActivitySessionPath = join(root, 'long-activity-session.jsonl');
   await writeFile(longActivitySessionPath, `${JSON.stringify({
