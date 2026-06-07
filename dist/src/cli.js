@@ -489,6 +489,7 @@ function readSessionFinalOutput(sessionFile, options = {}) {
     return '';
 }
 const sessionFullTranscriptCache = new Map();
+const fullOutputRenderCache = new Map();
 function readSessionFullTranscript(sessionFile) {
     try {
         const stats = statSync(sessionFile);
@@ -554,6 +555,34 @@ function readSessionLastUserInput(sessionFile) {
     }
     catch { }
     return '';
+}
+function renderFullOutputLines(task, fallbackText, width) {
+    const sessionFile = task.sessionFile || '';
+    let size = 0;
+    let mtimeMs = 0;
+    if (sessionFile) {
+        try {
+            const stats = statSync(sessionFile);
+            size = stats.size;
+            mtimeMs = stats.mtimeMs;
+        }
+        catch { }
+    }
+    const cacheKey = `${sessionFile || stableTaskKey(task) || 'inline'}\u001f${width}`;
+    const cached = fullOutputRenderCache.get(cacheKey);
+    if (cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.width === width && cached.fallbackText === fallbackText)
+        return cached.lines;
+    const transcript = sessionFile ? readSessionFullTranscript(sessionFile) : [];
+    const lines = transcript.length > 0
+        ? transcript.flatMap((item, index) => [
+            ...(index > 0 ? [''] : []),
+            ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
+        ])
+        : renderPiLastOutputMessage(fallbackText || 'No result yet.', width);
+    fullOutputRenderCache.set(cacheKey, { size, mtimeMs, width, fallbackText, lines });
+    if (fullOutputRenderCache.size > 50)
+        fullOutputRenderCache.delete(fullOutputRenderCache.keys().next().value);
+    return lines;
 }
 function taskLastInput(task) {
     return normalizeLastInputText(task.lastInput || '') || (task.sessionFile ? readSessionLastUserInput(task.sessionFile) : '');
@@ -794,6 +823,8 @@ async function miAgentsCommand() {
     let btwAnswer = '';
     let fullLastOutputMode = false;
     let fullLastOutputScroll = 0;
+    let fullLastOutputNeedsScrollbackFlush = false;
+    let fullLastOutputRenderedKey = '';
     let agentSubmitting = false;
     let multiSelectMode = false;
     const selectedTaskKeys = new Set();
@@ -960,6 +991,7 @@ async function miAgentsCommand() {
             return;
         fullLastOutputMode = false;
         fullLastOutputScroll = 0;
+        fullLastOutputNeedsScrollbackFlush = false;
         status = defaultAgentStatus;
         if (!renderTestMode)
             process.stdout.write('\x1b[2J\x1b[H');
@@ -1211,7 +1243,10 @@ async function miAgentsCommand() {
         const next = current < 0
             ? (delta > 0 ? 0 : indexes.length - 1)
             : Math.max(0, Math.min(indexes.length - 1, current + delta));
+        const previous = selected;
         selected = indexes[next];
+        if (fullLastOutputMode && selected !== previous)
+            fullLastOutputNeedsScrollbackFlush = true;
         requestRender();
     }
     function moveResumeSelection(delta) {
@@ -1298,6 +1333,14 @@ async function miAgentsCommand() {
             clampTaskSelection();
         }
     }
+    function fullOutputTaskIdentity(task, width) {
+        return [stableTaskKey(task), task.sessionFile, task.actualSessionFile, task.sessionId, width].map((value) => String(value ?? '')).join('\u001f');
+    }
+    function taskFullOutputFallback(task) {
+        return task.sessionFile
+            ? (taskDisplayText(task) || task.progress || 'No result yet.')
+            : (taskFinalOutput(task, { full: true }) || taskDisplayText(task) || task.progress || 'No result yet.');
+    }
     function renderAgentLines(width = cols()) {
         if (closed)
             return [];
@@ -1329,9 +1372,7 @@ async function miAgentsCommand() {
         const listHeight = Math.max(1, Math.floor(contentHeight * 0.55));
         const lines = [];
         const task = selectedTask();
-        const fullLastOutput = fullLastOutputMode && task
-            ? (taskFinalOutput(task, { full: true }) || taskDisplayText(task) || task.progress || 'No result yet.')
-            : '';
+        const fullLastOutput = fullLastOutputMode && task ? taskFullOutputFallback(task) : '';
         if (fullLastOutput && task) {
             lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
             lines.push(fgThinking(undefined, '─'.repeat(width)));
@@ -1341,20 +1382,19 @@ async function miAgentsCommand() {
                 lines.push(...renderPiUserMessage(lastInput, width));
                 lines.push('');
             }
-            const transcript = task.sessionFile ? readSessionFullTranscript(task.sessionFile) : [];
-            const outputLines = transcript.length > 0
-                ? transcript.flatMap((item, index) => [
-                    ...(index > 0 ? [''] : []),
-                    ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
-                ])
-                : renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
+            const outputLines = renderFullOutputLines(task, fullLastOutput || 'No result yet.', width);
             // Like pi: render the conversation above the normal input footer instead
             // of fitting it into an internal viewport. The terminal/tmux scrollback
             // owns scrolling; because the footer is last, the visible screen lands at
             // the latest output with input still usable.
             lines.push(...outputLines);
             lines.push(...footerLines);
-            return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
+            const fullOutputKey = fullOutputTaskIdentity(task, width);
+            const shouldFlushScrollback = fullLastOutputNeedsScrollbackFlush || fullLastOutputRenderedKey !== fullOutputKey || lines.length <= height;
+            fullLastOutputNeedsScrollbackFlush = false;
+            fullLastOutputRenderedKey = fullOutputKey;
+            const renderedLines = shouldFlushScrollback ? lines : lines.slice(-height);
+            return renderedLines.map((line) => padVisibleEnd(truncateText(line, width), width));
         }
         lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
         lines.push(fgThinking(undefined, '─'.repeat(width)));
@@ -1751,6 +1791,10 @@ async function miAgentsCommand() {
         if (data === '\x0c' || data.includes('\x0c')) {
             fullLastOutputMode = !fullLastOutputMode;
             fullLastOutputScroll = 0;
+            if (fullLastOutputMode)
+                fullLastOutputNeedsScrollbackFlush = true;
+            else
+                fullLastOutputRenderedKey = '';
             status = fullLastOutputMode ? 'Full output • ↑/↓ scroll • ^L back' : defaultAgentStatus;
             if (!renderTestMode)
                 process.stdout.write('\x1b[2J\x1b[H');
@@ -1853,6 +1897,7 @@ async function miAgentsCommand() {
             if (tasks.length > 0)
                 selected = Math.max(0, Math.min(tasks.length - 1, selected + (isPageUpKey(data) ? -1 : 1)));
             fullLastOutputScroll = 0;
+            fullLastOutputNeedsScrollbackFlush = true;
             requestRender();
             return;
         }
