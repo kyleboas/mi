@@ -489,6 +489,7 @@ function readSessionFinalOutput(sessionFile, options = {}) {
     return '';
 }
 const sessionFullTranscriptCache = new Map();
+const fullOutputRenderCache = new Map();
 function readSessionFullTranscript(sessionFile) {
     try {
         const stats = statSync(sessionFile);
@@ -554,6 +555,34 @@ function readSessionLastUserInput(sessionFile) {
     }
     catch { }
     return '';
+}
+function renderFullOutputLines(task, fallbackText, width) {
+    const sessionFile = task.sessionFile || '';
+    let size = 0;
+    let mtimeMs = 0;
+    if (sessionFile) {
+        try {
+            const stats = statSync(sessionFile);
+            size = stats.size;
+            mtimeMs = stats.mtimeMs;
+        }
+        catch { }
+    }
+    const cacheKey = `${sessionFile || stableTaskKey(task) || 'inline'}\u001f${width}`;
+    const cached = fullOutputRenderCache.get(cacheKey);
+    if (cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.width === width && cached.fallbackText === fallbackText)
+        return cached.lines;
+    const transcript = sessionFile ? readSessionFullTranscript(sessionFile) : [];
+    const lines = transcript.length > 0
+        ? transcript.flatMap((item, index) => [
+            ...(index > 0 ? [''] : []),
+            ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
+        ])
+        : renderPiLastOutputMessage(fallbackText || 'No result yet.', width);
+    fullOutputRenderCache.set(cacheKey, { size, mtimeMs, width, fallbackText, lines });
+    if (fullOutputRenderCache.size > 50)
+        fullOutputRenderCache.delete(fullOutputRenderCache.keys().next().value);
+    return lines;
 }
 function taskLastInput(task) {
     return normalizeLastInputText(task.lastInput || '') || (task.sessionFile ? readSessionLastUserInput(task.sessionFile) : '');
@@ -1341,13 +1370,7 @@ async function miAgentsCommand() {
                 lines.push(...renderPiUserMessage(lastInput, width));
                 lines.push('');
             }
-            const transcript = task.sessionFile ? readSessionFullTranscript(task.sessionFile) : [];
-            const outputLines = transcript.length > 0
-                ? transcript.flatMap((item, index) => [
-                    ...(index > 0 ? [''] : []),
-                    ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
-                ])
-                : renderPiLastOutputMessage(fullLastOutput || 'No result yet.', width);
+            const outputLines = renderFullOutputLines(task, fullLastOutput || 'No result yet.', width);
             // Like pi: render the conversation above the normal input footer instead
             // of fitting it into an internal viewport. The terminal/tmux scrollback
             // owns scrolling; because the footer is last, the visible screen lands at
