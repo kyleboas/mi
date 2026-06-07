@@ -2802,9 +2802,12 @@ async function startMiDaemonWithSystemd() {
 }
 async function startMiDaemon() {
     await mkdir(dirname(MI_SOCKET_PATH), { recursive: true });
-    if (await startMiDaemonWithSystemd())
-        return;
+    // Prefer host-launched daemon so Mi-spawned pi agents inherit the normal
+    // login-shell namespace like pi itself. systemd --user services run in a
+    // user namespace here, which makes sudo/brokered agent-secrets unusable.
     if (existsSync(MI_DAEMON_HOST) && await runQuiet(MI_DAEMON_HOST, [], 30000) && await waitForMiDaemonHealth(5000))
+        return;
+    if (await startMiDaemonWithSystemd())
         return;
     const child = spawn(process.execPath, [MI_DAEMON_PATH], {
         detached: true,
