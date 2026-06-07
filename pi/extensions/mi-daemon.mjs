@@ -750,7 +750,7 @@ async function stopTask(request) {
     activeWorker.proc.kill();
   }
   if (task) {
-    untrackActiveWorker(task, name);
+    untrackActiveWorker(task, name, activeWorker);
   }
   return { text: `Stopped ${name}; moved to needs input` };
 }
@@ -1056,8 +1056,10 @@ function workerKeys(task, fallbackName) {
 function trackActiveWorker(task, fallbackName, worker) {
   for (const key of workerKeys(task, fallbackName)) activeWorkers.set(key, worker);
 }
-function untrackActiveWorker(task, fallbackName) {
-  for (const key of workerKeys(task, fallbackName)) activeWorkers.delete(key);
+function untrackActiveWorker(task, fallbackName, expectedWorker) {
+  for (const key of workerKeys(task, fallbackName)) {
+    if (!expectedWorker || activeWorkers.get(key) === expectedWorker) activeWorkers.delete(key);
+  }
 }
 
 function compactToolValue(value, max = 120) {
@@ -1229,6 +1231,85 @@ function installTaskHeartbeat(worker, task) {
   });
 }
 
+function workerErrorMessage(error) {
+  return String(error?.message || error || "Worker error");
+}
+
+function isRecoverableWorkerTransportError(error) {
+  return /\b(?:WebSocket error|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|network error)\b/i.test(workerErrorMessage(error));
+}
+
+function workerAutoContinueLimit() {
+  const raw = process.env.MI_WORKER_ERROR_CONTINUE_RETRIES ?? process.env.MI_WORKER_TRANSPORT_RETRIES ?? "2";
+  const value = Number(raw);
+  return Number.isFinite(value) ? Math.max(0, value) : 2;
+}
+
+function workerAutoContinueAttempts(task) {
+  return Number(task?.autoContinueAttempts ?? task?.transportRetries ?? 0) || 0;
+}
+
+function workerContinuationSessionFile(task, before, sessionFile) {
+  return task?.actualSessionFile || sessionFile || before?.sessionFile || task?.sessionFile || "";
+}
+
+function workerModelSpec(task, fallback = MI_MODEL) {
+  const candidate = task?.modelSpec || task?.model;
+  return typeof candidate === "string" && candidate.trim() ? candidate.trim() : fallback;
+}
+
+function workerContinuationPrompt(task, error) {
+  const errorText = workerErrorMessage(error);
+  return [
+    "The previous Mi background worker hit an error before it could finish.",
+    `Error: ${errorText}`,
+    "Continue the same task from this existing pi session. Do not stop at the error; recover if possible, inspect current files/state if needed, try the next safe approach, avoid repeating completed work, and provide the final result.",
+    task?.lastInput ? `Original/current user request:\n${task.lastInput}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
+async function resumeTaskAfterWorkerError({ task, before, sessionFile, name, kind, reportToMain, error }) {
+  const attempts = workerAutoContinueAttempts(task);
+  const maxAttempts = workerAutoContinueLimit();
+  if (attempts >= maxAttempts) return false;
+  const resumeSessionFile = workerContinuationSessionFile(task, before, sessionFile);
+  if (!resumeSessionFile) return false;
+  const errorText = workerErrorMessage(error);
+  const label = isRecoverableWorkerTransportError(error) ? "worker transport error" : "worker error";
+  await log(`worker_error_continue ${kind || "Task"} ${name} retry=${attempts + 1}/${maxAttempts} error=${errorText}`);
+  const retryTask = await upsertTask({
+    ...task,
+    status: "running",
+    needsUser: false,
+    needsUserReason: undefined,
+    finishedAt: undefined,
+    error: undefined,
+    progress: `${label}; restarting and continuing`,
+    autoContinueAttempts: attempts + 1,
+    transportRetries: undefined,
+  });
+  const retryWorker = createRpcProcess({ cwd: retryTask.cwd || HOME, sessionFile: resumeSessionFile, model: workerModelSpec(retryTask), env: { MI_WORKER: "1" } });
+  trackActiveWorker(retryTask, name, retryWorker);
+  void (async () => {
+    const retryBefore = await retryWorker.rpc({ type: "get_state" }).catch(() => before || {});
+    installTaskHeartbeat(retryWorker, retryTask);
+    const retryDone = retryWorker.waitAgentEnd();
+    await retryWorker.rpc({ type: "prompt", message: workerContinuationPrompt(retryTask, error), streamingBehavior: "followUp" });
+    await finishTask({ task: retryTask, worker: retryWorker, before: retryBefore, sessionFile: resumeSessionFile, name, done: retryDone, kind, reportToMain });
+  })().catch(async (retryError) => {
+    if (retryWorker.expectedStop) return log(`worker_expected_stop ${name}`);
+    if (await resumeTaskAfterWorkerError({ task: retryTask, before, sessionFile: resumeSessionFile, name, kind, reportToMain, error: retryError })) {
+      untrackActiveWorker(retryTask, name, retryWorker);
+      retryWorker.proc.kill();
+      return;
+    }
+    await upsertTask({ ...retryTask, status: "error", finishedAt: new Date().toISOString(), error: workerErrorMessage(retryError) });
+    untrackActiveWorker(retryTask, name, retryWorker);
+    retryWorker.proc.kill();
+  });
+  return true;
+}
+
 async function finishTask({ task, worker, before, sessionFile, name, done, kind, reportToMain = false }) {
   try {
     const end = await done;
@@ -1236,17 +1317,17 @@ async function finishTask({ task, worker, before, sessionFile, name, done, kind,
     const text = lastAssistantText(end.messages);
     if (!text) throw new Error("Worker produced no response text.");
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
-    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model });
+    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), autoContinueAttempts: undefined, transportRetries: undefined });
     if (reportToMain) await appendMainThreadMessage(text, "mi-worker-result");
   } catch (error) {
     if (worker.expectedStop) {
       await log(`worker_expected_stop ${name}`);
       return;
     }
-    const errorText = String(error.message || error);
-    await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: errorText });
+    if (await resumeTaskAfterWorkerError({ task, before, sessionFile, name, kind, reportToMain, error })) return;
+    await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: workerErrorMessage(error) });
   } finally {
-    untrackActiveWorker(task, name);
+    untrackActiveWorker(task, name, worker);
     worker.proc.kill();
   }
 }
@@ -1287,6 +1368,7 @@ async function runWorker(request) {
   startingWorkerKeys.add(startKey);
   let worker;
   let task;
+  let before;
   try {
     const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message: taskInput });
     if (duplicate) {
@@ -1307,12 +1389,13 @@ async function runWorker(request) {
         startedAt: new Date().toISOString(),
         sessionName: name,
         model,
+        modelSpec: model,
         lastInput: taskInput,
       })
       : undefined;
     if (task) trackActiveWorker(task, name, worker);
     await worker.rpc({ type: "set_session_name", name });
-    const before = await worker.rpc({ type: "get_state" });
+    before = await worker.rpc({ type: "get_state" });
     const visibleSessionFile = await mirrorSessionToHome(before.sessionFile);
     task = await upsertTask({
       ...(task || {}),
@@ -1327,6 +1410,7 @@ async function runWorker(request) {
       sessionId: before.sessionId,
       sessionName: before.sessionName || name,
       model: before.model,
+      modelSpec: model,
       lastInput: taskInput,
     });
     installTaskHeartbeat(worker, task);
@@ -1341,17 +1425,21 @@ async function runWorker(request) {
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
     const text = lastAssistantText(end.messages);
     if (!text) throw new Error("Worker produced no response text.");
-    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text });
+    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, autoContinueAttempts: undefined, transportRetries: undefined });
     return { text, sessionFile: await mirrorSessionToHome(after.sessionFile || before.sessionFile), sessionId: after.sessionId || before.sessionId, sessionName: after.sessionName || name, model: after.model || before.model };
   } catch (error) {
+    let continued = false;
     if (request.background && task) {
       if (worker?.expectedStop) {
         await log(`worker_expected_stop ${name}`);
+      } else if (await resumeTaskAfterWorkerError({ task, before, sessionFile: task.actualSessionFile || task.sessionFile, name, kind: "Task complete", reportToMain: Boolean(request.reportToMain), error })) {
+        continued = true;
       } else {
-        await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error) });
+        await upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: workerErrorMessage(error) });
       }
-      untrackActiveWorker(task, name);
+      untrackActiveWorker(task, name, worker);
     }
+    if (continued) return { text: `Continuing background task after worker error: ${name}`, taskId: task?.id, sessionFile: task?.sessionFile, sessionId: task?.sessionId, sessionName: name };
     if (worker?.expectedStop) return { text: `Stopped ${name}; moved to needs input`, taskId: task?.id, sessionFile: task?.sessionFile, sessionId: task?.sessionId, sessionName: name };
     throw error;
   } finally {
@@ -1439,13 +1527,21 @@ async function continueWorker(request) {
   const name = task.sessionName || task.name || task.id;
   const activeWorker = workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) || activeWorkers.get(taskId);
   if (activeWorker && !activeWorker.proc.killed) {
-    await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
+    const activeUpdated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
     void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
-      .catch((error) => {
+      .catch(async (error) => {
         if (activeWorker.expectedStop) return log(`worker_expected_stop ${name}`);
-        return upsertTask({ ...task, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: taskInput });
+        if (await resumeTaskAfterWorkerError({ task: activeUpdated, before: undefined, sessionFile: activeUpdated.actualSessionFile || activeUpdated.sessionFile, name, kind: "Task updated", reportToMain: Boolean(request.reportToMain), error })) {
+          activeWorker.expectedStop = true;
+          if (!activeWorker.proc.killed) activeWorker.proc.kill();
+          untrackActiveWorker(activeUpdated, name, activeWorker);
+          return;
+        }
+        untrackActiveWorker(activeUpdated, name, activeWorker);
+        if (!activeWorker.proc.killed) activeWorker.proc.kill();
+        return upsertTask({ ...activeUpdated, status: "error", finishedAt: new Date().toISOString(), error: workerErrorMessage(error), lastInput: taskInput });
       });
-    return { text: `Queued message for background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+    return { text: `Queued message for background task: ${name}`, taskId: activeUpdated.id, sessionFile: activeUpdated.sessionFile, sessionId: activeUpdated.sessionId, sessionName: name };
   }
   if (task.openPiSession) {
     const queued = await queueMessageIntoOpenPiSession(task, workerInputMessage(message, request.useGoal));
@@ -1459,7 +1555,7 @@ async function continueWorker(request) {
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
   const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
-  const updated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
+  const updated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", modelSpec: model, lastInput: taskInput });
   if (request.background) {
     trackActiveWorker(updated, name, worker);
     void (async () => {
@@ -1473,8 +1569,13 @@ async function continueWorker(request) {
         await log(`worker_expected_stop ${name}`);
         return;
       }
-      await upsertTask({ ...updated, status: "error", finishedAt: new Date().toISOString(), error: String(error.message || error), lastInput: taskInput });
-      untrackActiveWorker(updated, name);
+      if (await resumeTaskAfterWorkerError({ task: updated, before: undefined, sessionFile, name, kind: "Task updated", reportToMain: Boolean(request.reportToMain), error })) {
+        untrackActiveWorker(updated, name, worker);
+        worker.proc.kill();
+        return;
+      }
+      await upsertTask({ ...updated, status: "error", finishedAt: new Date().toISOString(), error: workerErrorMessage(error), lastInput: taskInput });
+      untrackActiveWorker(updated, name, worker);
       worker.proc.kill();
     });
     return { text: `Sent follow-up to background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
@@ -1489,7 +1590,7 @@ async function continueWorker(request) {
     const text = lastAssistantText(end.messages);
     if (!text) throw new Error("Worker produced no response text.");
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile);
-    await upsertTask({ ...updated, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile, sessionFile: visibleSessionFile });
+    await upsertTask({ ...updated, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile, sessionFile: visibleSessionFile, autoContinueAttempts: undefined, transportRetries: undefined });
     return { text, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name };
   } finally {
     if (!request.background) worker.proc.kill();
