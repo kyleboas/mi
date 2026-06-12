@@ -362,16 +362,41 @@ function isNonFinalAssistantText(text) {
 function taskDisplayText(task) {
     return task.text && !isNonFinalAssistantText(task.text) ? task.text : '';
 }
+function isStoppedPiSessionWithoutFinal(task) {
+    const isPiSession = task.source === 'pi-session' || String(task.id || '').startsWith('pi-session:') || Boolean(task.sessionFile);
+    if (!isPiSession || !task.needsUser)
+        return false;
+    const reason = String(task.needsUserReason || '');
+    if (/Pi session is no longer running and no final assistant response was recorded/i.test(reason))
+        return true;
+    if (task.status && String(task.status).toLowerCase() !== 'paused')
+        return false;
+    const finalText = taskDisplayText(task);
+    if (finalText)
+        return false;
+    const progress = String(task.progress || '').trim().toLowerCase();
+    return ['thinking', 'running shell command', 'pi session is still running', 'stopped before final response; needs input'].includes(progress);
+}
+function stoppedPiSessionNotice(task) {
+    const reason = String(task.needsUserReason || '').trim();
+    if (/Pi session is no longer running and no final assistant response was recorded/i.test(reason))
+        return reason;
+    const lastInput = taskLastInput(task);
+    return `Pi session is no longer running and no final assistant response was recorded.${lastInput ? ` Last prompt: ${lastInput.slice(0, 180)}.` : ''} Next: reply to this task with whether to continue, revise, or mark it done based on the session state.`;
+}
 function taskFinalOutput(task, options = {}) {
+    if (isStoppedPiSessionWithoutFinal(task))
+        return stoppedPiSessionNotice(task);
     const sessionText = task.sessionFile ? readSessionFinalOutput(task.sessionFile, options) : '';
     const text = taskDisplayText(task);
     return task.error || (options.full ? (sessionText || text) : (text || sessionText));
 }
 function taskDetail(task) {
     const taskText = taskDisplayText(task);
-    const base = task.error || (isTaskActive(task) ? (task.progress || taskText) : (taskText || task.progress)) || task.sessionName || '';
+    const base = isStoppedPiSessionWithoutFinal(task) ? '' : (task.error || (isTaskActive(task) ? (task.progress || taskText) : (taskText || task.progress)) || task.sessionName || '');
     const state = taskStatus(task).toLowerCase();
-    const reason = task.needsUser ? `${state === 'paused' ? 'paused — ' : ''}needs input: ${task.needsUserReason || 'attention'}` : '';
+    const reasonText = isStoppedPiSessionWithoutFinal(task) ? stoppedPiSessionNotice(task) : (task.needsUserReason || 'attention');
+    const reason = task.needsUser ? `${state === 'paused' ? 'paused — ' : ''}needs input: ${reasonText}` : '';
     const detail = reason ? `${reason}${base ? ` — ${base}` : ''}` : base;
     return detail.replace(/\s+/g, ' ');
 }
@@ -572,7 +597,7 @@ function renderFullOutputLines(task, fallbackText, width) {
     const cached = fullOutputRenderCache.get(cacheKey);
     if (cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.width === width && cached.fallbackText === fallbackText)
         return cached.lines;
-    const transcript = sessionFile ? readSessionFullTranscript(sessionFile) : [];
+    const transcript = sessionFile && !isTaskActive(task) && !isStoppedPiSessionWithoutFinal(task) ? readSessionFullTranscript(sessionFile) : [];
     const lines = transcript.length > 0
         ? transcript.flatMap((item, index) => [
             ...(index > 0 ? [''] : []),
@@ -588,6 +613,8 @@ function taskLastInput(task) {
     return normalizeLastInputText(task.lastInput || '') || (task.sessionFile ? readSessionLastUserInput(task.sessionFile) : '');
 }
 function taskNeedsInputQuestion(task) {
+    if (isStoppedPiSessionWithoutFinal(task))
+        return stoppedPiSessionNotice(task);
     return task.progress || taskDisplayText(task) || task.error || task.needsUserReason || 'Needs input.';
 }
 const sessionActivityStepsCache = new Map();
@@ -676,7 +703,7 @@ function normalizedTaskName(task) {
     return String(task.sessionName || task.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 function isGenericTaskName(name) {
-    return !name || name === 'user' || name === 'mi session' || name === 'recent mi session';
+    return !name || name === 'user' || name === 'mi session' || name === 'pi session' || name === 'recent mi session';
 }
 function taskCwdKey(task) {
     return String(task.cwd || '').replace(/\/+$/, '');
@@ -1119,6 +1146,48 @@ async function miAgentsCommand() {
         status = `Thinking level: ${agentThinkingLevel}`;
         requestRender();
     }
+    async function sendNativeAgentSlashCommand(value) {
+        const task = replyTarget || selectedTask();
+        if (!task) {
+            status = `Select a task before using ${slashCommandName(value)}`;
+            requestRender();
+            return;
+        }
+        const taskId = task.id || task.sessionFile || task.sessionName || task.name;
+        if (!taskId) {
+            status = `Selected task has no id for ${slashCommandName(value)}`;
+            requestRender();
+            return;
+        }
+        const command = slashCommandName(value);
+        const isMarker = command === '/marker';
+        const waitForDone = command === '/end';
+        const taskKey = stableTaskKey(task);
+        agentSubmitting = true;
+        status = isMarker ? 'Marker set' : 'Summarizing increment since marker…';
+        requestRender();
+        void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: value, model: agentModelWithThinking(), background: !waitForDone, preserveStatus: true }, waitForDone ? 120000 : 30000)
+            .then(async () => {
+            if (taskKey) {
+                pendingTaskUpdates.delete(taskKey);
+                pendingTaskUpdateStartedAt.delete(taskKey);
+            }
+            await refresh();
+            if (waitForDone)
+                status = 'Increment summarized and marker advanced';
+            else if (isMarker)
+                status = 'Marker set';
+            setTimeout(() => void refresh(), 250);
+        })
+            .catch((error) => {
+            if (taskKey) {
+                pendingTaskUpdates.delete(taskKey);
+                pendingTaskUpdateStartedAt.delete(taskKey);
+            }
+            status = error instanceof Error ? error.message : String(error);
+        })
+            .finally(() => { agentSubmitting = false; requestRender(); });
+    }
     async function runAgentSlashCommand(value) {
         if (!value.startsWith('/'))
             return false;
@@ -1218,6 +1287,10 @@ async function miAgentsCommand() {
             await startAgentSlashBackgroundTask(value);
             return true;
         }
+        if (MI_NATIVE_AGENT_SLASH_COMMANDS.has(slashCommandName(value))) {
+            await sendNativeAgentSlashCommand(value);
+            return true;
+        }
         if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(value))) {
             status = `${slashCommandName(value)} is a Pi app command; open Pi directly to use it.`;
             requestRender();
@@ -1225,6 +1298,19 @@ async function miAgentsCommand() {
         }
         await runSlashCommandInPi(value);
         return true;
+    }
+    function preferredResumeSessionIndex(sessions) {
+        const selected = selectedTask();
+        const selectedKey = stableTaskKey(selected || {});
+        let foundOpenPi = sessions.findIndex((session) => session.openPiSession);
+        if (foundOpenPi >= 0)
+            return foundOpenPi;
+        if (selectedKey) {
+            foundOpenPi = sessions.findIndex((session) => stableTaskKey(session) === selectedKey || (selected?.sessionId && session.sessionId && session.sessionId === selected?.sessionId) || (selected?.sessionFile && session.sessionFile && session.sessionFile === selected?.sessionFile));
+            if (foundOpenPi >= 0)
+                return foundOpenPi;
+        }
+        return sessions.length ? 0 : -1;
     }
     function sectionTaskItems(label) {
         return tasks
@@ -1266,9 +1352,13 @@ async function miAgentsCommand() {
         status = 'Loading pi sessions...';
         requestRender();
         resumeSessions = await listResumeSessions();
-        resumeSelected = 0;
-        if (resumeSessions[resumeSelected])
-            selectedResumeKeys.add(stableTaskKey(resumeSessions[resumeSelected]));
+        resumeSelected = Math.max(0, preferredResumeSessionIndex(resumeSessions));
+        const resumeSession = resumeSessions[resumeSelected];
+        if (resumeSession) {
+            const key = stableTaskKey(resumeSession);
+            if (key)
+                selectedResumeKeys.add(key);
+        }
         resumeLoading = false;
         status = resumeSessions.length > 0 ? `${selectedResumeKeys.size} selected • Enter add selected • Esc cancel • ^M exit multi-select` : 'No pi sessions found';
         requestRender();
@@ -1337,6 +1427,8 @@ async function miAgentsCommand() {
         return [stableTaskKey(task), task.sessionFile, task.actualSessionFile, task.sessionId, width].map((value) => String(value ?? '')).join('\u001f');
     }
     function taskFullOutputFallback(task) {
+        if (isStoppedPiSessionWithoutFinal(task))
+            return stoppedPiSessionNotice(task);
         return task.sessionFile
             ? (taskDisplayText(task) || task.progress || 'No result yet.')
             : (taskFinalOutput(task, { full: true }) || taskDisplayText(task) || task.progress || 'No result yet.');
@@ -1363,8 +1455,9 @@ async function miAgentsCommand() {
         const maxInputLines = Math.max(1, height - 4);
         const rawInputLines = piEditor.markedLines;
         const inputLines = rawInputLines.length > maxInputLines ? rawInputLines.slice(-maxInputLines) : rawInputLines;
+        const statusLine = status && status !== defaultAgentStatus ? fgAccent(truncateText(status, width)) : '';
         const footerLines = [
-            '',
+            statusLine,
             ...inputLines.map((line) => truncateText(line, width)),
             fgDim(truncateText(agentModelWithThinking(), width).padStart(width)),
         ];
@@ -1769,7 +1862,13 @@ async function miAgentsCommand() {
             return;
         }
         if (matchesKey(data, 'ctrl+c')) {
-            if (multiSelectMode && !inputBuffer) {
+            if (resumeMode && !inputBuffer) {
+                resumeMode = false;
+                resumeMultiSelectMode = false;
+                selectedResumeKeys.clear();
+                status = defaultAgentStatus;
+            }
+            else if (multiSelectMode && !inputBuffer) {
                 multiSelectMode = false;
                 selectedTaskKeys.clear();
                 status = defaultAgentStatus;
@@ -1847,12 +1946,18 @@ async function miAgentsCommand() {
                 if (!resumeMode)
                     break;
                 if (key === '\x1b' || key === '\x03') {
-                    if (resumeMultiSelectMode && selectedResumeKeys.size > 0)
-                        selectedResumeKeys.clear();
-                    else
+                    if (key === '\x03') {
                         resumeMode = false;
+                        selectedResumeKeys.clear();
+                    }
+                    else if (resumeMultiSelectMode && selectedResumeKeys.size > 0) {
+                        selectedResumeKeys.clear();
+                    }
+                    else {
+                        resumeMode = false;
+                    }
                     resumeMultiSelectMode = false;
-                    status = resumeMode ? '^M multi-select • Enter add session as task • Esc cancel' : defaultAgentStatus;
+                    status = defaultAgentStatus;
                     requestRender();
                 }
                 else if (key === '\r' || key === '\n') {
@@ -2095,8 +2200,8 @@ async function miAgentsCommand() {
     }
     // Use the alternate screen so stale rows cannot remain in terminal scrollback
     // and look like duplicate tasks after section/status changes.
-    tui = startPiTuiScreen(new FunctionScreen(renderAgentLines, onData), { alternateScreen: true });
     await refresh();
+    tui = startPiTuiScreen(new FunctionScreen(renderAgentLines, onData), { alternateScreen: true });
     pollTimer = setInterval(() => {
         const hasLiveWork = agentSubmitting || resumeLoading || tasks.some(isTaskActive) || optimisticTasks.some(isTaskActive);
         if (!hasLiveWork && Date.now() - lastIdlePollAt < MI_IDLE_TASK_POLL_MS)
@@ -2518,7 +2623,7 @@ function renderPiLastOutputMessage(text, width) {
 function renderMiTranscriptItem(item, width) {
     return item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiAssistantMessage(item.text, width);
 }
-const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/resume', '/open', '/quit', '/mi'];
+const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/marker', '/end', '/resume', '/open', '/quit', '/mi'];
 const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/settings': 'Open settings menu',
     '/model': 'Select Mi model',
@@ -2622,6 +2727,7 @@ async function getModelAutocompleteItems(argumentPrefix) {
 }
 const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/resume', '/open', '/model', '/scoped-models']);
 const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect']);
+const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set(['/marker', '/end']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 function slashCommandName(value) {
     return value.match(/^\/\S+/)?.[0] || '';

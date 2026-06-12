@@ -18,6 +18,7 @@ const checks = [
   ['pi sessions expose a live bridge socket', /function piBridgeSocketPath\(sessionFile: string\)[\s\S]*async function startPiSessionBridge\(pi: ExtensionAPI, ctx: any\)[\s\S]*process\.env\.MI_WORKER === "1"[\s\S]*type === "send_user_message"[\s\S]*pi\.sendUserMessage/],
   ['pi session events publish to Mi daemon', /function publishPiSessionEvent\(ctx: any[\s\S]*type: "pi_session_event"[\s\S]*pi\.on\("agent_start"[\s\S]*pi\.on\("agent_end"/],
   ['pi session tool progress is summarized', /function summarizePiSessionToolStart\(toolName: unknown[\s\S]*name === "bash"\) return "running shell command"[\s\S]*pi\.on\("tool_execution_start"[\s\S]*summarizePiSessionToolStart\(event\.toolName, toolEventInput\(event\)\)/],
+  ['pi session progress ignores thinking deltas', /pi\.on\("message_update"[\s\S]*const update = event\?\.assistantMessageEvent \|\| \{\}[\s\S]*if \(update\.type !== "text_delta"\) return[\s\S]*publishPiSessionEvent\(ctx, \{ kind: "assistant_delta"/],
 ];
 
 const failures = checks.filter(([, pattern]) => !pattern.test(source));

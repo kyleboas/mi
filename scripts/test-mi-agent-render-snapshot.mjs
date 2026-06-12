@@ -268,6 +268,43 @@ try {
     'rendered mi agents lines must not contain embedded newlines because they shift following terminal rows',
   );
 
+  const stoppedSessionPath = join(root, 'stopped-session.jsonl');
+  await writeFile(stoppedSessionPath, [
+    JSON.stringify({ type: 'message', message: { role: 'user', content: 'please do work' } }),
+    JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'hidden-ish thinking' }] } }),
+    JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall', id: 'call', name: 'bash', arguments: { command: 'echo random-bash-final-area' } }] } }),
+    '',
+  ].join('\n'));
+  const stoppedNotice = 'Pi session is no longer running and no final assistant response was recorded. Last prompt: please do work. Next: reply to this task with whether to continue, revise, or mark it done based on the session state.';
+  const stoppedTasksPath = join(root, 'stopped-pi-tasks.json');
+  await writeFile(stoppedTasksPath, JSON.stringify([
+    { id: 'pi-session:stopped-no-final', source: 'pi-session', name: 'render-stopped-no-final', status: 'paused', needsUser: true, needsUserReason: stoppedNotice, sessionFile: stoppedSessionPath, progress: 'bash', updatedAt: iso(12900) },
+    { id: 'pi-session:legacy-thinking', source: 'pi-session', name: 'render-legacy-thinking', status: 'paused', needsUser: true, needsUserReason: 'needs input', sessionFile: stoppedSessionPath, progress: 'thinking', updatedAt: iso(12800) },
+    { id: 'pi-session:legacy-shell', source: 'pi-session', name: 'render-legacy-shell', status: 'paused', needsUser: true, needsUserReason: 'needs input', sessionFile: stoppedSessionPath, progress: 'running shell command', updatedAt: iso(12700) },
+  ], null, 2));
+  const stoppedResult = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+    cwd: new URL('..', import.meta.url),
+    env: {
+      ...process.env,
+      MI_AGENT_RENDER_TEST: '1',
+      MI_AGENT_RENDER_TEST_TASKS: stoppedTasksPath,
+      MI_AGENT_RENDER_TEST_EVENTS: 'ctrlL',
+      MI_AGENT_RENDER_TEST_ROWS: '14',
+      MI_AGENT_RENDER_TEST_COLS: '100',
+    },
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  assert.equal(stoppedResult.status, 0, stoppedResult.stderr || stoppedResult.stdout);
+  const stoppedFrames = JSON.parse(stoppedResult.stdout).frames;
+  const stoppedCollapsed = visible(stoppedFrames[0]).join('\n');
+  assert.ok(stoppedCollapsed.includes('Pi session is no longer running'), 'collapsed stopped-session view shows the actionable notice');
+  assert.ok(!stoppedCollapsed.includes('needs input: Pi session is no longer running') || !stoppedCollapsed.includes(' — bash'), 'collapsed stopped-session row does not append random bash progress');
+  assert.doesNotMatch(stoppedCollapsed, /random-bash-final-area|hidden-ish thinking/, 'collapsed stopped-session view does not leak non-final session activity');
+  const stoppedFull = visible(stoppedFrames[1]).join('\n');
+  assert.ok(stoppedFull.includes('Pi session is no longer running'), 'full stopped-session output shows the actionable notice');
+  assert.doesNotMatch(stoppedFull, /random-bash-final-area|hidden-ish thinking|^bash$/m, 'full stopped-session output does not show random bash/thinking as final output');
+
   const pasteTasksPath = join(root, 'paste-tasks.json');
   await writeFile(pasteTasksPath, JSON.stringify([
     { id: 'paste-1', name: 'render-paste-target', status: 'paused', needsUser: true, needsUserReason: 'needs reply', progress: 'waiting', updatedAt: iso(13000) },
