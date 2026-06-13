@@ -66,7 +66,7 @@ Useful in-view commands:
 - `/resume` opens a picker for recent/default pi sessions so they can be added to the task list.
 - `/open` opens the selected background agent in pi.
 - `/model` opens a pi-style model picker; Shift+Tab cycles thinking level.
-- `^L` toggles full-output mode; arrows/PageUp/PageDown scroll that output.
+- `^F` toggles full-output mode; arrows/PageUp/PageDown scroll that output.
 - `^M` toggles multi-select clear mode; Esc clears selected rows or exits input modes.
 - `/mi <question>` asks Mi main about the selected task context without steering the worker.
 

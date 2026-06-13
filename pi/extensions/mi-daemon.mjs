@@ -207,13 +207,20 @@ function sessionFingerprint(task) {
   return match?.[1] || "";
 }
 
+function taskNameDismissKeys(task) {
+  const names = [task?.sessionName, task?.name].filter(Boolean).map(String);
+  const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
+  if (!isPiSession) return names;
+  return names.filter((name) => !isGenericTaskName(normalizedNameText(name)));
+}
+
 function taskDismissKeys(task) {
-  return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, sessionFingerprint(task), task?.sessionName, task?.name].filter(Boolean).map(String);
+  return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, sessionFingerprint(task), ...taskNameDismissKeys(task)].filter(Boolean).map(String);
 }
 
 function taskPersistentDismissKeys(task) {
   const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
-  if (isPiSession) return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, task?.sessionName, task?.name].filter(Boolean).map(String);
+  if (isPiSession) return [task?.id, task?.sessionFile, task?.actualSessionFile, task?.sessionId, ...taskNameDismissKeys(task)].filter(Boolean).map(String);
   return taskDismissKeys(task);
 }
 
@@ -383,7 +390,7 @@ async function readPiSessionTask(file, stats, options = {}) {
   const name = sessionTitle || goalTitle || inputTitle || basename(cwd) || "Mi session";
   const progress = activeGoal?.objective
     ? activeGoal.objective.split("\n")[0].slice(0, 500)
-    : lastAssistant || (busy ? "Pi session is still running" : "Pi session finished without captured final output");
+    : (busy ? "Pi session is still running" : (lastAssistant || "Pi session finished without captured final output"));
   return enrichTask({
     id: `pi-session:${sessionId || file}`,
     name,
@@ -499,7 +506,7 @@ function normalizedTaskName(task) {
 }
 
 function isGenericTaskName(name) {
-  return !name || name === "user" || name === "mi session" || name === "recent mi session";
+  return !name || name === "user" || name === "mi session" || name === "pi session" || name === "recent mi session";
 }
 
 function normalizeLastInputText(text) {
@@ -542,12 +549,23 @@ function similarTaskTopic(task) {
   return "";
 }
 
+function taskSessionIdentityKeys(task) {
+  return [task?.sessionFile, task?.actualSessionFile, task?.sessionId, sessionFingerprint(task)].filter(Boolean).map(String);
+}
+
 function sameLogicalTask(a, b) {
   if (samePiSessionTask(a, b)) return true;
   const sameCwd = String(a?.cwd || "") === String(b?.cwd || "");
   const aName = normalizedTaskName(a);
   const bName = normalizedTaskName(b);
   if (sameCwd && aName && aName === bName && !isGenericTaskName(aName)) return true;
+  // No session-key or explicit-name match, so when both tasks carry their own
+  // session identity they point at different pi sessions and are distinct
+  // tasks. Without this guard, the lastInput/topic heuristics below merged
+  // unrelated sessions: completed tasks flipped back to "working" by adopting
+  // another live session's status, and deduped rows disappeared. The loose
+  // heuristics only link a task with no session identity yet to its session.
+  if (taskSessionIdentityKeys(a).length > 0 && taskSessionIdentityKeys(b).length > 0) return false;
   const aLastInput = normalizedLastInput(a);
   const bLastInput = normalizedLastInput(b);
   if (sameCwd && aLastInput && aLastInput === bLastInput) return true;
@@ -558,17 +576,59 @@ function sameLogicalTask(a, b) {
 }
 
 function stoppedPiNeedsInputReason(task) {
-  const activity = String(task?.progress || task?.text || "").replace(/\s+/g, " ").trim();
   const lastInput = normalizeLastInputText(task?.lastInput || "").slice(0, 180);
-  const context = activity && !/needs input|stopped before final response/i.test(activity)
-    ? `Last activity: ${activity.slice(0, 220)}.`
-    : lastInput
-      ? `Last prompt: ${lastInput}.`
-      : "No final assistant response was recorded.";
-  return `Pi session is no longer running and no final assistant response was recorded. ${context} Next: reply to this task with whether to continue, revise, or mark it done based on that last activity.`;
+  const context = lastInput
+    ? `Last prompt: ${lastInput}.`
+    : "No final assistant response was recorded.";
+  return `Pi session is no longer running and no final assistant response was recorded. ${context} Next: reply to this task with whether to continue, revise, or mark it done based on the session state.`;
+}
+
+function taskStatePreserveActive(task) {
+  if (typeof task?.preservedStatus !== "string" || task.preservedStatus.length === 0) return false;
+  const status = String(task?.status || "").toLowerCase();
+  return !["running", "active", "queued", "thinking", "thinkingqueued"].includes(status);
+}
+
+function withPreservedTaskState(task) {
+  if (!taskStatePreserveActive(task)) return task;
+  return {
+    ...task,
+    status: task.preservedStatus || task.status,
+    needsUser: task.preservedNeedsUser ?? task.needsUser,
+    needsUserReason: task.preservedNeedsUserReason ?? task.needsUserReason,
+    finishedAt: task.preservedFinishedAt ?? task.finishedAt,
+    text: task.preservedText ?? task.text,
+    progress: task.preservedProgress ?? task.progress,
+  };
+}
+
+function preserveTaskStatePatch(task) {
+  return {
+    preservedStatus: task.status,
+    preservedNeedsUser: task.needsUser,
+    preservedNeedsUserReason: task.needsUserReason,
+    preservedFinishedAt: task.finishedAt,
+    preservedText: task.text,
+    preservedProgress: task.progress,
+  };
+}
+
+function clearPreservedTaskState(task) {
+  const { preserveStateUntil, preservedStatus, preservedNeedsUser, preservedNeedsUserReason, preservedFinishedAt, preservedText, preservedProgress, ...rest } = task || {};
+  return {
+    ...rest,
+    preserveStateUntil: undefined,
+    preservedStatus: undefined,
+    preservedNeedsUser: undefined,
+    preservedNeedsUserReason: undefined,
+    preservedFinishedAt: undefined,
+    preservedText: undefined,
+    preservedProgress: undefined,
+  };
 }
 
 function reconcileStoredTask(task) {
+  task = withPreservedTaskState(task);
   if (task?.openPiPid && !existsSync(`/proc/${Number(task.openPiPid)}`)) {
     const { openPiSession, openPiPid, openPiInput, bridgeSocket, ...rest } = task;
     task = rest;
@@ -674,27 +734,34 @@ async function mergeOpenPiSessions(tasks, dismissed) {
         sessionName: task.sessionName || activeSession.sessionName,
       };
     }
-    const staleBusySession = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus);
+    const activeSessionWorking = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(activeStatus);
+    const liveOpenPiSession = Boolean(activeSession.openPiSession);
+    const staleBusySession = activeSessionWorking && !liveOpenPiSession;
     const storedWorking = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(taskStatus) && !task.finishedAt;
     const scannedComplete = ["complete", "completed", "done", "inactive"].includes(activeStatus) || activeSession.finishedAt;
     const scannedPausedFromMissingInteractiveProcess = activeStatus === "paused" && /no longer running|stopped before replying/i.test(activeSession.needsUserReason || "");
-    const preserveStoredTerminal = terminalTask && (staleBusySession || taskStatus === "paused" || scannedPausedFromMissingInteractiveProcess);
+    const preserveStoredTerminal = terminalTask && (staleBusySession || (!liveOpenPiSession && taskStatus === "paused") || scannedPausedFromMissingInteractiveProcess);
     const preserveStoredWorking = storedWorking && ((scannedComplete && storedWorkingIsNewerThanScan(task, activeSession)) || scannedPausedFromMissingInteractiveProcess);
-    const preserveStoredState = preserveStoredTerminal || preserveStoredWorking;
+    const preserveStoredExplicit = taskStatePreserveActive(task);
+    const preserveStoredState = preserveStoredTerminal || preserveStoredWorking || preserveStoredExplicit;
     return {
       ...task,
       name: betterMergedName(task, activeSession, "name"),
       sessionName: betterMergedName(task, activeSession, "sessionName"),
-      status: preserveStoredState ? task.status : (activeSession.status || task.status),
-      needsUser: preserveStoredTerminal ? task.needsUser : (activeSession.needsUser ?? task.needsUser),
-      needsUserReason: preserveStoredTerminal ? task.needsUserReason : (activeSession.needsUserReason || task.needsUserReason),
-      finishedAt: preserveStoredState ? task.finishedAt : activeSession.finishedAt,
-      text: preserveStoredState ? task.text : (activeSession.text || task.text),
-      progress: preserveStoredState ? task.progress : (activeSession.progress || task.progress),
+      status: preserveStoredState ? (task.preservedStatus || task.status) : (activeSession.status || task.status),
+      needsUser: preserveStoredState ? (task.preservedNeedsUser ?? task.needsUser) : (activeSessionWorking ? false : (activeSession.needsUser ?? task.needsUser)),
+      needsUserReason: preserveStoredState ? (task.preservedNeedsUserReason ?? task.needsUserReason) : (activeSessionWorking ? undefined : (activeSession.needsUserReason || task.needsUserReason)),
+      finishedAt: preserveStoredState ? (task.preservedFinishedAt ?? task.finishedAt) : activeSession.finishedAt,
+      text: preserveStoredState ? (task.preservedText ?? task.text) : (activeSessionWorking ? activeSession.text : (activeSession.text || task.text)),
+      error: preserveStoredState ? task.error : (activeSessionWorking ? undefined : (activeSession.error || task.error)),
+      progress: preserveStoredState ? (task.preservedProgress ?? task.progress) : (activeSession.progress || task.progress),
       lastInput: activeSession.lastInput || task.lastInput,
       lastEventAt: activeSession.lastEventAt || task.lastEventAt,
       updatedAt: preserveStoredState ? task.updatedAt : (activeSession.updatedAt || task.updatedAt),
-      openPiSession: activeSession.openPiSession || undefined,
+      openPiSession: activeSession.openPiSession || task.openPiSession || undefined,
+      openPiPid: activeSession.openPiPid || task.openPiPid,
+      openPiInput: activeSession.openPiInput || task.openPiInput,
+      bridgeSocket: activeSession.bridgeSocket || task.bridgeSocket,
     };
   });
   for (const session of visibleSessions) {
@@ -1199,6 +1266,10 @@ function isSlashCommand(message) {
   return /^\/[A-Za-z][\w:-]*(?:\s|$)/.test(String(message || "").trim());
 }
 
+function slashCommandName(message) {
+  return String(message || "").trim().match(/^\/\S+/)?.[0] || "";
+}
+
 function workerInputMessage(message, useGoal = "0") {
   return isSlashCommand(message) ? String(message || "").trim() : wrapWorkerMessage(message, useGoal);
 }
@@ -1283,8 +1354,8 @@ async function resumeTaskAfterWorkerError({ task, before, sessionFile, name, kin
     needsUser: false,
     needsUserReason: undefined,
     finishedAt: undefined,
-    error: undefined,
-    progress: `${label}; restarting and continuing`,
+    error: errorText,
+    progress: `${label}: ${errorText}; restarting and continuing`,
     autoContinueAttempts: attempts + 1,
     transportRetries: undefined,
   });
@@ -1317,7 +1388,7 @@ async function finishTask({ task, worker, before, sessionFile, name, done, kind,
     const text = lastAssistantText(end.messages);
     if (!text) throw new Error("Worker produced no response text.");
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
-    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), autoContinueAttempts: undefined, transportRetries: undefined });
+    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, error: undefined, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), autoContinueAttempts: undefined, transportRetries: undefined });
     if (reportToMain) await appendMainThreadMessage(text, "mi-worker-result");
   } catch (error) {
     if (worker.expectedStop) {
@@ -1480,13 +1551,36 @@ function sendBridgeRequest(socketPath, payload, timeoutMs = 1500) {
   });
 }
 
-async function sendMessageIntoPiBridge(task, message, deliverAs = "steer") {
+async function sendMessageIntoPiBridge(task, message, deliverAs = "steer", options = {}) {
   const sessionFile = task.actualSessionFile || task.sessionFile;
-  if (!sessionFile || isSlashCommand(message)) return false;
+  if (!sessionFile || (isSlashCommand(message) && !options.allowSlashCommand)) return false;
   const socketPath = task.bridgeSocket || piBridgeSocketPath(sessionFile);
   if (!existsSync(socketPath)) return false;
   await sendBridgeRequest(socketPath, { type: "send_user_message", message, deliverAs, source: "mi-agents", sourcePid: process.pid });
   return true;
+}
+
+async function runIncrementalWorkflowCommandInPiBridge(task, message) {
+  const sessionFile = task.actualSessionFile || task.sessionFile;
+  if (!sessionFile || !isSlashCommand(message)) return false;
+  const socketPath = task.bridgeSocket || piBridgeSocketPath(sessionFile);
+  if (!existsSync(socketPath)) return false;
+  await sendBridgeRequest(socketPath, { type: "run_incremental_workflow_command", message, source: "mi-agents", sourcePid: process.pid }, 120000);
+  return true;
+}
+
+async function runIncrementalWorkflowCommandInHeadlessBridge(task, message, model) {
+  const sessionFile = task.actualSessionFile || task.sessionFile;
+  if (!sessionFile || !isSlashCommand(message)) return false;
+  // MI_HEADLESS_BRIDGE suppresses pi_session_event publishing from this
+  // throwaway process so it cannot clobber the preserved task state.
+  const worker = createRpcProcess({ cwd: task.cwd || HOME, sessionFile, model: String(model || MI_MODEL).trim(), env: { MI_WORKER: "1", MI_HEADLESS_BRIDGE: "1" } });
+  try {
+    await worker.rpc({ type: "prompt", message });
+    return true;
+  } finally {
+    worker.proc.kill();
+  }
 }
 
 async function mirrorMessageIntoPiBridge(task, message, role = "user", sourcePid) {
@@ -1523,11 +1617,34 @@ async function continueWorker(request) {
   const tasks = await listAllTasks();
   let task = tasks.find((entry) => entry.id === taskId || entry.name === taskId || entry.sessionName === taskId || entry.sessionFile === taskId || entry.actualSessionFile === taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
-  if (task.source === "pi-session") task = await upsertTask({ ...task, id: task.id || `pi-session:${task.sessionId || task.sessionFile}`, status: task.status === "active" ? "active" : "inactive" });
+  if (task.source === "pi-session" && !request.preserveStatus) task = await upsertTask({ ...task, id: task.id || `pi-session:${task.sessionId || task.sessionFile}`, status: task.status === "active" ? "active" : "inactive" });
   const name = task.sessionName || task.name || task.id;
   const activeWorker = workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) || activeWorkers.get(taskId);
+  if (request.preserveStatus) {
+    task = await upsertTask({ ...task, ...preserveTaskStatePatch(task) });
+    if (task.openPiSession) {
+      // The session is open in an interactive pi; never fall through to a
+      // second pi process on the same session file. Surface bridge errors
+      // (e.g. /end refusing to run over the bridge) instead of swallowing them.
+      if (await runIncrementalWorkflowCommandInPiBridge(task, workerInputMessage(message, request.useGoal))) {
+        return { text: `Ran ${slashCommandName(message) || "command"} in open Pi session: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+      }
+      throw new Error(`Cannot run ${slashCommandName(message) || "command"}: open Pi session has no live bridge; run it inside that session`);
+    }
+    if (activeWorker && !activeWorker.proc.killed) {
+      await activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
+      return { text: `Sent ${slashCommandName(message) || "message"} to background task: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+    }
+    const sessionFile = task.actualSessionFile || task.sessionFile;
+    if (!sessionFile) throw new Error(`Cannot run ${slashCommandName(message) || "command"}: task has no session file`);
+    if (await runIncrementalWorkflowCommandInHeadlessBridge(task, workerInputMessage(message, request.useGoal), request.model)) {
+      await upsertTask({ ...task, ...preserveTaskStatePatch(task) });
+      return { text: `Ran ${slashCommandName(message) || "command"} in task session: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
+    }
+    throw new Error(`Cannot run ${slashCommandName(message) || "command"}: headless Pi bridge failed`);
+  }
   if (activeWorker && !activeWorker.proc.killed) {
-    const activeUpdated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
+    const activeUpdated = await upsertTask({ ...clearPreservedTaskState(task), status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", lastInput: taskInput });
     void activeWorker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal), streamingBehavior: isSlashCommand(message) ? undefined : "steer" })
       .catch(async (error) => {
         if (activeWorker.expectedStop) return log(`worker_expected_stop ${name}`);
@@ -1546,7 +1663,7 @@ async function continueWorker(request) {
   if (task.openPiSession) {
     const queued = await queueMessageIntoOpenPiSession(task, workerInputMessage(message, request.useGoal));
     if (queued) {
-      await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "message queued in open pi", lastInput: taskInput });
+      await upsertTask({ ...clearPreservedTaskState(task), status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "message queued in open pi", lastInput: taskInput });
       return { text: `Queued message in open Pi session: ${name}`, taskId: task.id, sessionFile: task.sessionFile, sessionId: task.sessionId, sessionName: name };
     }
   }
@@ -1555,7 +1672,7 @@ async function continueWorker(request) {
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
   const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
-  const updated = await upsertTask({ ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", modelSpec: model, lastInput: taskInput });
+  const updated = await upsertTask({ ...clearPreservedTaskState(task), status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", modelSpec: model, lastInput: taskInput });
   if (request.background) {
     trackActiveWorker(updated, name, worker);
     void (async () => {
@@ -1604,21 +1721,23 @@ async function handlePiSessionEvent(request) {
   const existing = tasks.find((task) => task.sessionFile === sessionFile || task.actualSessionFile === sessionFile || sessionFingerprint(task) === sessionFingerprint({ sessionFile }));
   const text = String(request.text || "").trim();
   const progress = normalizePiSessionProgress(request.progress, text);
-  const status = String(request.status || existing?.status || "running").trim();
+  const isPassiveSlashEvent = request.kind === "user_message" && /^\/(?:marker|end)(?:\s|$)/.test(text);
+  const status = String(isPassiveSlashEvent ? (existing?.status || request.status || "running") : (request.status || existing?.status || "running")).trim();
   const isComplete = ["complete", "completed", "done"].includes(status.toLowerCase());
+  const baseTask = isPassiveSlashEvent ? (existing || {}) : clearPreservedTaskState(existing || {});
   const task = await upsertTask({
-    ...(existing || {}),
+    ...baseTask,
     id: existing?.id || `pi-session:${request.sessionId || sessionFile}`,
     name: existing?.name || existing?.sessionName || (text ? taskNameFromText(text) : "Pi session"),
     cwd: request.cwd || existing?.cwd || HOME,
     source: "pi-session",
-    status: isComplete ? "complete" : "running",
+    status: isPassiveSlashEvent ? status : (isComplete ? "complete" : "running"),
     startedAt: existing?.startedAt || request.at || new Date().toISOString(),
     updatedAt: request.at || new Date().toISOString(),
     lastEventAt: request.at || new Date().toISOString(),
     finishedAt: isComplete ? (request.at || new Date().toISOString()) : undefined,
-    text: isComplete && text ? text : existing?.text,
-    progress,
+    text: isComplete ? (text || undefined) : (isPassiveSlashEvent ? existing?.text : undefined),
+    progress: isPassiveSlashEvent ? (existing?.progress || progress) : progress,
     sessionFile,
     actualSessionFile: sessionFile,
     sessionId: request.sessionId || existing?.sessionId,

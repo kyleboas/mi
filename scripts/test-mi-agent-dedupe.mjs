@@ -160,6 +160,16 @@ try {
   assert.equal(rows.length, 2, 'generic session names were incorrectly merged');
   assert.deepEqual(new Set(rows.map((t) => t.cwd)), new Set(['/repo-a', '/repo-b']), 'generic session rows lost their cwd identity');
 
+  // 6b. Two distinct sessions in the same cwd that only share a topic (e.g. both
+  // mention detect candidates) must stay two rows, and a completed stored task
+  // must not adopt another live session's busy status and flip back to working.
+  await writeTasks([{ id: `pi-session:${uuid(11)}`, source: 'pi-session', name: 'detect-run-may', sessionName: 'detect-run-may', cwd: '/repo', status: 'complete', sessionId: uuid(11), sessionFile: await sessionFile({ id: uuid(11), name: 'detect-run-may', cwd: '/repo', finalText: 'reviewed detect candidates', at: iso(5200), userText: 'review the detect candidates list' }), finishedAt: iso(5200), updatedAt: iso(5200), lastInput: 'review the detect candidates list' }]);
+  await sessionFile({ id: uuid(12), name: 'detect-run-june', cwd: '/repo', busy: true, at: iso(5400), userText: 'check the new detect candidates' });
+  rows = (await request('list_tasks')).tasks.filter((t) => [uuid(11), uuid(12)].includes(t.sessionId));
+  assert.equal(rows.length, 2, 'distinct sessions sharing only a topic were merged into one row');
+  const completedDetect = rows.find((t) => t.sessionId === uuid(11));
+  assert.notEqual(completedDetect.status, 'running', 'completed task adopted another live session status and flipped back to working');
+
   // 7. Concurrent duplicate starts must be suppressed before both requests can upsert.
   await writeTasks([]);
   const [firstStart, secondStart] = await Promise.all([

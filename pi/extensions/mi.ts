@@ -616,8 +616,95 @@ function lastAssistantTextFromMessages(messages: unknown[] = []) {
 	return "";
 }
 
+const INCREMENTAL_WORKFLOW_STATE_ENTRY = "incremental-workflow-state";
+const INCREMENTAL_WORKFLOW_MARKER_LABEL = "marker";
+const INCREMENTAL_WORKFLOW_DEFAULT_END_PROMPT = [
+	"Treat this as a finished work increment that should become durable context for continuing the same repository session.",
+	"Focus on the final accepted outcome, not dead ends or step-by-step implementation noise.",
+	"Capture the concrete code or repo changes, key decisions, important constraints, and any follow-up that still matters.",
+	"Mention relevant files, commands, commits, PR outcomes, or review feedback only when they change future work.",
+	"Omit temporary debugging details, abandoned attempts, and incidental churn that no longer matters.",
+	"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
+].join("\n");
+
+function getSemanticLeafId(ctx: any): string | undefined {
+	let currentId = ctx.sessionManager.getLeafId();
+	while (currentId) {
+		const entry = ctx.sessionManager.getEntry(currentId);
+		if (!entry) return undefined;
+		currentId = entry.type === "custom" || entry.type === "label" ? entry.parentId : undefined;
+		if (entry.type !== "custom" && entry.type !== "label") return entry.id;
+	}
+	return undefined;
+}
+
+function readIncrementalMarkerId(ctx: any): string | undefined {
+	let markerId: string | undefined;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type !== "custom" || entry.customType !== INCREMENTAL_WORKFLOW_STATE_ENTRY) continue;
+		const data = entry.data as { version?: unknown; markerId?: unknown } | undefined;
+		if (data?.version === 1 && typeof data.markerId === "string") markerId = data.markerId;
+	}
+	return markerId;
+}
+
+function applyIncrementalMarker(pi: ExtensionAPI, ctx: any, nextMarkerId: string, notifyMessage: string) {
+	const previousMarkerId = readIncrementalMarkerId(ctx);
+	if (previousMarkerId && previousMarkerId !== nextMarkerId && ctx.sessionManager.getLabel(previousMarkerId) === INCREMENTAL_WORKFLOW_MARKER_LABEL) pi.setLabel(previousMarkerId, undefined);
+	const existingLabel = ctx.sessionManager.getLabel(nextMarkerId);
+	if (existingLabel === undefined || existingLabel === INCREMENTAL_WORKFLOW_MARKER_LABEL) pi.setLabel(nextMarkerId, INCREMENTAL_WORKFLOW_MARKER_LABEL);
+	pi.appendEntry(INCREMENTAL_WORKFLOW_STATE_ENTRY, { version: 1, markerId: nextMarkerId });
+	ctx.ui.notify(notifyMessage, "info");
+}
+
+async function waitForIncrementalWorkflowIdle(ctx: any) {
+	if (typeof ctx.waitForIdle === "function") {
+		await ctx.waitForIdle();
+		return;
+	}
+	if (typeof ctx.isIdle !== "function") return;
+	for (let i = 0; i < 300 && !ctx.isIdle(); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
+async function runIncrementalWorkflowCommand(pi: ExtensionAPI, ctx: any, value: string) {
+	const [command, ...rest] = value.trim().split(/\s+/);
+	const args = rest.join(" ").trim();
+	await waitForIncrementalWorkflowIdle(ctx);
+	if (command === "/marker") {
+		const targetId = getSemanticLeafId(ctx);
+		if (!targetId) { ctx.ui.notify("No conversation point to mark yet", "warning"); return "No conversation point to mark yet"; }
+		if (readIncrementalMarkerId(ctx) === targetId) { ctx.ui.notify("Marker already points here", "info"); return "Marker already points here"; }
+		applyIncrementalMarker(pi, ctx, targetId, "Marker set");
+		return "Marker set";
+	}
+	if (command === "/end") {
+		// navigateTree is only available on command contexts. The pi-session
+		// bridge runs handlers with a plain event context, which cannot
+		// summarize; surface that instead of crashing on a missing method.
+		if (typeof ctx.navigateTree !== "function") throw new Error("/end cannot run over the session bridge; run /end inside the pi session");
+		const markerId = readIncrementalMarkerId(ctx);
+		if (!markerId) { ctx.ui.notify("No marker set. Run /marker first", "warning"); return "No marker set. Run /marker first"; }
+		if (!ctx.sessionManager.getEntry(markerId)) { ctx.ui.notify("Stored marker no longer exists on this session. Run /marker again", "warning"); return "Stored marker no longer exists on this session. Run /marker again"; }
+		if (getSemanticLeafId(ctx) === markerId) { ctx.ui.notify("Nothing new since the current marker", "info"); return "Nothing new since the current marker"; }
+		ctx.ui.setWorkingMessage(ctx.ui.theme.fg("dim", "Summarizing increment since marker…"));
+		let result: any;
+		try {
+			result = await ctx.navigateTree(markerId, args.toLowerCase() === "full" ? { summarize: true } : { summarize: true, customInstructions: args || INCREMENTAL_WORKFLOW_DEFAULT_END_PROMPT, replaceInstructions: false });
+		} finally {
+			ctx.ui.setWorkingMessage();
+		}
+		if (result.cancelled) { ctx.ui.notify("/end cancelled", "warning"); return "/end cancelled"; }
+		const nextMarkerId = getSemanticLeafId(ctx);
+		if (!nextMarkerId) { ctx.ui.notify("/end completed but no new marker point was found", "warning"); return "/end completed but no new marker point was found"; }
+		applyIncrementalMarker(pi, ctx, nextMarkerId, "Increment summarized and marker advanced");
+		return "Increment summarized and marker advanced";
+	}
+	throw new Error(`Unsupported native slash command: ${command}`);
+}
+
 async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
-	if (process.env.MI_MAIN === "1" || process.env.MI_WORKER === "1") return;
+	if (process.env.MI_MAIN === "1") return;
+	if (process.env.MI_WORKER === "1" && process.env.MI_HEADLESS_BRIDGE !== "1") return;
 	const sessionFile = ctx.sessionManager.getSessionFile?.();
 	if (!sessionFile) return;
 	await mkdir(MI_PI_BRIDGE_DIR, { recursive: true });
@@ -629,7 +716,7 @@ async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
 	const server = net.createServer((socket) => {
 		let data = "";
 		socket.on("error", () => undefined);
-		socket.on("data", (chunk) => {
+		socket.on("data", async (chunk) => {
 			data += chunk.toString("utf8");
 			if (!data.includes("\n")) return;
 			const line = data.slice(0, data.indexOf("\n"));
@@ -642,6 +729,13 @@ async function startPiSessionBridge(pi: ExtensionAPI, ctx: any) {
 				}
 				if (Number(request.sourcePid || 0) === process.pid) {
 					socket.end(JSON.stringify({ ok: true, ignored: true }) + "\n");
+					return;
+				}
+				if (request.type === "run_incremental_workflow_command") {
+					const text = String(request.message || "").trim();
+					if (!text) throw new Error("Message is empty");
+					const result = await runIncrementalWorkflowCommand(pi, ctx, text);
+					socket.end(JSON.stringify({ ok: true, text: result }) + "\n");
 					return;
 				}
 				if (request.type === "send_user_message") {
@@ -687,7 +781,7 @@ function stopPiSessionBridge(pi: ExtensionAPI) {
 }
 
 function publishPiSessionEvent(ctx: any, event: Record<string, unknown>) {
-	if (process.env.MI_MAIN === "1") return;
+	if (process.env.MI_MAIN === "1" || process.env.MI_HEADLESS_BRIDGE === "1") return;
 	const sessionFile = ctx.sessionManager.getSessionFile?.();
 	if (!sessionFile) return;
 	sendDaemonEvent({
@@ -745,7 +839,9 @@ export default function miExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("message_update", async (event: any, ctx) => {
-		const delta = String(event?.assistantMessageEvent?.delta || "");
+		const update = event?.assistantMessageEvent || {};
+		if (update.type !== "text_delta") return;
+		const delta = String(update.delta || "");
 		if (!delta) return;
 		assistantProgress = `${assistantProgress}${delta}`.replace(/\s+/g, " ").trim().slice(-500);
 		const nowMs = Date.now();
@@ -806,6 +902,23 @@ Mi-specific capability note: You are the persistent Mi main agent. Store every M
 			await notify(ctx, error instanceof Error ? error.message : String(error), "error");
 		}
 	}
+
+	// /marker and /end must be registered commands so they execute with a real
+	// command context (navigateTree/waitForIdle) when typed in a session and
+	// when delivered by the Mi daemon through `prompt` to worker/headless pis.
+	pi.registerCommand("marker", {
+		description: "Set the incremental-workflow marker at the current conversation point.",
+		async handler(_args: string, ctx: ExtensionCommandContext) {
+			await runIncrementalWorkflowCommand(pi, ctx, "/marker");
+		},
+	});
+
+	pi.registerCommand("end", {
+		description: 'Summarize the increment since the marker and advance it. Optional custom instructions, or "full".',
+		async handler(args: string, ctx: ExtensionCommandContext) {
+			await runIncrementalWorkflowCommand(pi, ctx, `/end ${args}`.trim());
+		},
+	});
 
 	pi.registerCommand("mi", {
 		description: "Open Mi, ask Mi, or run Mi subcommands: read, inbox, bring-in.",
