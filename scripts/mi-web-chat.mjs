@@ -42,6 +42,7 @@ const workerThresholdSeconds = Number(process.env.MI_WEB_WORKER_THRESHOLD_SECOND
 const pushoverEndpoint = 'https://api.pushover.net/1/messages.json';
 const pushoverEnvPath = path.join(home, '.config', 'pushover', 'env');
 const pushoverMessageLimit = 1024;
+const webhookToken = String(process.env.MI_WEB_CHAT_WEBHOOK_TOKEN || '').trim();
 
 let sendQueue = Promise.resolve();
 const activeJobs = new Map();
@@ -105,8 +106,14 @@ async function readMessages(threadId = defaultThread, limit = 150) {
       .split('\n')
       .map((line) => line.trim())
       .filter(Boolean)
-      .map((line) => JSON.parse(line))
-      .filter((message) => message.role !== 'system')
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((message) => message && message.role !== 'system')
       .map((message) => ({
         id: message.id,
         role: message.role,
@@ -151,7 +158,9 @@ async function saveUploadedPhoto(body) {
   if (bytes.length > maxUploadBytes) throw new Error(`photo too large; max ${Math.round(maxUploadBytes / 1024 / 1024)}MB`);
   const safeName = String(body.name || 'photo').replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 80) || 'photo';
   const ext = extensionForMime(mimeType);
-  const filename = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}-${safeName}${safeName.toLowerCase().endsWith(ext) ? '' : ext}`;
+  const lowerName = safeName.toLowerCase();
+  const hasExt = lowerName.endsWith(ext) || (ext === '.jpg' && lowerName.endsWith('.jpeg'));
+  const filename = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}-${safeName}${hasExt ? '' : ext}`;
   await mkdir(uploadDir, { recursive: true });
   const filePath = path.join(uploadDir, filename);
   await writeFile(filePath, bytes);
@@ -166,6 +175,12 @@ function sendJson(res, status, value) {
     'Cache-Control': 'no-store',
   });
   res.end(body);
+}
+
+function webhookAuthorized(req) {
+  if (!webhookToken) return false;
+  const auth = String(req.headers.authorization || '');
+  return auth === `Bearer ${webhookToken}`;
 }
 
 function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') {
@@ -324,7 +339,13 @@ async function notifyPushSubscribers(reply, threadId) {
   if (kept.length !== subscriptions.length) await savePushSubscriptions(kept);
 }
 
-const serviceWorkerJs = String.raw`self.addEventListener('push', (event) => {
+const serviceWorkerJs = String.raw`self.addEventListener('install', () => self.skipWaiting());
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('push', (event) => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch { data = { body: event.data ? event.data.text() : '' }; }
   const title = data.title || 'Mi';
@@ -1147,7 +1168,6 @@ const html = String.raw`<!doctype html>
     const send = document.getElementById('send');
     const photo = document.getElementById('photo');
     const photoInput = document.getElementById('photo-input');
-    const statusEl = document.getElementById('status');
     const errorEl = document.getElementById('error');
     const attachmentEl = document.getElementById('attachment');
     const attachmentNameEl = document.getElementById('attachment-name');
@@ -1160,6 +1180,8 @@ const html = String.raw`<!doctype html>
     let lastSignature = '';
     let lastRenderedBusy = false;
     let hasRenderedMessages = false;
+    let refreshErrorShown = false;
+    let pushSetupStarted = false;
 
     function escapeHtml(s){ return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
     function renderAssistantMarkdown(text){
@@ -1289,18 +1311,62 @@ const html = String.raw`<!doctype html>
         const data = await api('/api/messages?thread=' + encodeURIComponent(thread));
         syncServerJobs(data.messages || [], data.jobs || []);
         render(data.messages || []);
-        if (statusEl) statusEl.textContent = busy ? 'Mi is thinking…' : 'private tailnet chat';
+        if (refreshErrorShown) {
+          refreshErrorShown = false;
+          setError('');
+        }
       } catch (e) {
+        refreshErrorShown = true;
         setError(e.message);
       }
     }
 
+    function urlBase64ToUint8Array(base64String){
+      const padding = '='.repeat((4 - base64String.length % 4) % 4);
+      const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+      const raw = atob(base64);
+      return Uint8Array.from(Array.from(raw, c => c.charCodeAt(0)));
+    }
+
+    async function ensurePushSubscription(interactive){
+      if (pushSetupStarted) return;
+      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || !window.isSecureContext) return;
+      if (Notification.permission === 'denied') return;
+      if (Notification.permission === 'default' && !interactive) return;
+      pushSetupStarted = true;
+      try {
+        const registration = await navigator.serviceWorker.register('/sw.js');
+        let permission = Notification.permission;
+        if (permission === 'default') permission = await Notification.requestPermission();
+        if (permission !== 'granted') return;
+        const ready = await navigator.serviceWorker.ready.catch(() => registration);
+        const manager = (ready || registration).pushManager;
+        let subscription = await manager.getSubscription();
+        if (!subscription) {
+          const { publicKey } = await api('/api/push/public-key');
+          subscription = await manager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(publicKey) });
+        }
+        await api('/api/push/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ subscription }),
+        });
+      } catch {
+        pushSetupStarted = false;
+      }
+    }
+
     input.addEventListener('input', autogrow);
-    input.addEventListener('keydown', () => {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !window.matchMedia('(pointer: coarse)').matches) {
+        e.preventDefault();
+        sendCurrentMessage();
+        return;
+      }
       setTimeout(autogrow, 0);
     });
     send.addEventListener('click', () => { sendCurrentMessage(); });
-    photo.addEventListener('click', () => { if (!busy) photoInput.click(); });
+    photo.addEventListener('click', () => { photoInput.click(); });
     photoInput.addEventListener('change', () => { attachPhoto(); });
     removeAttachment.addEventListener('click', () => { attachment = null; renderAttachment(); input.focus(); });
 
@@ -1326,7 +1392,7 @@ const html = String.raw`<!doctype html>
     async function attachPhoto() {
       const file = photoInput.files && photoInput.files[0];
       photoInput.value = '';
-      if (!file || busy) return;
+      if (!file) return;
       if (!file.type.startsWith('image/')) return setError('Choose an image file.');
       setError('');
       input.disabled = true;
@@ -1354,6 +1420,7 @@ const html = String.raw`<!doctype html>
     async function sendCurrentMessage() {
       const message = input.value.trim();
       if (!message && !attachment) return;
+      ensurePushSubscription(true);
       setError('');
       input.value = '';
       const sentAttachment = attachment;
@@ -1364,7 +1431,6 @@ const html = String.raw`<!doctype html>
       const pendingText = [sentAttachment ? 'Photo: ' + (sentAttachment.name || 'image') : '', message].filter(Boolean).join('\n');
       pendingMessages.push({ id: pendingId, role: 'user', text: pendingText, ts: new Date().toISOString() });
       busy = true;
-      if (statusEl) statusEl.textContent = 'Mi is thinking…';
       await refresh();
       input.focus();
       try {
@@ -1381,10 +1447,13 @@ const html = String.raw`<!doctype html>
         pendingMessages = pendingMessages.filter(m => m.id !== pendingId);
         attachment = sentAttachment;
         renderAttachment();
+        if (!input.value.trim() && message) {
+          input.value = message;
+          autogrow();
+        }
         setError(e.message);
       } finally {
         busy = pendingMessages.length > 0 || serverJobs.length > 0;
-        if (statusEl) statusEl.textContent = busy ? 'Mi is thinking…' : 'private tailnet chat';
         await refresh();
         input.focus();
       }
@@ -1392,6 +1461,7 @@ const html = String.raw`<!doctype html>
 
     refresh();
     setInterval(refresh, 2000);
+    ensurePushSubscription(false);
   </script>
 </body>
 </html>`;
@@ -1430,6 +1500,19 @@ async function handle(req, res) {
       const threadId = safeThreadId(url.searchParams.get('thread') || defaultThread);
       return sendJson(res, 200, { messages: await readMessages(threadId), jobs: activeJobsFor(threadId) });
     }
+    if (req.method === 'POST' && url.pathname === '/api/notify') {
+      if (!webhookAuthorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+      const body = await readJsonBody(req);
+      const threadId = safeThreadId(body.thread || defaultThread);
+      const text = redact(String(body.text || body.message || '').trim());
+      const role = body.role === 'user' ? 'user' : 'assistant';
+      const source = String(body.source || 'webhook').replace(/[^a-zA-Z0-9:_-]/g, '-').slice(0, 80) || 'webhook';
+      if (!text) return sendJson(res, 400, { ok: false, error: 'message required' });
+      if (Array.from(text).length > maxMessageChars) return sendJson(res, 400, { ok: false, error: `message too long; max ${maxMessageChars} chars` });
+      await appendThreadMessage(threadId, role, text, { unread: body.unread !== false, source });
+      await notifyUser(text, threadId).catch(() => undefined);
+      return sendJson(res, 200, { ok: true, messages: await readMessages(threadId), jobs: activeJobsFor(threadId) });
+    }
     if (req.method === 'POST' && url.pathname === '/api/send') {
       const body = await readJsonBody(req);
       const threadId = safeThreadId(body.thread || defaultThread);
@@ -1438,6 +1521,7 @@ async function handle(req, res) {
       const photoName = String(body.photoName || '').trim();
       if (!message && !photoPath) return sendJson(res, 400, { ok: false, error: 'message required' });
       if (Array.from(message).length > maxMessageChars) return sendJson(res, 400, { ok: false, error: `message too long; max ${maxMessageChars} chars` });
+      if (photoPath && !path.resolve(photoPath).startsWith(path.resolve(uploadDir) + path.sep)) return sendJson(res, 400, { ok: false, error: 'invalid photo path' });
       const workerMessage = photoPath
         ? [`Photo uploaded from Mi web chat.${message ? `\n\nUser message:\n${message}` : ''}`, `Local file path: ${photoPath}`, 'Use the read tool to inspect this image if needed.'].join('\n\n')
         : message;

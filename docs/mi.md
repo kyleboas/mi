@@ -98,7 +98,7 @@ Key behavior:
 - `/goal ...` is treated as task prompt text, not as a local mi agents slash command.
 - `/resume` opens a picker for recent/default pi sessions; selected sessions are persisted into the Mi task list.
 - `/model` opens a pi-style model picker for new tasks and replies; Shift+Tab cycles thinking level.
-- `^L` opens full-output mode for the selected task. Arrow keys and PageUp/PageDown scroll the output; `^L` exits it.
+- `^F` opens full-output mode for the selected task. Arrow keys and PageUp/PageDown scroll the output; `^F` exits it.
 - `^M` toggles multi-select clear mode. Enter/Space toggles a row; Esc clears selected rows.
 - `/mi <question>` asks Mi main about the selected task context and stays in that side-chat until Ctrl-C.
 
