@@ -2618,7 +2618,7 @@ function renderMiTranscriptItem(item: { role: 'user' | 'assistant'; text: string
 
 type MiTranscriptItem = { role: 'user' | 'assistant'; text: string };
 
-const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/marker', '/end', '/resume', '/open', '/quit', '/mi'];
+const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/plan', '/compact', '/marker', '/end', '/resume', '/open', '/quit', '/mi'];
 const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
   '/settings': 'Open settings menu',
   '/model': 'Select Mi model',
@@ -2637,6 +2637,7 @@ const PI_SLASH_COMMAND_DESCRIPTIONS: Record<string, string> = {
   '/login': 'Configure provider authentication',
   '/logout': 'Remove provider authentication',
   '/new': 'Start a new Mi background agent',
+  '/plan': 'Start a read-only planning background agent',
   '/compact': 'Manually compact the session context',
   '/marker': 'Set the incremental-workflow marker in the selected task session',
   '/end': 'Summarize the increment since the marker and advance it',
@@ -2728,7 +2729,7 @@ async function getModelAutocompleteItems(argumentPrefix: string) {
 }
 
 const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/resume', '/open', '/model', '/scoped-models']);
-const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect']);
+const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect', '/plan']);
 const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set(['/marker', '/end']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 

@@ -84,7 +84,8 @@ assert.match(cli, /matchesKey\(data, 'shift\+tab'\)[\s\S]*cycleAgentThinking\(\)
 assert.doesNotMatch(cli, /status = `Agent (?:model|tier)/, 'agent view does not put model changes in the help/status line');
 assert.match(cli, /async function applyAgentPiCycle\(text: string\)/, 'agent view supports pi-cycle model shortcuts for new tasks and replies');
 assert.match(cli, /async function runAgentSlashCommand\(value: string\)/, 'agent view supports slash commands in input');
-assert.match(cli, /const PI_SLASH_COMMANDS = \[[^\]]*'\/marker'[^\]]*'\/end'[^\]]*\]/, 'agent view autocompletes /marker and /end');
+assert.match(cli, /const PI_SLASH_COMMANDS = \[[^\]]*'\/plan'[^\]]*'\/marker'[^\]]*'\/end'[^\]]*\]/, 'agent view autocompletes /plan, /marker, and /end');
+assert.match(cli, /const MI_BACKGROUND_SLASH_COMMANDS = new Set\(\['\/detect', '\/plan'\]\)/, 'agent view starts /plan as a native Mi background task instead of opening Pi');
 assert.match(cli, /const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set\(\['\/marker', '\/end'\]\)/, 'agent view handles /marker and /end natively');
 assert.match(cli, /async function sendNativeAgentSlashCommand\(value: string\)[\s\S]*const isMarker = command === '\/marker'[\s\S]*const waitForDone = command === '\/end'[\s\S]*status = isMarker \? 'Marker set' : 'Summarizing increment since marker…'[\s\S]*type: 'continue_worker'[\s\S]*background: !waitForDone[\s\S]*preserveStatus: true[\s\S]*if \(waitForDone\) status = 'Increment summarized and marker advanced'/, 'native task slash commands show extension status above input; /marker and /end preserve task state');
 assert.match(cli, /MI_NATIVE_AGENT_SLASH_COMMANDS\.has\(slashCommandName\(value\)\)[\s\S]*sendNativeAgentSlashCommand\(value\)/, 'runAgentSlashCommand dispatches native task slash commands');
