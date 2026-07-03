@@ -176,11 +176,15 @@ export async function runCron(cron: MiCron) {
   return result;
 }
 
-export async function tickCrons() {
+export async function tickCrons(options: { remindersOnly?: boolean } = {}) {
   const crons = await readCrons();
-  const ran: Array<{ name: string; status: 'ok' | 'error' }> = [];
+  const ran: Array<{ name: string; status: 'ok' | 'error' | 'skipped' }> = [];
   for (const cron of crons) {
     if (!due(cron)) continue;
+    if (options.remindersOnly && cron.command) {
+      ran.push({ name: cron.name, status: 'skipped' });
+      continue;
+    }
     const result = await runCron(cron);
     cron.lastRunAt = now();
     cron.lastStatus = result.status;
@@ -190,6 +194,10 @@ export async function tickCrons() {
   }
   await writeCrons(crons);
   return ran;
+}
+
+export async function tickReminderCrons() {
+  return tickCrons({ remindersOnly: true });
 }
 
 export function cronPaths() { return { cronsPath: CRONS_PATH, logPath: LOG_PATH }; }

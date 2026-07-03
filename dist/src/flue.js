@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { capabilityGrantExpiresAt } from './capability-gc.js';
 const secretPatterns = [
     /\b[A-Za-z0-9_]*TOKEN[A-Za-z0-9_]*\s*=\s*[^\s]+/gi,
     /\b[A-Za-z0-9_]*SECRET[A-Za-z0-9_]*\s*=\s*[^\s]+/gi,
@@ -22,6 +24,42 @@ function fallbackReply(message, error) {
 }
 function currentUserText(message) {
     return message.split(/(?:^|\n)Current user message:\n/i).pop() || message;
+}
+const safePiEnvKeys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'HOSTNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'TMP', 'TEMP', 'PI_PROVIDER', 'PI_MODEL', 'PI_CONFIG_DIR', 'PI_GATEWAY_URL', 'AGENT_GATEWAY_URL', 'FLUE_URL', 'FLUE_CHAT_URL', 'FLUE_CMD'];
+function reducedPiEnv(extra = {}) {
+    const env = {};
+    for (const key of safePiEnvKeys) {
+        const value = process.env[key];
+        if (value !== undefined)
+            env[key] = value;
+    }
+    return { ...env, ...extra };
+}
+function miRoot() {
+    return process.env.MI_ROOT || path.join(process.env.HOME || process.cwd(), 'assistant');
+}
+function miRuntimeDir() {
+    return process.env.MI_RUNTIME_DIR || path.join(process.env.HOME || process.cwd(), '.pi', 'agent', 'mi');
+}
+function capabilityGuardPath() {
+    return process.env.MI_CAPABILITY_GUARD || path.join(miRoot(), 'pi', 'extensions', 'mi-capability-guard.ts');
+}
+async function writeCapabilityGrantsFile(cwd, profile = 'chat-read') {
+    const dir = path.join(miRuntimeDir(), 'capabilities');
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const file = path.join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
+    const createdAt = new Date().toISOString();
+    const grant = {
+        id: `${profile}-${Date.now().toString(36)}`,
+        resource: `file://${path.resolve(cwd)}`,
+        rights: ['read'],
+        constraints: { recursive: true, profile },
+        principal: { id: 'mi-chat', type: 'web', displayName: 'Mi chat' },
+        createdAt,
+        expiresAt: capabilityGrantExpiresAt(createdAt),
+    };
+    await writeFile(file, JSON.stringify({ profile, grants: [grant] }, null, 2), { mode: 0o600 });
+    return file;
 }
 function directChatReply(message) {
     const trimmed = currentUserText(message).trim();
@@ -124,15 +162,20 @@ async function runPiChat(message, error) {
     const lookupContext = needsLookup ? await lookupContextFor(message).catch(() => '') : '';
     const prompt = needsLookup
         ? `You are Mi in a private chat. Be concise. Use the lookup context below to answer the current user request. Do not output tool calls, JSON, commands, or code blocks. If the lookup context is insufficient, say you couldn't verify it.\n\nLookup context:\n${lookupContext || 'No lookup results available.'}\n\nUser: ${message}`
-        : `You are Mi in a private chat. Be concise. You may use the exposed tools when the current user request explicitly asks you to inspect, check, verify, or monitor local files, logs, state, or service status. Tool use is read-only: use bash only for non-mutating commands such as pwd, ls, find, rg, tail, ps, or systemctl status. Do not edit files, write files, deploy, publish, merge, delete, spend money, send external messages, kill processes, restart services, or change settings without explicit approval. Never expose secrets. If you use tools, summarize only safe findings.\n\nUser: ${message}`;
+        : `You are Mi in a private chat. Be concise. You may use the exposed tools when the current user request explicitly asks you to inspect, check, verify, or monitor local files, logs, state, or service status. Tool use is read-only: use read, grep, find, and ls only. Do not use bash, edit files, write files, deploy, publish, merge, delete, spend money, send external messages, kill processes, restart services, or change settings without explicit approval. Never expose secrets. If you use tools, summarize only safe findings.\n\nUser: ${message}`;
+    const cwd = process.env.HOME || process.cwd();
+    const grantsFile = await writeCapabilityGrantsFile(cwd, 'chat-read');
+    const auditFile = path.join(miRuntimeDir(), 'capability-audit.jsonl');
     return await new Promise((resolve) => {
         const model = process.env.PI_CHAT_MODEL || process.env.PI_MODEL;
-        const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes'];
-        const chatTools = process.env.MI_CHAT_TOOLS || 'read,bash';
+        const guard = capabilityGuardPath();
+        const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
+        const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes'];
+        const chatTools = process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
         const args = model ? [...baseArgs, '--model', model, '--tools', chatTools, prompt] : [...baseArgs, '--tools', chatTools, prompt];
         const child = spawn(cmd, args, {
-            cwd: process.env.HOME || process.cwd(),
-            env: process.env,
+            cwd,
+            env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }),
             shell: false,
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -264,7 +307,7 @@ export async function runFlueChat(message) {
     return await new Promise((resolve) => {
         const child = spawn(cmd, args, {
             cwd: process.cwd(),
-            env: process.env,
+            env: reducedPiEnv(),
             shell: false,
             stdio: ['ignore', 'pipe', 'pipe'],
         });

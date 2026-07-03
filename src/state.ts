@@ -1,5 +1,6 @@
 import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { type CapabilityAuditEvent, type CapabilityGrant, type CapabilityRight, type Principal, mintCapabilityGrant } from './capabilities.js';
 import { redactSecrets } from './redact.js';
 
 const stateDir = path.resolve('state');
@@ -16,6 +17,11 @@ export type Approval = {
   prompt: string;
   reason: string;
   result?: string;
+  resource?: string;
+  rights?: CapabilityRight[];
+  principal?: Principal;
+  expiresAt?: string;
+  capabilityId?: string;
 };
 
 export async function ensureState() {
@@ -88,7 +94,7 @@ export async function readRecentEvents(limit = 100) {
   }
 }
 
-export async function createApproval(prompt: string, reason: string) {
+export async function createApproval(prompt: string, reason: string, capabilityRequest: Partial<Pick<Approval, 'resource' | 'rights' | 'principal' | 'expiresAt'>> = {}) {
   const items = await readApprovals();
   const approval: Approval = {
     id: Math.random().toString(36).slice(2, 10),
@@ -96,9 +102,51 @@ export async function createApproval(prompt: string, reason: string) {
     status: 'pending',
     prompt: String(redactSecrets(prompt)),
     reason: String(redactSecrets(reason)),
+    resource: capabilityRequest.resource,
+    rights: capabilityRequest.rights,
+    principal: capabilityRequest.principal,
+    expiresAt: capabilityRequest.expiresAt,
   };
   items.unshift(approval);
   await writeApprovals(items);
   await logEvent('approval.created', approval);
   return approval;
+}
+
+export async function resolveApproval(approvalId: string, status: 'approved' | 'rejected', result?: string): Promise<Approval | undefined> {
+  const items = await readApprovals();
+  const approval = items.find((item) => item.id === approvalId || item.id.startsWith(approvalId));
+  if (!approval) return undefined;
+  approval.status = status;
+  approval.result = result ? String(redactSecrets(result)) : approval.result;
+  await writeApprovals(items);
+  await logEvent(`approval.${status}`, { approvalId: approval.id, result: approval.result });
+  return approval;
+}
+
+export async function approveAsCapability(approvalId: string): Promise<CapabilityGrant | undefined> {
+  const items = await readApprovals();
+  const approval = items.find((item) => item.id === approvalId || item.id.startsWith(approvalId));
+  if (!approval?.resource || !approval.rights?.length) {
+    if (approval) await resolveApproval(approval.id, 'approved');
+    return undefined;
+  }
+  const grant = mintCapabilityGrant({
+    id: approval.capabilityId,
+    resource: approval.resource,
+    rights: approval.rights,
+    principal: approval.principal,
+    createdAt: new Date().toISOString(),
+    expiresAt: approval.expiresAt,
+  });
+  approval.status = 'approved';
+  approval.capabilityId = grant.id;
+  approval.expiresAt = grant.expiresAt || approval.expiresAt;
+  await writeApprovals(items);
+  await logEvent('capability.granted', { approvalId, grant });
+  return grant;
+}
+
+export async function logCapabilityAudit(event: CapabilityAuditEvent) {
+  await logEvent('capability.audit', event);
 }

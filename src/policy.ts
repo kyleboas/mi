@@ -1,8 +1,11 @@
-export type RouteMode = 'flue-chat' | 'pi-read-only' | 'approval-required';
+import { alwaysAskReason, matchDelegation, readDelegations } from './delegations.js';
+
+export type RouteMode = 'flue-chat' | 'pi-read-only' | 'delegated' | 'approval-required';
 
 export type RouteDecision = {
   mode: RouteMode;
   reason: string;
+  delegationId?: string;
 };
 
 const risky = [
@@ -61,7 +64,17 @@ function matchesAny(prompt: string, patterns: RegExp[]) {
   return patterns.find((r) => r.test(prompt));
 }
 
+export async function classifyWithDelegations(prompt: string): Promise<RouteDecision> {
+  const askReason = alwaysAskReason(prompt);
+  if (askReason) return { mode: 'approval-required', reason: askReason };
+  const delegation = matchDelegation(prompt, await readDelegations());
+  if (delegation) return { mode: 'delegated', reason: `Matched standing delegation: ${delegation.id}`, delegationId: delegation.id };
+  return classify(prompt);
+}
+
 export function classify(prompt: string): RouteDecision {
+  const askReason = alwaysAskReason(prompt);
+  if (askReason) return { mode: 'approval-required', reason: askReason };
   const riskyHit = matchesAny(prompt, risky);
   if (riskyHit) return { mode: 'approval-required', reason: `Matched risky action pattern: ${riskyHit}` };
 

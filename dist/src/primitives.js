@@ -9,6 +9,8 @@ export function createRunRecord(assistant, trigger) {
         trigger,
         status: 'started',
         startedAt: new Date().toISOString(),
+        capabilities: [],
+        capabilityAudit: [],
         toolCalls: [],
         workerResults: [],
         approvals: [],
@@ -38,6 +40,12 @@ export function addApproval(run, approval) {
     return {
         ...run,
         approvals: [...run.approvals, { ...approval, createdAt: approval.createdAt || new Date().toISOString() }],
+    };
+}
+export function addCapabilityAudit(run, event) {
+    return {
+        ...run,
+        capabilityAudit: [...(run.capabilityAudit || []), event],
     };
 }
 export async function writeRunRecord(run) {

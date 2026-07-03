@@ -37,44 +37,52 @@ The current private implementation uses these runtime components under the two p
    - `pi.inspect` is read-only and constrained to safe read/search tools.
    - `pi.repair` is defined as the code-changing worker but disabled by default; it requires approval before enabling.
 
-3. **`mi check`**
-   - One proactive check-in, not an agent platform.
-   - Shape: read state → run checks → dedupe → append message → maybe notify.
+3. **`mi check` / `mi tick`**
+   - One proactive check-in and one scheduled entrypoint, not a generic agent platform.
+   - Shape: read state → run checks → dedupe → append message → optionally start a bounded delegated/read-only worker → maybe notify.
    - Default checks are `pendingApprovals`, `failedCrons`, and `dailyBrief`.
-   - It creates awareness only: notices, summaries, nudges, and notifications. It never acts.
+   - Registry-only checks include configured monitor health and dynamic project questions.
+   - It may act without asking only when a standing delegation in `assistants/delegations.md` permits the action; otherwise it observes, asks, or reports.
 
 ## Core primitives
 
-Mi core intentionally exposes only five primitives:
+Mi core intentionally exposes these primitives:
 
 - **Assistant**: Markdown instructions plus frontmatter.
 - **Trigger**: timer, webhook, manual command, or service event.
 - **Tool**: a small function exposed by an integration.
 - **Worker**: a short-lived AI process that does one job. The first worker backend is pi.
-- **Run**: a durable record of what happened: timestamp, trigger, assistant, tool calls, worker results, approvals, status, and final report.
+- **Principal**: the human or trigger source whose authority backs a run.
+- **Capability**: a bounded grant to a resource such as `file://...`, `https://...`, or `secret://...` with rights like `read`, `write`, `execute`, `fetch`, or `exchange`.
+- **Run**: a durable record of what happened: timestamp, trigger, assistant, principal, capability grants/audit, tool calls, worker results, approvals, status, and final report.
 
 These primitives live in `src/primitives.ts`. Run records are written to `state/runs/<run-id>.json` and `state/runs.jsonl`. Proactive observations are logged in Mi-owned local state (`state/events.jsonl` and `state/proactive-dedupe.json`). Service-specific behavior belongs in installable tool packages, not the core.
 
 ## Routing policy
 
-The current routing classifier returns one of three modes:
+The current routing classifier returns one of four modes:
 
 - `flue-chat`: greetings, simple conversation, planning, drafting, writing prose, messaging drafts, summarization of user-provided text, and general questions.
 - `pi-read-only`: requests that combine an inspection action (`check`, `inspect`, `read`, `search`, `status`, `summarize`, `find`, `list`, `show`) with a local target (`repo`, `service`, `wiki`, `file`, `log`, `process`, `health`, `server`, `app`, `project`).
-- `approval-required`: risky actions such as editing, changing, modifying, fixing, deleting, deploying, publishing, merging, committing, pushing, or secret/token/password/API-key handling.
+- `delegated`: reversible/scoped actions that match `assistants/delegations.md`, such as Mi-owned service restarts, scoped repair workers that only prepare branches/PRs, or Kyle-only reports.
+- `approval-required`: always-ask or risky actions such as merging, deploying, publishing, deleting non-Mi data, DNS, secrets, spending money, messaging anyone other than Kyle, or editing Tactics Journal posts.
 
 ## Safety model
 
-Safety is enforced in `src/safety.ts`, `src/proactive.ts`, and at runner boundaries:
+Safety is enforced in `src/safety.ts`, `src/capabilities.ts`, `src/proactive.ts`, the Pi capability guard, and runner boundaries:
 
 - Assistants are read-only by default.
 - Tools or permissions that imply write/deploy/merge/delete/DNS/secret changes require approval.
+- Scoped Pi workers run with explicit tool lists and a reduced environment; they do not inherit the daemon's full `process.env`.
+- Raw host `bash` is denied by default for scoped workers. Bash requires an explicit execute capability or a stronger sandbox in a later phase.
 - `pi.inspect` is read-only.
-- `pi.repair` always requires an explicit approval gate before code-changing worker runs.
+- `pi.repair` always requires an explicit approval gate before code-changing worker runs; approvals mint bounded capability grants rather than broad permission.
 - Runtime assistants cannot silently rewrite `assistants/*.md`; they may only suggest instruction changes.
-- Proactive Mi creates awareness only. It appends observations and may notify, but it does not inspect with pi, start workers, edit files, deploy, merge, delete, change config, or approve anything.
+- Proactive Mi uses a three-tier model: read-only inspection, delegated act-then-report, and approval-required.
+- Delegated actions must match `assistants/delegations.md`, consume a bounded budget, verify their result, and write/report what happened.
+- Always-ask actions include merge, deploy, publish, delete non-Mi data, DNS, secrets, spending money, messaging anyone other than Kyle, and edits under Tactics Journal `_posts/`.
 - Builder edits are reviewable file changes.
 
 ## Safety boundary
 
-Flue decides and orchestrates. pi inspects and executes under visible constraints. There is no public webhook/control UI in Mi. Pushover is notifications-only and must not carry secrets, public control links, or dangerous action links.
+Flue decides and orchestrates for no-host or virtual-sandbox work. Until Flue has scoped host mounts and child-task tool attenuation, Mi does not use Flue `local()` as a host security boundary. pi inspects and executes under visible constraints projected by Mi: explicit tools, reduced env, and `pi/extensions/mi-capability-guard.ts` loaded with `--no-extensions --extension <guard>`. There is no public webhook/control UI in Mi. Pushover is notifications-only and must not carry secrets, public control links, or dangerous action links.

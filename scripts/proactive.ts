@@ -11,6 +11,9 @@ const aliases: Record<string, string[]> = {
   'pending-approvals': ['pendingApprovals'],
   'failed-crons': ['failedCrons'],
   crons: ['failedCrons'],
+  'health-check': ['health-check'],
+  heartbeat: ['health-check'],
+  'configured-monitor-health': ['health-check'],
 };
 
 const checkIds = aliases[job] || [job];

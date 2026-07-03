@@ -18,8 +18,12 @@ let selectedTaskNeedsUser = false;
 let selectedTaskNeedsUserReason;
 let selectedTaskProgress;
 let selectedTaskLastInput;
+const selectedTaskStartedAt = new Date(Date.now() - 60_000).toISOString();
+const daemonTasks = [];
 
 await writeFile(sessionFile, '');
+await writeFile(piLog, '');
+await writeFile(requestLog, '');
 await writeFile(fakePi, `#!/usr/bin/env node\nimport { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(piLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`, { mode: 0o755 });
 
 const server = net.createServer((socket) => {
@@ -32,33 +36,59 @@ const server = net.createServer((socket) => {
     const request = JSON.parse(line);
     await appendFile(requestLog, JSON.stringify(request) + '\n');
     if (request.type === 'list_tasks') {
-      socket.end(JSON.stringify({ ok: true, tasks: [{
-        id: 'task-selected',
-        name: 'selected task',
-        sessionName: 'selected task',
-        status: selectedTaskStatus,
-        needsUser: selectedTaskNeedsUser,
-        needsUserReason: selectedTaskNeedsUserReason,
-        progress: selectedTaskProgress,
-        lastInput: selectedTaskLastInput,
-        cwd: root,
-        sessionFile,
-        actualSessionFile: sessionFile,
-        startedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      }] }) + '\n');
+      socket.end(JSON.stringify({ ok: true, tasks: [
+        ...daemonTasks,
+        {
+          id: 'task-selected',
+          name: 'selected task',
+          sessionName: 'selected task',
+          status: selectedTaskStatus,
+          needsUser: selectedTaskNeedsUser,
+          needsUserReason: selectedTaskNeedsUserReason,
+          progress: selectedTaskProgress,
+          lastInput: selectedTaskLastInput,
+          cwd: root,
+          sessionFile,
+          actualSessionFile: sessionFile,
+          startedAt: selectedTaskStartedAt,
+          updatedAt: selectedTaskStartedAt,
+        },
+      ] }) + '\n');
       return;
     }
     if (request.type === 'run_worker') {
-      socket.end(JSON.stringify({ ok: true, text: 'Started background task', taskId: 'task-new', sessionFile, sessionName: request.name || 'new task' }) + '\n');
+      const id = `task-new-${daemonTasks.length + 1}`;
+      const taskSessionFile = join(root, `${id}.jsonl`);
+      daemonTasks.unshift({
+        id,
+        name: request.name || 'new task',
+        sessionName: request.name || 'new task',
+        status: 'running',
+        progress: request.message,
+        lastInput: request.lastInput || request.message,
+        cwd: root,
+        sessionFile: taskSessionFile,
+        actualSessionFile: taskSessionFile,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      socket.end(JSON.stringify({ ok: true, text: 'Started background task', taskId: id, sessionFile: taskSessionFile, sessionName: request.name || 'new task' }) + '\n');
       return;
     }
     if (request.type === 'continue_worker') {
-      selectedTaskStatus = 'running';
-      selectedTaskNeedsUser = false;
-      selectedTaskNeedsUserReason = undefined;
-      selectedTaskProgress = request.message;
-      selectedTaskLastInput = request.message;
+      const daemonTask = daemonTasks.find((task) => task.id === request.taskId || task.sessionName === request.taskId || task.name === request.taskId || task.sessionFile === request.taskId);
+      if (daemonTask) {
+        daemonTask.status = 'running';
+        daemonTask.progress = request.message;
+        daemonTask.lastInput = request.message;
+        daemonTask.updatedAt = new Date().toISOString();
+      } else {
+        selectedTaskStatus = 'running';
+        selectedTaskNeedsUser = false;
+        selectedTaskNeedsUserReason = undefined;
+        selectedTaskProgress = request.message;
+        selectedTaskLastInput = request.message;
+      }
       socket.end(JSON.stringify({ ok: true, text: 'Sent follow-up to background task' }) + '\n');
       return;
     }
@@ -112,7 +142,7 @@ await new Promise((resolve, reject) => {
 function runAgentsAndSend(input, done) {
   const steps = Array.isArray(input) ? input : [{ input }];
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['dist/src/cli.js', 'agents'], {
+    const child = spawn('node_modules/.bin/tsx', ['src/cli.ts', 'agents'], {
       cwd: new URL('..', import.meta.url).pathname,
       env: { ...process.env, MI_SOCKET_PATH: socketPath, PI_CMD: fakePi, TERM: 'xterm-256color' },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -127,7 +157,7 @@ function runAgentsAndSend(input, done) {
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), 500);
       reject(new Error(`mi agents timed out. stdout=${stdout.slice(-1000)} stderr=${stderr.slice(-1000)}`));
-    }, 8000);
+    }, 30000);
     const startedAt = Date.now();
     const doneTimer = setInterval(async () => {
       try {
@@ -142,7 +172,7 @@ function runAgentsAndSend(input, done) {
     child.on('exit', (code, signal) => {
       clearInterval(doneTimer);
       clearTimeout(killTimer);
-      if (code === 0 || signal === 'SIGTERM') resolve({ stdout, stderr });
+      if (code === 0 || code === 143 || signal === 'SIGTERM') resolve({ stdout, stderr });
       else reject(new Error(`mi agents exited ${code}/${signal}. stdout=${stdout.slice(-1000)} stderr=${stderr.slice(-1000)}`));
     });
     let stepIndex = 0;
@@ -175,7 +205,7 @@ function runAgentsAndSend(input, done) {
 
 // Typing a plain reply to the selected task should send it to the worker, then Esc should stop it into needs input.
 const typedReplyDone = async () => false;
-typedReplyDone.afterMs = 6000;
+typedReplyDone.afterMs = 12000;
 const typedReplyRun = await runAgentsAndSend([
   { input: 'please continue selected task\n' },
   { waitFor: 'selected task', input: '\x1b\x1b' },
@@ -187,7 +217,10 @@ assert.match(typedReplyPlain, /paused/, 'Esc after typed reply should render tas
 assert.match(typedReplyPlain, /stopped by Escape; needs User input/, 'Esc after typed reply should render needs-input reason');
 
 // /resume is a mi agents command: it opens a session picker, then Enter adds the selected pi session as a task without opening pi.
-await runAgentsAndSend('/resume\n\r', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('resume_session'));
+await runAgentsAndSend([
+  { input: '/resume\r' },
+  { waitFor: 'Enter add selected', input: '\n' },
+], async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('resume_session'));
 let piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
 assert.equal(piCalls.length, 0, '/resume should not spawn pi');
 requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
@@ -195,17 +228,58 @@ assert.ok(requests.some((request) => request.type === 'list_pi_sessions'), '/res
 assert.ok(requests.some((request) => request.type === 'resume_session' && ['pi-session-old', 'pi-session-two'].includes(request.id)), 'CR Enter should add the selected pi session as a task, not enter multi-select');
 
 // Other pi slash commands should be delegated to real pi with the selected session.
-await runAgentsAndSend('/model\n', async () => (await readFile(piLog, 'utf8').catch(() => '')).includes('/model'));
+await runAgentsAndSend('/session\r', async () => (await readFile(piLog, 'utf8').catch(() => '')).includes('/session'));
 piCalls = (await readFile(piLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-assert.deepEqual(piCalls.at(-1), ['--session', sessionFile, '/model']);
+assert.deepEqual(piCalls.at(-1), ['--session', sessionFile, '/session']);
 
 // /new is intentionally a mi agents command and must not be delegated to pi.
 await writeFile(piLog, '');
-await runAgentsAndSend('/new verify background task\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('run_worker'));
+await runAgentsAndSend('/new verify background task\r', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('run_worker'));
 piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
 assert.equal(piCalls.length, 0, '/new should not spawn pi');
 requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 assert.ok(requests.some((request) => request.type === 'run_worker' && request.message === 'verify background task'), '/new should create a Mi background task');
+
+// /plan is a full Mi agents workflow command: start a plan worker, send refinements to the same worker, and forward the go trigger without opening pi.
+await writeFile(piLog, '');
+await writeFile(requestLog, '');
+await runAgentsAndSend('/plan design safe change\r', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('"message":"/plan design safe change"'));
+piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
+assert.equal(piCalls.length, 0, '/plan should not spawn pi from mi agents');
+requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const planStart = requests.find((request) => request.type === 'run_worker' && request.message === '/plan design safe change');
+assert.ok(planStart, '/plan should create a Mi background task');
+assert.equal(planStart.background, true, '/plan should run as a background worker');
+assert.equal(planStart.lastInput, '/plan design safe change', '/plan task should preserve the slash command as last input');
+const planTask = daemonTasks.find((task) => task.lastInput === '/plan design safe change');
+assert.ok(planTask, '/plan task should appear in the Mi agents task list');
+
+await writeFile(piLog, '');
+await writeFile(requestLog, '');
+await runAgentsAndSend('what tests should cover this?\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('what tests should cover this?'));
+requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+assert.ok(requests.some((request) => request.type === 'continue_worker' && request.message === 'what tests should cover this?' && request.taskId === planTask.id), '/plan refinements should be sent to the plan worker');
+
+await writeFile(piLog, '');
+await writeFile(requestLog, '');
+await runAgentsAndSend('go implement that plan\n', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('go implement that plan'));
+piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
+assert.equal(piCalls.length, 0, '/plan go trigger should be forwarded to the worker, not opened in pi');
+requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+assert.ok(requests.some((request) => request.type === 'continue_worker' && request.message === 'go implement that plan' && request.taskId === planTask.id), '/plan go trigger should continue the same plan worker so the pi /plan extension can exit plan mode');
+
+// /mi is a Mi-side question about the selected task and should go to Mi main, not pi.
+await writeFile(piLog, '');
+await runAgentsAndSend('/mi what is selected doing?\r', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('"type":"prompt"'));
+piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
+assert.equal(piCalls.length, 0, '/mi should not spawn pi');
+requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+assert.ok(requests.some((request) => request.type === 'prompt' && /selected background task/i.test(request.message || '')), '/mi should ask Mi main about the selected task');
+
+// /goal is intentionally not intercepted as a local mi-agents slash command; it is sent to the worker as a normal follow-up.
+await runAgentsAndSend('/goal finish the selected work\r', async () => (await readFile(requestLog, 'utf8').catch(() => '')).includes('/goal finish the selected work'));
+requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+assert.ok(requests.some((request) => request.type === 'continue_worker' && request.message === '/goal finish the selected work'), '/goal should be forwarded to the selected worker');
 
 server.close();
 await rm(root, { recursive: true, force: true });
