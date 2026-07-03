@@ -198,16 +198,23 @@ async function repair(anomalies: ImessageAnomaly[], deps: Required<Pick<MonitorD
   return repairs;
 }
 
+function listNaturally(items: string[]) {
+  if (items.length <= 1) return items[0] || '';
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
 function successText(anomalies: ImessageAnomaly[], repairs: ImessageMonitorResult['repairs']) {
-  const services = repairs.filter((item) => item.ok).map((item) => item.service.replace(/\.service$/, '')).join(', ') || 'the iMessage bridge';
-  const problem = anomalies.some((item) => item.code === 'service-inactive') ? 'it had stopped responding' : 'it looked unhealthy';
-  return `I noticed the iMessage bridge ${problem}, restarted ${services}, and it looks healthy again now.`;
+  const services = listNaturally(repairs.filter((item) => item.ok).map((item) => item.service.replace(/\.service$/, ''))) || 'the iMessage bridge';
+  const problem = anomalies.some((item) => item.code === 'service-inactive') ? 'had stopped responding' : 'looked unhealthy';
+  return `The iMessage bridge ${problem}, so I restarted ${services}. It looks healthy again now.`;
 }
 
 function failureText(anomalies: ImessageAnomaly[], repairs: ImessageMonitorResult['repairs']) {
-  const problems = anomalies.map((item) => `${item.code}: ${item.detail}`).slice(0, 4).join('; ');
-  const repairSummary = repairs.map((item) => `${item.service} ${item.ok ? 'ok' : 'failed'}`).join(', ') || 'no repair attempted';
-  return safeNotificationText(`I could not repair the iMessage bridge automatically. Problems: ${problems}. Repairs: ${repairSummary}.`);
+  const problems = anomalies.slice(0, 4).map((item) => item.detail || item.code).join('; ');
+  const tried = repairs.length > 0
+    ? `I tried restarting ${listNaturally(repairs.map((item) => `${item.service.replace(/\.service$/, '')} (${item.ok ? 'ok' : 'failed'})`))}.`
+    : 'I did not attempt a restart.';
+  return safeNotificationText(`I could not repair the iMessage bridge on my own, so it needs your attention. What I saw: ${problems}. ${tried}`);
 }
 
 export async function runImessageMonitor(deps: MonitorDeps = {}): Promise<ImessageMonitorResult> {
