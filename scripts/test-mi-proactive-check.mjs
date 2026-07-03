@@ -50,6 +50,10 @@ assert.match(readme, /## `mi check`[\s\S]*read state → run checks → dedupe �
 assert.match(readme, /Dynamic project questions are the exception:[\s\S]*do not add a footer/, 'README documents question footer suppression');
 assert.match(monitorRegistry, /\| tactics:detect \| Tactics Journal detect health \| health_sidecar \| \/home\/kyle\/code\/research\/\.logs\/detect-latest-health\.json \| 30h \|/, 'monitor registry declares the real Tactics Journal detect sidecar');
 assert.match(monitorRegistry, /\| mi-crons:configured \| Mi reminder crons \| mi_crons \| state\/crons\.json \| n\/a \|/, 'monitor registry declares Mi cron health');
+assert.match(monitorRegistry, /\| tactics:report-pr-queue-worker \| [^|]+ \| health_sidecar \| \/home\/kyle\/code\/research\/\.logs\/report-pr-queue-worker-latest-health\.json \| 30h \|/, 'monitor registry tracks the renamed report PR queue worker sidecar');
+assert.doesNotMatch(monitorRegistry, /\| tactics:report-worker \||\| tactics:tune \||\| tactics:storage-prune \|/, 'monitors without a live sidecar producer are removed from the registry');
+assert.match(proactive, /\$\{item\.id\}:\$\{item\.status\}:\$\{item\.reason\}/, 'monitor health dedupe key uses stable identity');
+assert.doesNotMatch(proactive, /dedupeKey: `monitorHealth:[^\n]*item\.detail/, 'monitor health dedupe key excludes volatile detail text');
 
 const root = await mkdtemp(join(tmpdir(), 'mi-proactive-'));
 try {
@@ -102,7 +106,9 @@ try {
     const second = await runMiCheck({ checkIds: ['health-check'], dryRun: true });
     await writeFile(join(process.env.MI_TACTICS_HEALTH_DIR, 'detect-latest-health.json'), JSON.stringify({ checked_at: new Date().toISOString(), step: 'detect', status: 'ok', reason: 'ok' }));
     const recovered = await runMiCheck({ checkIds: ['health-check'], dryRun: true });
-    console.log(JSON.stringify({ first, second, recovered, state: JSON.parse(await readFile(join(stateDir, 'monitor-health.json'), 'utf8')) }));
+    await writeFile(join(process.env.MI_TACTICS_HEALTH_DIR, 'detect-latest-health.json'), JSON.stringify({ checked_at: new Date(Date.now() + 60_000).toISOString(), step: 'detect', status: 'ok', reason: 'ok' }));
+    const refreshed = await runMiCheck({ checkIds: ['health-check'], dryRun: true });
+    console.log(JSON.stringify({ first, second, recovered, refreshed, state: JSON.parse(await readFile(join(stateDir, 'monitor-health.json'), 'utf8')) }));
   `);
   const tsx = new URL('../node_modules/.bin/tsx', import.meta.url).pathname;
   const result = spawnSync(process.execPath, [tsx, runner], {
@@ -111,13 +117,14 @@ try {
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  const { first, second, recovered } = JSON.parse(result.stdout.trim());
+  const { first, second, recovered, refreshed } = JSON.parse(result.stdout.trim());
   assert.equal(first.notices.length, 1, 'stale configured monitor transition creates one notice');
   assert.match(first.message, /Starting safe read-only triage now\./, 'repairable stale monitor starts live safe read-only triage');
   assert.equal(first.notices[0].notice.repairName, 'repair-tactics-detect', 'repair worker name is scoped to the configured monitor');
   assert.equal(second.notices.length, 0, 'unchanged stale monitor is suppressed');
   assert.equal(recovered.notices.length, 1, 'recovered monitor reports once');
   assert.match(recovered.message, /healthy again/, 'recovery message is conversational');
+  assert.equal(refreshed.notices.length, 0, 'healthy monitor with a fresh checked_at timestamp does not re-notify as recovered');
 } finally {
   await rm(monitorRoot, { recursive: true, force: true });
 }

@@ -9,6 +9,9 @@ import { tmpdir } from 'node:os';
 
 const repoRoot = new URL('..', import.meta.url).pathname;
 
+const bridgeSource = await readFile(join(repoRoot, 'scripts', 'mi-photon-bridge.mjs'), 'utf8');
+assert.match(bridgeSource, /await sendToUser\(target, message, 'notification'\)/, 'notify endpoint sends the message body without a title heading');
+
 async function readJsonl(path) {
   if (!existsSync(path)) return [];
   const text = await readFile(path, 'utf8');

@@ -501,7 +501,7 @@ type MonitorHealthState = {
 
 const tacticsJournalRoot = process.env.MI_TACTICS_JOURNAL_ROOT || '/home/kyle/code/research';
 const tacticsHealthDir = process.env.MI_TACTICS_HEALTH_DIR || join(tacticsJournalRoot, '.logs');
-const tacticsHealthSteps = (process.env.MI_TACTICS_HEALTH_STEPS || 'ingest,detect,report,report-worker,tune,storage-prune')
+const tacticsHealthSteps = (process.env.MI_TACTICS_HEALTH_STEPS || 'ingest,detect,report,report-pr-queue-worker')
   .split(',')
   .map((step) => step.trim())
   .filter(Boolean);
@@ -532,11 +532,11 @@ async function writeMonitorHealthState(state: MonitorHealthState) {
 
 function transitionFor(previous: MonitorRecord | undefined, current: MonitorObservation) {
   if (!previous?.status) return 'seed' as const;
-  if (previous.status === current.status && previous.reason === current.reason && previous.detail === current.detail) return 'unchanged' as const;
+  // detail carries volatile text (checked_at timestamps); only status/reason changes are real transitions
+  if (previous.status === current.status && previous.reason === current.reason) return 'unchanged' as const;
   if (previous.status !== 'ok' && current.status === 'ok') return 'recovered' as const;
   if (previous.status === 'ok' && current.status !== 'ok') return 'broken' as const;
-  if (previous.status !== current.status) return 'changed' as const;
-  return 'changed-detail' as const;
+  return 'changed' as const;
 }
 
 function monitorLine(observation: MonitorObservation) {
@@ -775,7 +775,7 @@ export async function configuredMonitorHealth(): Promise<null | ProactiveNotice>
   return {
     message: lines.join('\n'),
     notify: true,
-    dedupeKey: `monitorHealth:${[...becameBroken, ...changedBroken, ...humanRequired, ...recovered].map((item) => `${item.id}:${item.status}:${item.reason}:${item.detail || ''}`).sort().join('|')}`,
+    dedupeKey: `monitorHealth:${[...becameBroken, ...changedBroken, ...humanRequired, ...recovered].map((item) => `${item.id}:${item.status}:${item.reason}`).sort().join('|')}`,
     repairName: firstRepairable ? `repair-${firstRepairable.id.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}` : undefined,
     repairPrompt: firstRepairable ? makeMonitorRepairPrompt(firstRepairable) : undefined,
   };
