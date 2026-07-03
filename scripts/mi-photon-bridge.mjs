@@ -360,11 +360,11 @@ function startNotifyServer() {
       if (!localOnly(req)) return sendJson(res, 403, { ok: false, error: 'local only' });
       if (notifyToken && req.headers.authorization !== `Bearer ${notifyToken}`) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
       const payload = await readRequestJson(req);
-      const title = String(payload.title || 'Mi');
       const message = String(payload.message || '').trim();
       const target = String(payload.to || allowedUsers[0] || '').trim();
       if (!message) return sendJson(res, 400, { ok: false, error: 'message required' });
-      await sendToUser(target, `${title}\n\n${message}`, 'notification');
+      // payload.title is metadata for push channels; iMessage shows only the message body
+      await sendToUser(target, message, 'notification');
       return sendJson(res, 200, { ok: true });
     } catch (error) {
       console.error('photon notify failed:', error?.message || String(error));
