@@ -3,8 +3,8 @@ import net from "node:net";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { appendFile, chmod, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 const HOME = homedir();
@@ -30,6 +30,7 @@ const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_
 const MI_DAEMON_IDLE_EXIT_MS = Number(process.env.MI_DAEMON_IDLE_EXIT_MS || 60000);
 const MI_TASK_DISCOVERY_DELAY_MS = Number(process.env.MI_TASK_DISCOVERY_DELAY_MS || 1500);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
+const MI_WORKFLOWS_DIR = resolve(process.env.MI_WORKFLOWS_DIR || join(HOME, "workflows"));
 const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const THREAD_INDEX_PATH = join(THREADS_DIR, "index.json");
@@ -37,6 +38,51 @@ const NICE_BIN = process.env.MI_NICE_BIN || "/usr/bin/nice";
 const IONICE_BIN = process.env.MI_IONICE_BIN || "/usr/bin/ionice";
 const MI_WORKER_NICE = Number(process.env.MI_WORKER_NICE || 10);
 const MI_WORKER_IONICE_CLASS = String(process.env.MI_WORKER_IONICE_CLASS || "3");
+const MI_CAPABILITY_GUARD = process.env.MI_CAPABILITY_GUARD || join(MI_ROOT, "pi", "extensions", "mi-capability-guard.ts");
+const MI_CAPABILITY_GRANT_TTL_MS = Number(process.env.MI_CAPABILITY_GRANT_TTL_MS || 6 * 60 * 60_000);
+const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "HOSTNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR", "TMP", "TEMP", "PI_PROVIDER", "PI_MODEL", "PI_CONFIG_DIR", "PI_GATEWAY_URL", "AGENT_GATEWAY_URL"];
+
+function reducedPiEnv(extra = {}) {
+  const env = {};
+  for (const key of SAFE_PI_ENV_KEYS) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return { ...env, ...extra };
+}
+
+function cwdInsideWorkflows(cwd = HOME) {
+  const absolute = resolve(cwd);
+  return absolute === MI_WORKFLOWS_DIR || absolute.startsWith(`${MI_WORKFLOWS_DIR}/`);
+}
+
+function workerCapabilityProfile(request = {}, cwd = HOME, task = undefined) {
+  const requested = request.capabilityProfile || request.capability_profile || task?.capabilityProfile;
+  if (requested === "worker-write-scoped") {
+    if (!cwdInsideWorkflows(cwd)) throw new Error("worker-write-scoped is only allowed under ~/workflows");
+    return "worker-write-scoped";
+  }
+  return "worker-read";
+}
+
+function writeWorkerCapabilityGrantsFile(cwd = HOME, profile = "worker-read") {
+  const dir = join(RUNTIME_DIR, "capabilities");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { chmodSync(dir, 0o700); } catch {}
+  const file = join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
+  const createdAt = new Date().toISOString();
+  const grant = {
+    id: `${profile}-${Date.now().toString(36)}`,
+    resource: `file://${resolve(cwd)}`,
+    rights: profile === "worker-write-scoped" ? ["read", "write"] : ["read"],
+    constraints: { recursive: true, profile, scope: profile === "worker-write-scoped" ? "workflows-only" : undefined },
+    principal: { id: "mi-worker", type: "worker", displayName: "Mi worker" },
+    createdAt,
+    expiresAt: new Date(Date.parse(createdAt) + MI_CAPABILITY_GRANT_TTL_MS).toISOString(),
+  };
+  writeFileSync(file, JSON.stringify({ profile, grants: [grant] }, null, 2), { mode: 0o600 });
+  try { chmodSync(file, 0o600); } catch {}
+  return file;
+}
 
 let piProc;
 let daemonLockHandle;
@@ -381,7 +427,10 @@ async function readPiSessionTask(file, stats, options = {}) {
     } else if (record.type === "message" && record.message?.role === "assistant") {
       const text = textFromMessage(record.message);
       busy = assistantMessageIsBusy(record.message) || !text;
-      if (text) lastAssistant = text.slice(0, 500);
+      // Preserve the complete final assistant response for mi agents full-output mode.
+      // Row/detail summaries are truncated separately by the UI; truncating here
+      // permanently loses output for discovered pi sessions.
+      if (text) lastAssistant = text;
     }
   }
   const sessionTitle = sessionName && !isGenericTaskName(normalizedNameText(sessionName)) ? sessionName : "";
@@ -1189,13 +1238,18 @@ function rpcLaunchCommand(args, env = {}) {
 }
 
 function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODEL, env = {} } = {}) {
-  const args = ["--mode", "rpc", "--model", model];
+  const profile = env.MI_CAPABILITY_PROFILE || (env.MI_WORKER === "1" ? "worker-read" : "mi-main-orchestrator");
+  const grantsFile = env.MI_CAPABILITY_GRANTS_FILE || writeWorkerCapabilityGrantsFile(cwd, profile);
+  const auditFile = env.MI_CAPABILITY_AUDIT_FILE || join(RUNTIME_DIR, "capability-audit.jsonl");
+  const tools = env.MI_CAPABILITY_TOOLS || env.MI_WORKER_TOOLS || (profile === "worker-write-scoped" ? "read,grep,find,ls,write,edit" : "read,grep,find,ls");
+  const args = ["--mode", "rpc", "--model", model, "--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--tools", tools];
+  if (existsSync(MI_CAPABILITY_GUARD)) args.push("--extension", MI_CAPABILITY_GUARD);
   if (sessionDir) args.splice(2, 0, "--session-dir", sessionDir);
   if (sessionFile) args.splice(2, 0, "--session", sessionFile);
   const launch = rpcLaunchCommand(args, env);
   const proc = spawn(launch.command, launch.args, {
     cwd,
-    env: { ...process.env, ...env },
+    env: reducedPiEnv({ ...env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   let rpcBuffer = "";
@@ -1359,7 +1413,8 @@ async function resumeTaskAfterWorkerError({ task, before, sessionFile, name, kin
     autoContinueAttempts: attempts + 1,
     transportRetries: undefined,
   });
-  const retryWorker = createRpcProcess({ cwd: retryTask.cwd || HOME, sessionFile: resumeSessionFile, model: workerModelSpec(retryTask), env: { MI_WORKER: "1" } });
+  const retryProfile = workerCapabilityProfile({}, retryTask.cwd || HOME, retryTask);
+  const retryWorker = createRpcProcess({ cwd: retryTask.cwd || HOME, sessionFile: resumeSessionFile, model: workerModelSpec(retryTask), env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: retryProfile } });
   trackActiveWorker(retryTask, name, retryWorker);
   void (async () => {
     const retryBefore = await retryWorker.rpc({ type: "get_state" }).catch(() => before || {});
@@ -1431,6 +1486,7 @@ async function runWorker(request) {
   const cwd = String(request.cwd || HOME).trim();
   const model = String(request.model || MI_MODEL).trim();
   const sessionDir = request.sessionDir ? String(request.sessionDir).trim() : undefined;
+  const capabilityProfile = workerCapabilityProfile(request, cwd);
   const startKey = logicalTaskStartKey({ name, cwd, message: taskInput });
   if (startingWorkerKeys.has(startKey)) {
     await log(`duplicate_worker_start_suppressed ${name}`);
@@ -1447,8 +1503,8 @@ async function runWorker(request) {
       await log(`duplicate_worker_suppressed ${name} existing=${duplicate.id || duplicate.sessionName || duplicate.sessionFile || "unknown"}`);
       return { text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
     }
-    log(`starting worker ${name} cwd=${cwd} model=${model}`);
-    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1" } });
+    log(`starting worker ${name} cwd=${cwd} model=${model} capabilityProfile=${capabilityProfile}`);
+    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: capabilityProfile } });
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     task = request.background
       ? await upsertTask({
@@ -1461,6 +1517,7 @@ async function runWorker(request) {
         sessionName: name,
         model,
         modelSpec: model,
+        capabilityProfile,
         lastInput: taskInput,
       })
       : undefined;
@@ -1482,6 +1539,7 @@ async function runWorker(request) {
       sessionName: before.sessionName || name,
       model: before.model,
       modelSpec: model,
+      capabilityProfile,
       lastInput: taskInput,
     });
     installTaskHeartbeat(worker, task);
@@ -1574,7 +1632,8 @@ async function runIncrementalWorkflowCommandInHeadlessBridge(task, message, mode
   if (!sessionFile || !isSlashCommand(message)) return false;
   // MI_HEADLESS_BRIDGE suppresses pi_session_event publishing from this
   // throwaway process so it cannot clobber the preserved task state.
-  const worker = createRpcProcess({ cwd: task.cwd || HOME, sessionFile, model: String(model || MI_MODEL).trim(), env: { MI_WORKER: "1", MI_HEADLESS_BRIDGE: "1" } });
+  const profile = workerCapabilityProfile({}, task.cwd || HOME, task);
+  const worker = createRpcProcess({ cwd: task.cwd || HOME, sessionFile, model: String(model || MI_MODEL).trim(), env: { MI_WORKER: "1", MI_HEADLESS_BRIDGE: "1", MI_CAPABILITY_PROFILE: profile } });
   try {
     await worker.rpc({ type: "prompt", message });
     return true;
@@ -1671,8 +1730,9 @@ async function continueWorker(request) {
   if (!sessionFile) throw new Error(`Task has no session file: ${taskId}`);
   const cwd = task.cwd || HOME;
   const model = String(request.model || MI_MODEL).trim();
-  const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1" } });
-  const updated = await upsertTask({ ...clearPreservedTaskState(task), status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", modelSpec: model, lastInput: taskInput });
+  const capabilityProfile = workerCapabilityProfile(request, cwd, task);
+  const worker = createRpcProcess({ cwd, sessionFile, model, env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: capabilityProfile } });
+  const updated = await upsertTask({ ...clearPreservedTaskState(task), status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined, text: undefined, error: undefined, continuedAt: new Date().toISOString(), progress: "follow-up queued", modelSpec: model, capabilityProfile, lastInput: taskInput });
   if (request.background) {
     trackActiveWorker(updated, name, worker);
     void (async () => {

@@ -18,8 +18,14 @@ import { checkAssistant, runAssistant } from './runner.js';
 import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
 import { runMiCheck } from './proactive.js';
+import { generateProjectsStatus } from './project-status.js';
+import { readDelegations } from './delegations.js';
+import { acceptProposal, readProposalQueue, queuedProposals, resolveProposal } from './proposals.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
-import { readRecentEvents, logEvent } from './state.js';
+import { runMiTick } from './tick.js';
+import { handleLoopDiscoverySelection, runLoopDiscovery } from './loop-discovery.js';
+import { decideLoopFactoryImplementation, handleLoopFactoryReply, loopFactoryStatus, runLoopFactoryCapture, runLoopFactoryDigest } from './loop-factory.js';
+import { approveAsCapability, readApprovals, resolveApproval, readRecentEvents, logEvent } from './state.js';
 import { redactSecrets } from './redact.js';
 import { appendThreadMessage, compactThread, createTempThread, getThread, listThreads, markThreadRead, readThreadMessages, threadContext, } from './threads.js';
 initTheme(process.env.PI_THEME, false);
@@ -65,10 +71,28 @@ Usage:
   mi compact [thread]             Compact old read messages in a thread
   mi agents                       Open mi agents live background agent view
   mi check                        Run one proactive Mi check-in
-  mi cron list                    List Mi cron jobs
+  mi check health-check           Check configured monitors and repair only stale/degraded ones
+  mi check question               Ask one dynamic project or goal question
+  mi tick                         Run due reminders, monitor health, daily brief, questions, weekly loop discovery, and Loop Factory
+  mi project-status               Regenerate ~/pi-docs/projects-status.md
+  mi status                       One-screen Mi services, monitors, budgets, and pending decisions
+  mi approvals [approve|reject <id>] List or resolve pending approvals
+  mi proposals [accept|reject <n>] List or resolve queued proposals
+  mi delegations                  Show active standing delegations
+  mi loop-discovery [--force] [--dry-run] [--notify] [--select <value>]
+                                  Mine Pi sessions for recurring workflow candidates
+  mi loop-factory capture <text>  Capture a user-noticed recurring loop
+  mi loop-factory reply <text>    Reply to the active Loop Factory grilling session; r accepts the recommendation
+  mi loop-factory digest [--notify] [--force]
+                                  Run the Loop Factory digest/build-ready scan
+  mi loop-factory decide <queue now|later|never> [candidate]
+                                  Decide whether to queue a build-ready spec for implementation
+  mi loop-factory status          Show Loop Factory candidate counts
+  mi cron list                    List Mi reminder crons
   mi cron check                   Run due Mi cron jobs now
   mi cron remove <name>           Remove a Mi cron job
-  mi cron add <name> (--every <1h>|--at <iso>) [--cwd <path>] -- <command>
+  mi cron add <name> (--every <1h>|--at <iso>) --message <text>
+  mi cron add <name> (--every <1h>|--at <iso>) [--cwd <path>] -- <command>  (legacy/deprecated)
   mi task <name> [--cwd <path>] -- <task prompt>
   mi task reply <task-id-or-name> -- <follow-up prompt>
   mi task list                    List background agent tasks
@@ -148,6 +172,188 @@ async function proactiveCheckCommand(args) {
     console.log(result.message);
     if (result.skipped.length > 0 && result.notices.length === 0)
         console.log(`Skipped ${result.skipped.length} duplicate notice(s).`);
+}
+async function tickCommand() {
+    const result = await runMiTick();
+    for (const item of result.reminders)
+        console.log(`reminder ${item.name}: ${item.status}`);
+    console.log(result.health.message);
+    if (result.dailyBrief)
+        console.log(result.dailyBrief.message);
+    else if (result.skippedDailyBrief)
+        console.log('Daily brief not due.');
+    if (result.weeklyReview?.message)
+        console.log(result.weeklyReview.message);
+    if (result.loopDiscovery && result.loopDiscovery.status !== 'skipped')
+        console.log(result.loopDiscovery.message);
+    if (result.loopFactory && result.loopFactory.status !== 'skipped')
+        console.log(result.loopFactory.message);
+}
+async function statusCommand() {
+    const approvals = (await readApprovals()).filter((approval) => approval.status === 'pending');
+    const proposals = queuedProposals(await readProposalQueue());
+    const health = await runMiCheck({ checkIds: ['health-check'] });
+    const delegations = await readDelegations();
+    console.log('Mi status');
+    console.log(`Monitors: ${health.notices.length === 0 ? 'ok' : `${health.notices.length} notice(s)`}`);
+    console.log(`Pending approvals: ${approvals.length}`);
+    console.log(`Queued proposals: ${proposals.length}`);
+    console.log(`Standing delegations: ${delegations.length}`);
+    if (approvals.length > 0)
+        approvals.slice(0, 5).forEach((approval, index) => console.log(`${index + 1}. approval ${approval.id}: ${approval.reason}`));
+    if (proposals.length > 0)
+        proposals.slice(0, 3).forEach((proposal, index) => console.log(`${index + 1}. proposal ${proposal.id}: ${proposal.title}`));
+}
+async function proposalsCommand(args) {
+    const subcommand = args[0] || 'list';
+    if (subcommand === 'list' || subcommand === 'queued') {
+        const proposals = queuedProposals(await readProposalQueue());
+        if (proposals.length === 0) {
+            console.log('No queued proposals.');
+            return;
+        }
+        proposals.forEach((proposal, index) => console.log(`${index + 1}. ${proposal.id} - ${proposal.title}: ${proposal.action}${proposal.detail ? ` (${proposal.detail})` : ''}`));
+        return;
+    }
+    if (subcommand === 'accept' || subcommand === 'start' || subcommand === 'yes') {
+        const selector = args[1];
+        if (!selector)
+            throw new Error('proposal number or id required');
+        const proposal = await acceptProposal(selector);
+        if (!proposal)
+            throw new Error(`proposal not found: ${selector}`);
+        await logEvent('proposal.accepted', { proposalId: proposal.id, action: proposal.action });
+        console.log(`Accepted ${proposal.id}. ${proposal.action}`);
+        return;
+    }
+    if (subcommand === 'reject' || subcommand === 'no') {
+        const selector = args[1];
+        if (!selector)
+            throw new Error('proposal number or id required');
+        const proposal = await resolveProposal(selector, 'rejected');
+        if (!proposal)
+            throw new Error(`proposal not found: ${selector}`);
+        await logEvent('proposal.rejected', { proposalId: proposal.id });
+        console.log(`Rejected ${proposal.id}.`);
+        return;
+    }
+    throw new Error(`unknown proposals command: ${subcommand}`);
+}
+async function delegationsCommand() {
+    const delegations = await readDelegations();
+    if (delegations.length === 0) {
+        console.log('No standing delegations configured.');
+        return;
+    }
+    for (const delegation of delegations)
+        console.log(`${delegation.id}\t${delegation.mode}\tbudget ${delegation.dailyBudget}/day\t${delegation.actionClass}\t${delegation.scope}`);
+}
+async function approvalsCommand(args) {
+    const subcommand = args[0] || 'list';
+    if (subcommand === 'list' || subcommand === 'pending') {
+        const pending = (await readApprovals()).filter((approval) => approval.status === 'pending');
+        if (pending.length === 0) {
+            console.log('No pending approvals.');
+            return;
+        }
+        pending.forEach((approval, index) => console.log(`${index + 1}. ${approval.id} - ${approval.reason}${approval.prompt ? ` (${approval.prompt})` : ''}`));
+        return;
+    }
+    if (subcommand === 'approve' || subcommand === 'yes') {
+        const id = args[1];
+        if (!id)
+            throw new Error('approval id required');
+        const grant = await approveAsCapability(id);
+        const approval = (await readApprovals()).find((item) => item.id === id || item.id.startsWith(id));
+        if (!approval)
+            throw new Error(`approval not found: ${id}`);
+        console.log(`Approved ${approval.id}${grant ? ` and minted capability ${grant.id}` : ''}.`);
+        return;
+    }
+    if (subcommand === 'reject' || subcommand === 'no') {
+        const id = args[1];
+        if (!id)
+            throw new Error('approval id required');
+        const approval = await resolveApproval(id, 'rejected', args.slice(2).join(' ').trim() || undefined);
+        if (!approval)
+            throw new Error(`approval not found: ${id}`);
+        console.log(`Rejected ${approval.id}.`);
+        return;
+    }
+    throw new Error(`unknown approvals command: ${subcommand}`);
+}
+async function projectStatusCommand(args) {
+    const outputPath = argValue(args, '--output');
+    const projectsPath = argValue(args, '--projects');
+    const plansReadmePath = argValue(args, '--plans');
+    const result = await generateProjectsStatus({ outputPath, projectsPath, plansReadmePath });
+    console.log(`Wrote ${result.outputPath} for ${result.projects} project(s).`);
+}
+async function loopDiscoveryCommand(args) {
+    const select = argValue(args, '--select');
+    if (select) {
+        const result = await handleLoopDiscoverySelection(select, { notify: args.includes('--notify') });
+        console.log(result.reply);
+        if (!result.started && result.matched)
+            process.exitCode = 1;
+        return;
+    }
+    const result = await runLoopDiscovery({
+        mode: 'manual',
+        force: args.includes('--force'),
+        dryRun: args.includes('--dry-run'),
+        notify: args.includes('--notify'),
+        draftAll: args.includes('--draft-all'),
+    });
+    console.log(result.message);
+    if (result.briefId)
+        console.log(`Brief: ${result.briefId}`);
+    if (result.spawned)
+        console.log(`Spawned ${result.spawned} grilling task(s).`);
+}
+async function loopFactoryCommand(args) {
+    const subcommand = args[0] || 'status';
+    if (subcommand === 'capture') {
+        const message = args.slice(1).join(' ').trim();
+        if (!message)
+            throw new Error('loop capture text required');
+        const result = await runLoopFactoryCapture(message, { source: 'manual', startGrilling: true, notify: args.includes('--notify') });
+        console.log(result.reply);
+        if (!result.ok)
+            process.exitCode = 1;
+        return;
+    }
+    if (subcommand === 'reply' || subcommand === 'answer') {
+        const message = args.slice(1).join(' ').trim();
+        if (!message)
+            throw new Error('reply text required; use r to accept the recommendation');
+        const result = await handleLoopFactoryReply(message, { source: 'cli' });
+        console.log(result.reply);
+        if (!result.ok)
+            process.exitCode = 1;
+        return;
+    }
+    if (subcommand === 'digest') {
+        const result = await runLoopFactoryDigest({ mode: 'manual', notify: args.includes('--notify'), force: args.includes('--force') });
+        console.log(result.message);
+        return;
+    }
+    if (subcommand === 'decide' || subcommand === 'decision') {
+        const decision = args.slice(1).join(' ').trim();
+        if (!decision)
+            throw new Error('decision required: queue now, later, or never');
+        const result = await decideLoopFactoryImplementation(decision);
+        console.log(result.reply);
+        if (!result.ok)
+            process.exitCode = 1;
+        return;
+    }
+    if (subcommand === 'status') {
+        const result = await loopFactoryStatus();
+        console.log(result.message);
+        return;
+    }
+    throw new Error(`unknown loop-factory command: ${subcommand}`);
 }
 async function logsCommand(args) {
     const name = args[0];
@@ -303,7 +509,7 @@ function taskSectionMovedMs(task) {
     const timestamp = section === 'needs input'
         ? task.notifiedNeedsUserAt || task.notifiedPausedAt || task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt
         : section === 'working'
-            ? task.continuedAt || task.startedAt || task.updatedAt || task.lastEventAt
+            ? task.continuedAt || task.updatedAt || task.lastEventAt || task.startedAt
             : task.finishedAt || task.updatedAt || task.lastEventAt || task.continuedAt || task.startedAt;
     return Date.parse(timestamp || '') || 0;
 }
@@ -319,9 +525,13 @@ function compactDuration(ms) {
         return `${hours}h`;
     return `${Math.floor(hours / 24)}d`;
 }
+function agentRenderNowMs() {
+    const fixed = process.env.MI_AGENT_RENDER_TEST_NOW;
+    return fixed ? Date.parse(fixed) || Number(fixed) || Date.now() : Date.now();
+}
 function taskTimeLabel(task) {
     const section = taskSection(task);
-    const now = Date.now();
+    const now = agentRenderNowMs();
     const timestamp = section === 'completed'
         ? Date.parse(task.finishedAt || task.updatedAt || task.lastEventAt || '')
         : section === 'needs input'
@@ -356,11 +566,19 @@ function taskRepo(task) {
     const parts = cwd.split('/').filter(Boolean);
     return parts.at(-1) || cwd;
 }
+function sanitizeVisibleAssistantText(text) {
+    return String(text || '')
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/^\s*(?:thinking|reasoning)\s*:\s*.*$/gmi, '')
+        .trim();
+}
 function isNonFinalAssistantText(text) {
-    return text.trim().toLowerCase() === 'queued goal continuation is no longer active.';
+    return sanitizeVisibleAssistantText(text).trim().toLowerCase() === 'queued goal continuation is no longer active.';
 }
 function taskDisplayText(task) {
-    return task.text && !isNonFinalAssistantText(task.text) ? task.text : '';
+    const text = sanitizeVisibleAssistantText(task.text || '');
+    return text && !isNonFinalAssistantText(text) ? text : '';
 }
 function isStoppedPiSessionWithoutFinal(task) {
     const isPiSession = task.source === 'pi-session' || String(task.id || '').startsWith('pi-session:') || Boolean(task.sessionFile);
@@ -403,14 +621,13 @@ function taskDetail(task) {
 function textFromSessionMessage(message) {
     const content = message?.content;
     if (typeof content === 'string')
-        return content.trim();
+        return sanitizeVisibleAssistantText(content);
     if (!Array.isArray(content))
         return '';
-    return content
-        .map((part) => typeof part === 'string' ? part : part?.type === 'text' ? part.text || '' : part?.type === 'thinking' ? `thinking: ${part.thinking || ''}` : part?.type === 'toolCall' ? `tool: ${part.name || 'unknown'} ${JSON.stringify(part.arguments || {})}` : '')
+    return sanitizeVisibleAssistantText(content
+        .map((part) => typeof part === 'string' ? part : part?.type === 'text' ? part.text || '' : part?.type === 'toolCall' ? `tool: ${part.name || 'unknown'} ${JSON.stringify(part.arguments || {})}` : '')
         .filter(Boolean)
-        .join('\n')
-        .trim();
+        .join('\n'));
 }
 function summarizeSessionTool(name, args, elapsedLabel = '') {
     const elapsed = elapsedLabel ? ` (${elapsedLabel})` : '';
@@ -502,7 +719,7 @@ function readSessionFinalOutput(sessionFile, options = {}) {
             const content = record.message?.content;
             if (Array.isArray(content) && content.some((part) => part?.type === 'toolCall'))
                 continue;
-            const text = textFromSessionMessage(record.message).replace(/^thinking:.*$/gmi, '').trim();
+            const text = sanitizeVisibleAssistantText(textFromSessionMessage(record.message));
             if (text && !isNonFinalAssistantText(text))
                 outputs.push(text);
         }
@@ -541,7 +758,7 @@ function readSessionFullTranscript(sessionFile) {
                 continue;
             const text = role === 'user'
                 ? normalizeLastInputText(textFromSessionMessage(record.message))
-                : textFromSessionMessage(record.message).replace(/^thinking:.*$/gmi, '').trim();
+                : sanitizeVisibleAssistantText(textFromSessionMessage(record.message));
             if (!text || isNonFinalAssistantText(text))
                 continue;
             items.push({ role, text });
@@ -800,6 +1017,12 @@ async function listTasks() {
     return (result.tasks || []).sort((a, b) => taskStartedMs(b) - taskStartedMs(a) || taskUpdatedMs(b) - taskUpdatedMs(a));
 }
 async function listResumeSessions() {
+    if (process.env.MI_AGENT_RENDER_TEST_RESUME_ERROR)
+        throw new Error(process.env.MI_AGENT_RENDER_TEST_RESUME_ERROR);
+    if (process.env.MI_AGENT_RENDER_TEST_RESUME_SESSIONS) {
+        const sessions = JSON.parse(readFileSync(process.env.MI_AGENT_RENDER_TEST_RESUME_SESSIONS, 'utf8'));
+        return sessions.sort((a, b) => taskUpdatedMs(b) - taskUpdatedMs(a) || taskStartedMs(b) - taskStartedMs(a));
+    }
     const result = await sendTaskSocketRequest({ type: 'list_pi_sessions' }, 10000);
     return (result.sessions || []).sort((a, b) => taskUpdatedMs(b) - taskUpdatedMs(a) || taskStartedMs(b) - taskStartedMs(a));
 }
@@ -1322,7 +1545,7 @@ async function miAgentsCommand() {
         return tasks
             .map((task, index) => ({ task, index }))
             .filter((item) => taskSection(item.task) === label)
-            .sort((a, b) => taskDisplayOrderValue(a.task) - taskDisplayOrderValue(b.task) || taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task));
+            .sort((a, b) => taskSectionMovedMs(b.task) - taskSectionMovedMs(a.task) || taskStartedMs(b.task) - taskStartedMs(a.task) || taskUpdatedMs(b.task) - taskUpdatedMs(a.task) || taskDisplayOrderValue(a.task) - taskDisplayOrderValue(b.task));
     }
     function navigationTaskIndexes() {
         return ['needs input', 'working', 'completed'].flatMap((label) => sectionTaskItems(label).map((item) => item.index));
@@ -2191,12 +2414,20 @@ async function miAgentsCommand() {
                 return '\x1b[6~';
             if (event === 'enter')
                 return '\n';
+            if (event === 'space')
+                return ' ';
             if (event === 'escape')
                 return '\x1b';
             if (event === 'ctrlL')
                 return '\x0c';
+            if (event === 'ctrlF')
+                return '\x06';
             if (event === 'ctrlC')
                 return '\x03';
+            if (event === 'ctrlM' || event === 'multiSelect')
+                return '\r';
+            if (event === 'shiftTab')
+                return '\x1b[Z';
             if (event.startsWith('text:'))
                 return event.slice('text:'.length);
             if (event.startsWith('paste:'))
@@ -2206,14 +2437,20 @@ async function miAgentsCommand() {
         snapshot('initial');
         for (const event of (process.env.MI_AGENT_RENDER_TEST_EVENTS || 'down,down,pageDown,pageUp,up,enter,escape').split(',').map((item) => item.trim()).filter(Boolean)) {
             if (event.startsWith('add:')) {
-                const name = event.slice('add:'.length).trim() || `render-added-${Date.now().toString(36)}`;
-                const ts = new Date().toISOString();
+                const addSpec = event.slice('add:'.length).trim();
+                const [rawName, rawTs] = addSpec.split('@');
+                const name = rawName || `render-added-${Date.now().toString(36)}`;
+                const ts = rawTs || process.env.MI_AGENT_RENDER_TEST_NOW || new Date().toISOString();
                 const task = { id: `render-test-${name}`, name, cwd: HOME, status: 'running', progress: `test-added ${name}`, startedAt: ts, updatedAt: ts };
                 const previousTasks = tasks;
                 tasks = dedupeTasksByStableKey([task, ...tasks]);
                 rememberTaskDisplayOrder(tasks, previousTasks);
                 selected = 0;
                 clampTaskSelection();
+            }
+            else if (event.startsWith('slash:')) {
+                setAgentInput(event.slice('slash:'.length));
+                await submitAgentInput();
             }
             else if (event.startsWith('reload:')) {
                 const previouslySelectedTask = selectedTask();
@@ -2663,7 +2900,7 @@ function renderPiLastOutputMessage(text, width) {
 function renderMiTranscriptItem(item, width) {
     return item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiAssistantMessage(item.text, width);
 }
-const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/compact', '/marker', '/end', '/resume', '/open', '/quit', '/mi'];
+const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/plan', '/compact', '/marker', '/end', '/resume', '/open', '/quit', '/mi'];
 const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/settings': 'Open settings menu',
     '/model': 'Select Mi model',
@@ -2682,6 +2919,7 @@ const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/login': 'Configure provider authentication',
     '/logout': 'Remove provider authentication',
     '/new': 'Start a new Mi background agent',
+    '/plan': 'Start a read-only planning background agent',
     '/compact': 'Manually compact the session context',
     '/marker': 'Set the incremental-workflow marker in the selected task session',
     '/end': 'Summarize the increment since the marker and advance it',
@@ -2768,7 +3006,7 @@ async function getModelAutocompleteItems(argumentPrefix) {
     }));
 }
 const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/resume', '/open', '/model', '/scoped-models']);
-const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect']);
+const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect', '/plan']);
 const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set(['/marker', '/end']);
 const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
 function slashCommandName(value) {
@@ -2843,7 +3081,7 @@ function isCtrlFShortcut(data) {
     // Match Ctrl+F across encodings like isCtrlMShortcut: raw \x06, kitty
     // CSI-u (\x1b[102;5u), and modifyOtherKeys (\x1b[27;5;102~). Terminals in
     // those modes never send the raw byte, which made ^F appear to do nothing.
-    return data === '\x06' || data.includes('\x06') || matchesKey(data, 'ctrl+f') || /\x1b\[102;5(?::\d+)?u|\x1b\[27;5;102~/.test(data);
+    return data === '\x06' || data.includes('\x06') || data === '\x0c' || matchesKey(data, 'ctrl+f') || matchesKey(data, 'ctrl+l') || /\x1b\[102;5(?::\d+)?u|\x1b\[27;5;102~/.test(data);
 }
 function isCtrlMShortcut(data) {
     // iOS Termius sends Ctrl-M as raw CR. That is indistinguishable from a
@@ -3217,6 +3455,11 @@ async function miTuiCommand(initial = '') {
             fgDim(truncateText('  Esc to cancel and edit', width)),
         ];
     }
+    function miSurfaceMode(surface) {
+        if (surface === 'main-tui' || surface === 'imessage')
+            return 'converse';
+        return 'delegate';
+    }
     function normalizedMiMessageText(text) {
         return String(text || '').trim().toLowerCase();
     }
@@ -3430,10 +3673,12 @@ async function miTuiCommand(initial = '') {
         await appendThreadMessage('main', 'user', text, { unread: false, source: 'mi-cli' });
         requestRender();
         try {
-            const decision = miWorkerRoutingDecision(text);
-            const response = decision.start
-                ? await startBackgroundWorkerFromMi(text, decision)
-                : await sendToMiMain(await buildMiTurnPrompt(text));
+            const response = miSurfaceMode('main-tui') === 'converse'
+                ? await sendToMiMain(await buildMiTurnPrompt(text))
+                : await (async () => {
+                    const decision = miWorkerRoutingDecision(text);
+                    return decision.start ? startBackgroundWorkerFromMi(text, decision) : sendToMiMain(await buildMiTurnPrompt(text));
+                })();
             getMiState().then((state) => {
                 miState = state;
                 requestRender();
@@ -3871,13 +4116,14 @@ async function cronCommand(args) {
         const every = argValue(meta, '--every');
         const at = argValue(meta, '--at');
         const cwd = argValue(meta, '--cwd');
+        const message = argValue(meta, '--message');
         const enabled = !meta.includes('--disabled');
         if (Boolean(every) === Boolean(at))
             throw new Error('provide exactly one of --every or --at');
-        if (commandParts.length === 0)
-            throw new Error('cron command required after --');
-        const cron = await upsertCron({ name, every, at, cwd, enabled, command: commandParts.join(' ') });
-        console.log(`Saved ${cron.name}`);
+        if (!message && commandParts.length === 0)
+            throw new Error('cron reminder message required; command crons are legacy and require -- <command>');
+        const cron = await upsertCron(message ? { name, every, at, enabled, message } : { name, every, at, cwd, enabled, command: commandParts.join(' ') });
+        console.log(`Saved ${cron.name}${message ? '' : ' (legacy command cron)'}`);
         return;
     }
     throw new Error(`unknown cron command: ${subcommand}`);
@@ -3910,7 +4156,23 @@ async function main() {
         return compactCommand(args);
     if (command === 'agents')
         return miAgentsCommand();
-    if (command === 'check' && (args.length === 0 || ['all', 'pendingApprovals', 'failedCrons', 'dailyBrief', 'pending-approvals', 'approval-reminders', 'failed-crons', 'crons', 'daily-brief', 'brief'].includes(args[0])))
+    if (command === 'tick')
+        return tickCommand();
+    if (command === 'status')
+        return statusCommand();
+    if (command === 'approvals')
+        return approvalsCommand(args);
+    if (command === 'proposals')
+        return proposalsCommand(args);
+    if (command === 'delegations')
+        return delegationsCommand();
+    if (command === 'project-status')
+        return projectStatusCommand(args);
+    if (command === 'loop-discovery')
+        return loopDiscoveryCommand(args);
+    if (command === 'loop-factory')
+        return loopFactoryCommand(args);
+    if (command === 'check' && (args.length === 0 || ['all', 'pendingApprovals', 'failedCrons', 'dailyBrief', 'pending-approvals', 'approval-reminders', 'failed-crons', 'crons', 'daily-brief', 'brief', 'health-check', 'heartbeat', 'configured-monitor-health', 'projectQuestion', 'project-question', 'question', 'questions', 'ask'].includes(args[0])))
         return proactiveCheckCommand(args);
     if (command === 'cron')
         return cronCommand(args);

@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AssistantFile, Permissions, TriggerConfig } from './assistant.js';
+import type { CapabilityAuditEvent, CapabilityGrant, Principal } from './capabilities.js';
 import type { WorkerRequest, WorkerResult } from './workers.js';
 
 export type Assistant = AssistantFile;
@@ -34,6 +35,7 @@ export type RunToolCall = {
   input?: unknown;
   output?: unknown;
   error?: string;
+  capabilityIds?: string[];
 };
 
 export type RunApproval = {
@@ -41,6 +43,11 @@ export type RunApproval = {
   status: 'pending' | 'approved' | 'rejected' | 'completed' | 'failed';
   reason: string;
   createdAt: string;
+  resource?: string;
+  rights?: string[];
+  principal?: Principal;
+  expiresAt?: string;
+  capabilityId?: string;
 };
 
 export type RunRecord = {
@@ -50,6 +57,9 @@ export type RunRecord = {
   status: RunStatus;
   startedAt: string;
   finishedAt?: string;
+  principal?: Principal;
+  capabilities: CapabilityGrant[];
+  capabilityAudit: CapabilityAuditEvent[];
   toolCalls: RunToolCall[];
   workerResults: WorkerResult[];
   approvals: RunApproval[];
@@ -66,6 +76,8 @@ export function createRunRecord(assistant: string, trigger: Trigger): RunRecord 
     trigger,
     status: 'started',
     startedAt: new Date().toISOString(),
+    capabilities: [],
+    capabilityAudit: [],
     toolCalls: [],
     workerResults: [],
     approvals: [],
@@ -99,6 +111,13 @@ export function addApproval(run: RunRecord, approval: Omit<RunApproval, 'created
   return {
     ...run,
     approvals: [...run.approvals, { ...approval, createdAt: approval.createdAt || new Date().toISOString() }],
+  };
+}
+
+export function addCapabilityAudit(run: RunRecord, event: CapabilityAuditEvent): RunRecord {
+  return {
+    ...run,
+    capabilityAudit: [...(run.capabilityAudit || []), event],
   };
 }
 

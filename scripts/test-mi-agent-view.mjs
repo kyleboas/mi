@@ -6,6 +6,7 @@ import { matchesKey } from '@mariozechner/pi-tui';
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
 const miExtension = readFileSync(new URL('../pi/extensions/mi.ts', import.meta.url), 'utf8');
+const miAgentE2e = readFileSync(new URL('../scripts/test-mi-agent-e2e.mjs', import.meta.url), 'utf8');
 
 assert.match(cli, /mi agents\s+Open mi agents live background agent view/, 'usage documents mi agents startup command and mi agents name');
 assert.match(cli, /AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTheme, UserMessageComponent/, 'CLI imports pi message components and theme');
@@ -30,7 +31,10 @@ assert.match(cli, /sessionActivityStepsCache[\s\S]*Date\.now\(\) - cached\.at < 
 assert.match(cli, /function readSessionFinalOutput\(sessionFile: string, options: \{ full\?: boolean \} = \{\}\)[\s\S]*outputs\.push\(text\)[\s\S]*if \(options\.full\) return outputs\.join\('\\n\\n'\)[\s\S]*return outputs\.at\(-1\) \|\| ''/, 'agent view skips queued-goal inactive sentinel when showing session final output');
 assert.match(cli, /function readSessionFullTranscript\(sessionFile: string\)[\s\S]*role !== 'user' && role !== 'assistant'[\s\S]*items\.push\(\{ role, text \}\)[\s\S]*return items/, 'agent view reads full user/assistant transcript for full output mode');
 assert.match(cli, /function taskFinalOutput\(task: MiTask, options: \{ full\?: boolean \} = \{\}\)[\s\S]*options\.full \? \(sessionText \|\| text\) : \(text \|\| sessionText\)/, 'full output mode prefers the full session assistant text over stored task text');
-assert.match(cli, /function taskDisplayText\(task: MiTask\)[\s\S]*!isNonFinalAssistantText\(task\.text\)/, 'agent view skips queued-goal inactive sentinel in persisted task text');
+assert.match(cli, /function sanitizeVisibleAssistantText\(text: string\)[\s\S]*<thinking>[\s\S]*?<\\\/thinking>[\s\S]*<think>[\s\S]*?<\\\/think>[\s\S]*\(\?:thinking\|reasoning\)/, 'agent view strips leaked thinking/reasoning blocks from visible assistant text');
+assert.match(cli, /function taskDisplayText\(task: MiTask\)[\s\S]*sanitizeVisibleAssistantText\(task\.text \|\| ''\)[\s\S]*!isNonFinalAssistantText\(text\)/, 'agent view sanitizes persisted task text and skips queued-goal inactive sentinel');
+assert.match(cli, /function textFromSessionMessage\(message: any\)[\s\S]*typeof content === 'string'\) return sanitizeVisibleAssistantText\(content\)[\s\S]*part\?\.type === 'text'[\s\S]*part\?\.type === 'toolCall'[\s\S]*sanitizeVisibleAssistantText/, 'agent view excludes structured thinking parts when reading session messages');
+assert.doesNotMatch(cli, /part\?\.type === 'thinking' \? `thinking:/, 'session message extraction must not turn thinking parts into visible final text');
 assert.match(cli, /miTranscriptRenderCache/, 'main Mi TUI caches transcript rendering between spinner frames');
 assert.match(cli, /const MI_WORKING_RENDER_MS = Number\(process\.env\.MI_WORKING_RENDER_MS \|\| PI_LOADER_INTERVAL_MS\)/, 'main Mi TUI uses pi loader spinner cadence');
 assert.match(cli, /workingFrame = \(workingFrame \+ 1\) % PI_SPINNER_FRAMES\.length/, 'main Mi TUI advances working spinner by frame count instead of wall-clock jumps');
@@ -84,7 +88,9 @@ assert.match(cli, /matchesKey\(data, 'shift\+tab'\)[\s\S]*cycleAgentThinking\(\)
 assert.doesNotMatch(cli, /status = `Agent (?:model|tier)/, 'agent view does not put model changes in the help/status line');
 assert.match(cli, /async function applyAgentPiCycle\(text: string\)/, 'agent view supports pi-cycle model shortcuts for new tasks and replies');
 assert.match(cli, /async function runAgentSlashCommand\(value: string\)/, 'agent view supports slash commands in input');
-assert.match(cli, /const PI_SLASH_COMMANDS = \[[^\]]*'\/marker'[^\]]*'\/end'[^\]]*\]/, 'agent view autocompletes /marker and /end');
+assert.match(cli, /const PI_SLASH_COMMANDS = \[[^\]]*'\/plan'[^\]]*'\/marker'[^\]]*'\/end'[^\]]*\]/, 'agent view autocompletes /plan, /marker, and /end');
+assert.match(cli, /const MI_BACKGROUND_SLASH_COMMANDS = new Set\(\['\/detect', '\/plan'\]\)/, 'agent view starts /plan as a native Mi background task instead of opening Pi');
+assert.match(miAgentE2e, /\/plan is a full Mi agents workflow command[\s\S]*message === '\/plan design safe change'[\s\S]*message === 'what tests should cover this\?'[\s\S]*message === 'go implement that plan'/, 'mi agents e2e covers the full /plan workflow: start, refine, and go on the same worker');
 assert.match(cli, /const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set\(\['\/marker', '\/end'\]\)/, 'agent view handles /marker and /end natively');
 assert.match(cli, /async function sendNativeAgentSlashCommand\(value: string\)[\s\S]*const isMarker = command === '\/marker'[\s\S]*const waitForDone = command === '\/end'[\s\S]*status = isMarker \? 'Marker set' : 'Summarizing increment since marker…'[\s\S]*type: 'continue_worker'[\s\S]*background: !waitForDone[\s\S]*preserveStatus: true[\s\S]*if \(waitForDone\) status = 'Increment summarized and marker advanced'/, 'native task slash commands show extension status above input; /marker and /end preserve task state');
 assert.match(cli, /MI_NATIVE_AGENT_SLASH_COMMANDS\.has\(slashCommandName\(value\)\)[\s\S]*sendNativeAgentSlashCommand\(value\)/, 'runAgentSlashCommand dispatches native task slash commands');
@@ -220,8 +226,8 @@ assert.match(cli, /function taskTimeLabel\(task: MiTask\)[\s\S]*section === 'nee
 assert.match(cli, /function taskTimeLabel\(task: MiTask\)[\s\S]*Date\.parse\(task\.continuedAt \|\| task\.startedAt/, 'working tasks show time working');
 assert.match(cli, /function sectionTaskItems\(label: 'needs input' \| 'working' \| 'completed'\)/, 'mi agents builds sorted section task lists');
 assert.match(cli, /function taskStartedMs\(task: MiTask\)[\s\S]*Date\.parse\(task\.startedAt \|\| task\.continuedAt \|\| task\.updatedAt/, 'task ordering can use task start time');
-assert.match(cli, /function taskSectionMovedMs\(task: MiTask\)[\s\S]*section === 'needs input'[\s\S]*task\.notifiedNeedsUserAt \|\| task\.notifiedPausedAt[\s\S]*section === 'working'[\s\S]*task\.continuedAt \|\| task\.startedAt[\s\S]*task\.finishedAt/, 'section ordering uses the timestamp when each task entered its current section');
-assert.match(cli, /\.sort\(\(a, b\) => taskDisplayOrderValue\(a\.task\) - taskDisplayOrderValue\(b\.task\)[\s\S]*taskSectionMovedMs\(b\.task\) - taskSectionMovedMs\(a\.task\)/, 'each mi agents section uses stable display order first so live updates do not churn navigation');
+assert.match(cli, /function taskSectionMovedMs\(task: MiTask\)[\s\S]*section === 'needs input'[\s\S]*task\.notifiedNeedsUserAt \|\| task\.notifiedPausedAt[\s\S]*section === 'working'[\s\S]*task\.continuedAt \|\| task\.updatedAt \|\| task\.lastEventAt \|\| task\.startedAt[\s\S]*task\.finishedAt/, 'section ordering uses newest transition\/activity timestamp for each task section');
+assert.match(cli, /\.sort\(\(a, b\) => taskSectionMovedMs\(b\.task\) - taskSectionMovedMs\(a\.task\)[\s\S]*taskStartedMs\(b\.task\) - taskStartedMs\(a\.task\)[\s\S]*taskUpdatedMs\(b\.task\) - taskUpdatedMs\(a\.task\)[\s\S]*taskDisplayOrderValue\(a\.task\) - taskDisplayOrderValue\(b\.task\)/, 'each mi agents section sorts newest to oldest and uses stable display order only as a final tie-breaker');
 assert.match(cli, /for \(const label of \['needs input', 'working', 'completed'\] as const\)/, 'mi agents splits tasks into needs input, working, and completed sections');
 assert.match(cli, /label === 'completed' && selectedSection !== 'completed'[\s\S]*sectionTasks\.slice\(0, 3\)/, 'mi agents initially shows only the newest three completed tasks');
 assert.match(cli, /`completed \(\$\{visibleSectionTasks\.length\} shown of \$\{sectionTasks\.length\}\)`/, 'mi agents indicates completed list count when capped');
@@ -261,13 +267,11 @@ assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, on
 assert.match(cli, /tui = startPiTuiScreen\(new FunctionScreen\(renderMiLines, onData\), \{ clearScreen: false \}\)/, 'main Mi TUI avoids alternate screen so tmux scrollback works');
 assert.match(cli, /leave conversation history in normal terminal scrollback/, 'main Mi TUI documents why it avoids alternate screen');
 assert.match(cli, /if \(options\.alternateScreen\) process\.stdout\.write\('\\x1b\[\?1049l'\)/, 'alternate-screen mi agents restores the normal screen on cleanup');
-assert.match(cli, /function miMessageLooksLikeInlineChat\(text: string\)[\s\S]*draft\|write\|rewrite\|compose\|wordsmith[\s\S]*return true/, 'main Mi handles writing/drafting requests inline unless they are code work');
-assert.match(cli, /function miWorkerRoutingDecision\(text: string\): MiWorkerRoutingDecision[\s\S]*miMessageLooksLikeInlineChat\(normalized\)[\s\S]*reason: 'inline-chat'/, 'main Mi keeps inline chat/drafting requests out of background workers');
-assert.match(cli, /function miWorkerRoutingDecision\(text: string\): MiWorkerRoutingDecision[\s\S]*localTarget && \(actionable \|\| complaint\)[\s\S]*repo\/app work/, 'main Mi detects actionable local bug/work requests for background workers');
-assert.match(cli, /function shouldStartBackgroundWorkerFromMi\(text: string\)[\s\S]*miWorkerRoutingDecision\(text\)\.start/, 'main Mi worker routing goes through the smarter routing decision');
-assert.match(cli, /async function buildBackgroundWorkerPromptFromMi\(text: string, decision = miWorkerRoutingDecision\(text\)\)[\s\S]*Background worker handoff from Mi main chat[\s\S]*Handoff reason: \$\{decision\.reason\}\.[\s\S]*Current user request:[\s\S]*Relevant Mi main chat context/, 'main Mi builds a self-contained worker handoff with recent chat context and route reason');
-assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string, decision = miWorkerRoutingDecision\(text\)\)[\s\S]*const message = await buildBackgroundWorkerPromptFromMi\(text, decision\)[\s\S]*type: 'run_worker'[\s\S]*message, lastInput: text[\s\S]*background: true, reportToMain: true[\s\S]*miHandoffReasonSentence\(decision\)/, 'main Mi starts background workers with handoff context and returns an intelligent acknowledgement');
-assert.match(cli, /const decision = miWorkerRoutingDecision\(text\);[\s\S]*decision\.start[\s\S]*await startBackgroundWorkerFromMi\(text, decision\)[\s\S]*await sendToMiMain\(await buildMiTurnPrompt\(text\)\)/, 'main Mi routes actionable work to a background worker and chatty messages to Mi main');
+assert.match(cli, /type MiSurface = 'main-tui' \| 'imessage' \| 'web' \| 'agents'/, 'Mi has a minimal surface policy seam');
+assert.match(cli, /function miSurfaceMode\(surface: MiSurface\): MiSurfaceMode[\s\S]*surface === 'main-tui' \|\| surface === 'imessage'[\s\S]*return 'converse'/, 'main Mi and iMessage are conversation-first surfaces');
+assert.match(cli, /const response = miSurfaceMode\('main-tui'\) === 'converse'[\s\S]*await sendToMiMain\(await buildMiTurnPrompt\(text\)\)/, 'main Mi TUI answers conversationally instead of auto-starting workers');
+assert.match(cli, /async function buildBackgroundWorkerPromptFromMi\(text: string, decision = miWorkerRoutingDecision\(text\)\)[\s\S]*Background worker handoff from Mi main chat[\s\S]*Handoff reason: \$\{decision\.reason\}\.[\s\S]*Current user request:[\s\S]*Relevant Mi main chat context/, 'worker handoff builder remains available for explicit future delegation');
+assert.match(cli, /async function startBackgroundWorkerFromMi\(text: string, decision = miWorkerRoutingDecision\(text\)\)[\s\S]*const message = await buildBackgroundWorkerPromptFromMi\(text, decision\)[\s\S]*type: 'run_worker'[\s\S]*message, lastInput: text[\s\S]*background: true, reportToMain: true[\s\S]*miHandoffReasonSentence\(decision\)/, 'main Mi worker handoff remains isolated and reusable, but not automatic');
 assert.match(miExtension, /Route deliberately instead of reflexively handing everything off[\s\S]*specific acknowledgement/, 'Mi main system prompt discourages reflexive/generic handoffs');
 assert.match(cli, /async function buildMiTurnPrompt\(text: string\)/, 'main Mi TUI builds pi-chat-style turn prompts');
 assert.match(cli, /readThreadMessages\('main', 15\)/, 'main Mi TUI includes last 15 messages as context');
@@ -345,6 +349,7 @@ assert.match(daemon, /function sessionFingerprint\(task\)[\s\S]*match\(\/\(\[0-9
 assert.match(cli, /function sessionFingerprint\(task: MiTask\)[\s\S]*taskIdentityKeys/, 'mi agents UI dedupes rows by parsed session UUID');
 assert.match(daemon, /function sameLogicalTask\(a, b\)[\s\S]*samePiSessionTask\(a, b\)[\s\S]*normalizedTaskName/, 'daemon can merge continued external pi-session rows by logical task name');
 assert.match(daemon, /let lastInput = ""[\s\S]*normalizeLastInputText\(textFromMessage\(record\.message\)\)[\s\S]*lastInput = text\.slice\(0, 500\)/, 'daemon captures latest pi-session user input for dedupe and non-generic names');
+assert.match(daemon, /Preserve the complete final assistant response[\s\S]*if \(text\) lastAssistant = text;/, 'daemon does not truncate discovered pi-session final output before mi agents full-output mode can show it');
 assert.match(daemon, /const inputTitle = taskNameFromText\(lastInput\)[\s\S]*sessionTitle \|\| goalTitle \|\| inputTitle \|\| basename\(cwd\)/, 'daemon names unnamed pi sessions from their prompt before falling back to cwd');
 assert.match(daemon, /function dedupePiSessionTasks\(tasks\)[\s\S]*sameLogicalTask\(entry, task\)[\s\S]*return merged/, 'daemon dedupes stored and discovered copies of the same pi session');
 assert.match(daemon, /return dedupePiSessionTasks\(merged\)/, 'daemon returns deduped pi session task rows');

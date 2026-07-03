@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -9,6 +9,8 @@ import { notify as sendNotification } from './notify.js';
 import { logEvent, readApprovals } from './state.js';
 import { appendThreadMessage } from './threads.js';
 import { redactSecrets } from './redact.js';
+import { projectQuestion } from './questions.js';
+import { queuedProposals, readProposalQueue, renderNumberedProposals } from './proposals.js';
 
 export type ProactiveNotice = {
   message: string;
@@ -16,6 +18,7 @@ export type ProactiveNotice = {
   dedupeKey?: string;
   repairPrompt?: string;
   repairName?: string;
+  suppressActionFooter?: boolean;
 };
 
 export type ProactiveCheck = {
@@ -47,6 +50,9 @@ const miTasksDir = join(homedir(), 'mi');
 const miStateDir = process.env.MI_TASK_STATE_DIR || join(miTasksDir, 'state');
 const miPreferencesPath = join(miTasksDir, 'preferences.md');
 const dedupePath = join(stateDir, 'proactive-dedupe.json');
+const monitorHealthPath = join(stateDir, 'monitor-health.json');
+const monitorRegistryPath = process.env.MI_MONITOR_REGISTRY_PATH || join(miRoot, 'assistants', 'monitors.md');
+const autoActionsPath = join(stateDir, 'auto-actions.json');
 const runtimeDir = process.env.MI_RUNTIME_DIR || join(homedir(), '.pi', 'agent', 'mi');
 const socketPath = process.env.MI_SOCKET_PATH || join(runtimeDir, 'main.sock');
 const repairModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';
@@ -259,8 +265,54 @@ function sendSocketRequest(payload: unknown, timeoutMs = 30000): Promise<{ ok?: 
   });
 }
 
+type AutoActionState = {
+  date?: string;
+  readOnlyTriageToday?: number;
+};
+
+function autoActionsEnabled() {
+  return process.env.MI_AUTO_ACTIONS_ENABLED !== 'false';
+}
+
+function autoActionMaxPerDay() {
+  const value = Number(process.env.MI_AUTO_ACTION_INSPECT_MAX_PER_DAY || process.env.MI_AUTO_ACTIONS_MAX_PER_DAY || 3);
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 3;
+}
+
+async function readAutoActionState(): Promise<AutoActionState> {
+  try {
+    const parsed = JSON.parse(await readFile(autoActionsPath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeAutoActionState(state: AutoActionState) {
+  await mkdir(dirname(autoActionsPath), { recursive: true });
+  await writeFile(autoActionsPath, JSON.stringify(state, null, 2), { mode: 0o600 });
+}
+
+async function consumeReadOnlyTriageBudget() {
+  if (!autoActionsEnabled()) return { allowed: false, reason: 'disabled' };
+  const maxPerDay = autoActionMaxPerDay();
+  if (maxPerDay <= 0) return { allowed: false, reason: 'daily budget disabled' };
+  const state = await readAutoActionState();
+  const date = today();
+  if (state.date !== date) {
+    state.date = date;
+    state.readOnlyTriageToday = 0;
+  }
+  if ((state.readOnlyTriageToday || 0) >= maxPerDay) return { allowed: false, reason: 'daily budget exhausted' };
+  state.readOnlyTriageToday = (state.readOnlyTriageToday || 0) + 1;
+  await writeAutoActionState(state);
+  return { allowed: true, reason: 'ok' };
+}
+
 async function startRepairWorker(notice: ProactiveNotice) {
   if (!notice.repairPrompt) return null;
+  const budget = await consumeReadOnlyTriageBudget();
+  if (!budget.allowed) return { skipped: true, reason: budget.reason };
   const name = notice.repairName || taskNameFromPrompt(notice.repairPrompt);
   const result = await sendSocketRequest({
     type: 'run_worker',
@@ -271,8 +323,9 @@ async function startRepairWorker(notice: ProactiveNotice) {
     background: true,
     reportToMain: true,
     model: repairModel,
+    capabilityProfile: 'worker-read',
   }, 30000);
-  return { name, taskId: result.taskId, sessionFile: result.sessionFile };
+  return { name, taskId: result.taskId, sessionFile: result.sessionFile, capabilityProfile: 'worker-read' };
 }
 
 function noticeHash(checkId: string, notice: ProactiveNotice) {
@@ -369,6 +422,8 @@ export async function dailyBrief(): Promise<null | ProactiveNotice> {
     .sort((a, b) => Date.parse(b.lastRunAt || '') - Date.parse(a.lastRunAt || ''))
     .slice(0, 5);
   const paths = cronPaths();
+  const proposals = queuedProposals(await readProposalQueue());
+  const proposalLines = renderNumberedProposals(proposals);
   const work = await currentWorkLines();
   const projects = await projectLines();
   const actionItems = [
@@ -385,6 +440,9 @@ export async function dailyBrief(): Promise<null | ProactiveNotice> {
       '',
       'ACTION ITEMS',
       compactLines(actionItems.slice(0, 8), '- No urgent approvals, failed monitors, or blocked tasks found.'),
+      '',
+      'PROPOSALS',
+      compactLines(proposalLines, '- No queued proposals today.'),
       '',
       'PROJECTS IN MOTION',
       compactLines(projects, '- No recent project activity found.'),
@@ -413,6 +471,316 @@ export async function dailyBrief(): Promise<null | ProactiveNotice> {
   };
 }
 
+type MonitorStatus = 'ok' | 'stale' | 'degraded' | 'human-required' | 'muted_pending_human';
+
+type MonitorObservation = {
+  id: string;
+  title: string;
+  status: MonitorStatus;
+  reason: string;
+  detail?: string;
+  repairable?: boolean;
+  repairPrompt?: string;
+  repairName?: string;
+};
+
+type MonitorRecord = {
+  status?: MonitorStatus;
+  reason?: string;
+  detail?: string;
+  lastObservedAt?: string;
+  lastTransitionAt?: string;
+  repairAttempts?: number;
+  nextRepairAfter?: string;
+};
+
+type MonitorHealthState = {
+  version: 1;
+  monitors: Record<string, MonitorRecord>;
+};
+
+const tacticsJournalRoot = process.env.MI_TACTICS_JOURNAL_ROOT || '/home/kyle/code/research';
+const tacticsHealthDir = process.env.MI_TACTICS_HEALTH_DIR || join(tacticsJournalRoot, '.logs');
+const tacticsHealthSteps = (process.env.MI_TACTICS_HEALTH_STEPS || 'ingest,detect,report,report-worker,tune,storage-prune')
+  .split(',')
+  .map((step) => step.trim())
+  .filter(Boolean);
+const tacticsStaleMs = Number(process.env.MI_TACTICS_HEALTH_STALE_MS || 30 * 60 * 60_000);
+const monitorRepairCooldownMs = Number(process.env.MI_MONITOR_REPAIR_COOLDOWN_MS || 6 * 60 * 60_000);
+const monitorRepairMaxAttempts = Math.max(1, Number(process.env.MI_MONITOR_REPAIR_MAX_ATTEMPTS || 3));
+const humanRequiredReasons = new Set(['railway_auth_failed', 'railway_project_unlinked', 'cloudflare_ai_gateway_billing', 'cloudflare_ai_gateway_forbidden']);
+const repairableMonitorReasons = new Set(['stale', 'missing_health_sidecar', 'unreadable_health_sidecar', 'process_killed', 'rescore_degraded', 'degraded', 'failed', 'error']);
+
+async function readJsonObject<T extends object>(path: string): Promise<Partial<T>> {
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function readMonitorHealthState(): Promise<MonitorHealthState> {
+  const parsed = await readJsonObject<MonitorHealthState>(monitorHealthPath);
+  return { version: 1, monitors: parsed.monitors && typeof parsed.monitors === 'object' ? parsed.monitors as Record<string, MonitorRecord> : {} };
+}
+
+async function writeMonitorHealthState(state: MonitorHealthState) {
+  await mkdir(dirname(monitorHealthPath), { recursive: true });
+  await writeFile(monitorHealthPath, JSON.stringify(state, null, 2), { mode: 0o600 });
+}
+
+function transitionFor(previous: MonitorRecord | undefined, current: MonitorObservation) {
+  if (!previous?.status) return 'seed' as const;
+  if (previous.status === current.status && previous.reason === current.reason && previous.detail === current.detail) return 'unchanged' as const;
+  if (previous.status !== 'ok' && current.status === 'ok') return 'recovered' as const;
+  if (previous.status === 'ok' && current.status !== 'ok') return 'broken' as const;
+  if (previous.status !== current.status) return 'changed' as const;
+  return 'changed-detail' as const;
+}
+
+function monitorLine(observation: MonitorObservation) {
+  const suffix = observation.detail ? ` — ${truncateLine(observation.detail, 180)}` : '';
+  return `- ${observation.title}: ${observation.reason}${suffix}`;
+}
+
+function recoveryLine(observation: MonitorObservation) {
+  return `- ${observation.title} is healthy again.`;
+}
+
+function makeMonitorRepairPrompt(observation: MonitorObservation) {
+  if (observation.repairPrompt) return observation.repairPrompt;
+  return [
+    'Safe read-only triage worker launched automatically by Mi for a configured monitor that became stale or degraded.',
+    `Monitor: ${observation.title}`,
+    `Status: ${observation.status}`,
+    `Reason: ${observation.reason}`,
+    observation.detail ? `Detail: ${observation.detail}` : '',
+    '',
+    'Scope:',
+    '- Inspect and summarize only this configured monitor using read-only tools.',
+    '- Do not edit files, deploy, merge, delete, change config, approve anything, or touch secrets.',
+    '- Do not start new open-ended Tactics Journal research work if nothing is broken.',
+    '- If a mutation or human action is required, stop and report exactly what is needed.',
+  ].filter(Boolean).join('\n');
+}
+
+function repairAllowed(observation: MonitorObservation, previous: MonitorRecord | undefined, nowMs: number) {
+  if (!observation.repairable) return false;
+  if (observation.status !== 'stale' && observation.status !== 'degraded') return false;
+  if (!repairableMonitorReasons.has(observation.reason)) return false;
+  if (previous?.nextRepairAfter && Date.parse(previous.nextRepairAfter) > nowMs) return false;
+  return true;
+}
+
+type MonitorRegistryEntry = {
+  id: string;
+  title: string;
+  type: 'health_sidecar' | 'mi_crons';
+  source: string;
+  freshnessMs?: number;
+  allowedAutoActions?: string;
+};
+
+function parseDurationMs(value: string, fallback: number) {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/i);
+  if (!match) return fallback;
+  const amount = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  if (unit === 'ms') return amount;
+  if (unit === 's') return amount * 1000;
+  if (unit === 'm') return amount * 60_000;
+  if (unit === 'h') return amount * 60 * 60_000;
+  return amount * 24 * 60 * 60_000;
+}
+
+function defaultTacticsRegistryEntries(): MonitorRegistryEntry[] {
+  return tacticsHealthSteps.map((step) => ({
+    id: `tactics:${step}`,
+    title: `Tactics Journal ${step} health`,
+    type: 'health_sidecar',
+    source: join(tacticsHealthDir, `${step}-latest-health.json`),
+    freshnessMs: tacticsStaleMs,
+    allowedAutoActions: 'read_triage',
+  }));
+}
+
+function parseMonitorRegistry(markdown: string): MonitorRegistryEntry[] {
+  const entries: MonitorRegistryEntry[] = [];
+  for (const line of markdown.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('|') || trimmed.includes('---') || /^\|\s*id\s*\|/i.test(trimmed)) continue;
+    const cells = trimmed.split('|').slice(1, -1).map((cell) => cell.trim());
+    if (cells.length < 8) continue;
+    const [id, title, type, source, freshness, , allowedAutoActions] = cells;
+    if (!id || !title || !type || !source) continue;
+    if (type !== 'health_sidecar' && type !== 'mi_crons') continue;
+    entries.push({
+      id,
+      title,
+      type,
+      source,
+      freshnessMs: freshness && freshness !== 'n/a' ? parseDurationMs(freshness, tacticsStaleMs) : undefined,
+      allowedAutoActions,
+    });
+  }
+  return entries;
+}
+
+async function readMonitorRegistry(): Promise<MonitorRegistryEntry[]> {
+  if (process.env.MI_TACTICS_HEALTH_DIR || process.env.MI_TACTICS_HEALTH_STEPS || process.env.MI_TACTICS_HEALTH_STALE_MS) {
+    return [...defaultTacticsRegistryEntries(), { id: 'mi-crons:configured', title: 'Mi reminder crons', type: 'mi_crons', source: 'state/crons.json', allowedAutoActions: 'read_triage' }];
+  }
+  const parsed = parseMonitorRegistry(await readFile(monitorRegistryPath, 'utf8').catch(() => ''));
+  return parsed.length > 0 ? parsed : [{ id: 'mi-crons:configured', title: 'Mi reminder crons', type: 'mi_crons', source: 'state/crons.json', allowedAutoActions: 'read_triage' }];
+}
+
+async function observeTacticsHealthStep(entryOrStep: MonitorRegistryEntry | string): Promise<MonitorObservation | null> {
+  const entry = typeof entryOrStep === 'string' ? defaultTacticsRegistryEntries().find((item) => item.id === `tactics:${entryOrStep}`) : entryOrStep;
+  if (!entry) return null;
+  const path = entry.source;
+  const title = entry.title;
+  try {
+    const [raw, info] = await Promise.all([readFile(path, 'utf8'), stat(path)]);
+    const payload = JSON.parse(raw) as Record<string, unknown>;
+    const checkedAt = String(payload.checked_at || payload.checkedAt || '');
+    const checkedMs = Date.parse(checkedAt) || info.mtimeMs;
+    const reason = String(payload.reason || payload.status || 'unknown');
+    const status = String(payload.status || '').toLowerCase();
+    const human = payload.human_action_required === true || humanRequiredReasons.has(reason);
+    const ageMs = Date.now() - checkedMs;
+    if (human) return { id: entry.id, title, status: 'human-required', reason, detail: checkedAt ? `checked ${checkedAt}` : path, repairable: false };
+    if (ageMs > (entry.freshnessMs || tacticsStaleMs)) return { id: entry.id, title, status: 'stale', reason: 'stale', detail: `last checked ${checkedAt || new Date(checkedMs).toISOString()}`, repairable: entry.allowedAutoActions === 'read_triage' };
+    if (status === 'ok') return { id: entry.id, title, status: 'ok', reason: 'ok', detail: checkedAt ? `checked ${checkedAt}` : undefined };
+    const degradedReason = reason || status || 'degraded';
+    return { id: entry.id, title, status: 'degraded', reason: degradedReason, detail: String(payload.log_file || payload.exit_code || path), repairable: entry.allowedAutoActions === 'read_triage' && repairableMonitorReasons.has(degradedReason) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    const reason = error instanceof SyntaxError ? 'unreadable_health_sidecar' : 'unreadable_health_sidecar';
+    return { id: entry.id, title, status: 'stale', reason, detail: path, repairable: entry.allowedAutoActions === 'read_triage' };
+  }
+}
+
+async function observeMiCronHealth(): Promise<MonitorObservation[]> {
+  const crons = await readCrons().catch(() => []);
+  const enabled = crons.filter((cron) => cron.enabled);
+  if (enabled.length === 0) return [{ id: 'mi-crons:configured', title: 'Mi reminder crons', status: 'ok', reason: 'none-configured', detail: 'No Mi reminder crons are configured.' }];
+  const commandCrons = enabled.filter((cron) => cron.command);
+  if (commandCrons.length > 0) {
+    return [{ id: 'mi-crons:command-crons', title: 'Mi command crons', status: 'human-required', reason: 'legacy_command_crons', detail: `${commandCrons.length} command cron(s) should be migrated to configured monitors or reminders.`, repairable: false }];
+  }
+  const failed = enabled.filter((cron) => cron.lastStatus === 'error');
+  if (failed.length > 0) return [{ id: 'mi-crons:reminders', title: 'Mi reminder crons', status: 'degraded', reason: 'failed', detail: failed.map((cron) => cron.name).join(', '), repairable: true }];
+  return [{ id: 'mi-crons:reminders', title: 'Mi reminder crons', status: 'ok', reason: 'ok', detail: `${enabled.length} enabled reminder cron(s).` }];
+}
+
+async function observeConfiguredMonitors() {
+  const registry = await readMonitorRegistry();
+  const sidecars = (await Promise.all(registry.filter((entry) => entry.type === 'health_sidecar').map(observeTacticsHealthStep))).filter((item): item is MonitorObservation => Boolean(item));
+  const miCrons = registry.some((entry) => entry.type === 'mi_crons') ? await observeMiCronHealth() : [];
+  return [...sidecars, ...miCrons];
+}
+
+export async function configuredMonitorHealth(): Promise<null | ProactiveNotice> {
+  const state = await readMonitorHealthState();
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const observations = await observeConfiguredMonitors();
+  const activeIds = new Set(observations.map((observation) => observation.id));
+  for (const id of Object.keys(state.monitors)) {
+    if (id.startsWith('tactics:') && !activeIds.has(id)) delete state.monitors[id];
+  }
+  const becameBroken: MonitorObservation[] = [];
+  const changedBroken: MonitorObservation[] = [];
+  const recovered: MonitorObservation[] = [];
+  const humanRequired: MonitorObservation[] = [];
+  const repairable: MonitorObservation[] = [];
+
+  for (const observation of observations) {
+    const previous = state.monitors[observation.id];
+    if (previous?.status === 'muted_pending_human' && observation.status !== 'ok') {
+      state.monitors[observation.id] = {
+        ...previous,
+        reason: observation.reason,
+        detail: observation.detail,
+        lastObservedAt: nowIso,
+      };
+      continue;
+    }
+
+    const attempts = previous?.repairAttempts || 0;
+    if (observation.status !== 'ok' && attempts >= monitorRepairMaxAttempts) {
+      const mutedObservation: MonitorObservation = {
+        ...observation,
+        status: 'human-required',
+        reason: 'muted_pending_human',
+        detail: `${observation.detail ? `${observation.detail}; ` : ''}auto-repair attempted ${attempts} time(s); muted pending human`,
+        repairable: false,
+      };
+      humanRequired.push(mutedObservation);
+      state.monitors[observation.id] = {
+        ...previous,
+        status: 'muted_pending_human',
+        reason: observation.reason,
+        detail: observation.detail,
+        repairAttempts: attempts,
+        lastObservedAt: nowIso,
+        lastTransitionAt: nowIso,
+        nextRepairAfter: undefined,
+      };
+      continue;
+    }
+
+    const transition = transitionFor(previous, observation);
+    const next: MonitorRecord = {
+      ...previous,
+      status: observation.status,
+      reason: observation.reason,
+      detail: observation.detail,
+      lastObservedAt: nowIso,
+      lastTransitionAt: transition === 'seed' || transition === 'unchanged' ? previous?.lastTransitionAt : nowIso,
+    };
+    if (transition !== 'seed' && transition !== 'unchanged') {
+      if (observation.status === 'ok') recovered.push(observation);
+      else if (observation.status === 'human-required') humanRequired.push(observation);
+      else if (transition === 'broken') becameBroken.push(observation);
+      else changedBroken.push(observation);
+    }
+    if (transition !== 'seed' && observation.status !== 'ok' && repairAllowed(observation, previous, nowMs)) {
+      repairable.push(observation);
+      next.repairAttempts = (previous?.repairAttempts || 0) + 1;
+      next.nextRepairAfter = new Date(nowMs + monitorRepairCooldownMs * Math.max(1, Math.min(next.repairAttempts, 6))).toISOString();
+    }
+    if (observation.status === 'ok') {
+      next.repairAttempts = 0;
+      next.nextRepairAfter = undefined;
+    }
+    state.monitors[observation.id] = next;
+  }
+  await writeMonitorHealthState(state);
+
+  if (becameBroken.length === 0 && changedBroken.length === 0 && recovered.length === 0 && humanRequired.length === 0) return null;
+  const lines = [
+    becameBroken.length > 0 ? 'I noticed a configured monitor needs attention:' : '',
+    ...becameBroken.map(monitorLine),
+    changedBroken.length > 0 ? 'A configured monitor changed state:' : '',
+    ...changedBroken.map(monitorLine),
+    humanRequired.length > 0 ? 'This one needs you before I can do anything safely:' : '',
+    ...humanRequired.map(monitorLine),
+    recovered.length > 0 ? 'Good news — this recovered:' : '',
+    ...recovered.map(recoveryLine),
+    repairable.length > 0 ? 'Starting safe read-only triage now.' : 'No action taken.',
+  ].filter(Boolean);
+  const firstRepairable = repairable[0];
+  return {
+    message: lines.join('\n'),
+    notify: true,
+    dedupeKey: `monitorHealth:${[...becameBroken, ...changedBroken, ...humanRequired, ...recovered].map((item) => `${item.id}:${item.status}:${item.reason}:${item.detail || ''}`).sort().join('|')}`,
+    repairName: firstRepairable ? `repair-${firstRepairable.id.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}` : undefined,
+    repairPrompt: firstRepairable ? makeMonitorRepairPrompt(firstRepairable) : undefined,
+  };
+}
+
 export const checks: ProactiveCheck[] = [
   { id: 'pendingApprovals', run: pendingApprovals },
   { id: 'failedCrons', run: failedCrons },
@@ -427,6 +795,14 @@ const checkRegistry = new Map<string, ProactiveCheck>([
   ['crons', { id: 'failedCrons', run: failedCrons }],
   ['daily-brief', { id: 'dailyBrief', run: dailyBrief }],
   ['brief', { id: 'dailyBrief', run: dailyBrief }],
+  ['health-check', { id: 'configuredMonitorHealth', run: configuredMonitorHealth }],
+  ['heartbeat', { id: 'configuredMonitorHealth', run: configuredMonitorHealth }],
+  ['configured-monitor-health', { id: 'configuredMonitorHealth', run: configuredMonitorHealth }],
+  ['projectQuestion', { id: 'projectQuestion', run: projectQuestion }],
+  ['project-question', { id: 'projectQuestion', run: projectQuestion }],
+  ['question', { id: 'projectQuestion', run: projectQuestion }],
+  ['questions', { id: 'projectQuestion', run: projectQuestion }],
+  ['ask', { id: 'projectQuestion', run: projectQuestion }],
 ]);
 
 function resolveChecks(ids: string[] | undefined) {
@@ -442,7 +818,9 @@ function formatCheckMessage(notices: Array<{ checkId: string; notice: ProactiveN
   if (notices.length === 0) return 'Mi check found no new notices.';
   const body = notices.map(({ notice }) => notice.message).join('\n\n');
   const hasRepair = notices.some(({ notice }) => Boolean(notice.repairPrompt));
-  return String(redactSecrets(`${body}\n\n${hasRepair ? 'Repair worker requested.' : 'No action taken.'}`));
+  const needsFooter = notices.some(({ notice }) => !notice.suppressActionFooter);
+  if (!needsFooter) return String(redactSecrets(body));
+  return String(redactSecrets(`${body}\n\n${hasRepair ? 'Background worker requested.' : 'No action taken.'}`));
 }
 
 export async function runMiCheck(options: ProactiveCheckRunOptions = {}): Promise<ProactiveCheckRunResult> {
@@ -494,7 +872,12 @@ export async function runMiCheck(options: ProactiveCheckRunOptions = {}): Promis
       if (!notice.repairPrompt) continue;
       try {
         const repair = await startRepairWorker(notice);
-        await logEvent('mi.check.repair_worker.started', { checkId, repair });
+        if (repair?.skipped) {
+          await logEvent('mi.check.repair_worker.skipped', { checkId, reason: repair.reason });
+          await appendThreadMessage('main', 'assistant', `Mi skipped safe read-only triage for ${checkId}: ${repair.reason}.`, { unread: true, source: 'mi:check' });
+        } else {
+          await logEvent('mi.check.repair_worker.started', { checkId, repair });
+        }
       } catch (error) {
         const errorText = redactSecrets(error instanceof Error ? error.message : String(error));
         await logEvent('mi.check.repair_worker.error', { checkId, error: errorText });

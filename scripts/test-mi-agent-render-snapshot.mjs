@@ -51,9 +51,58 @@ try {
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1b_[^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
-  const visible = (frame) => frame.lines.map(stripAnsi);
-  const taskRows = (frame) => visible(frame).filter((line) => /^\s*(?:→\s*)?[●○✓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ]\s+render-/.test(line));
+  const normalizeVisual = (text) => stripAnsi(text)
+    .replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, '●')
+    .replace(/\b\d+s\b/g, '<time>')
+    .replace(/\b\d+m\b/g, '<time>')
+    .replace(/\b\d+h\b/g, '<time>')
+    .replace(/\b\d+d\b/g, '<time>');
+  const visible = (frame) => frame.lines.map(normalizeVisual);
+  const taskRows = (frame) => visible(frame).filter((line) => /^\s*(?:→\s*)?[●○✓ ]\s+render-/.test(line));
   const countTaskRows = (frame, name) => taskRows(frame).filter((line) => line.includes(name)).length;
+  const rowIndex = (frame, name) => taskRows(frame).findIndex((line) => line.includes(name));
+  const assertVisibleOnce = (frame, names, message = frame.event) => {
+    for (const name of names) assert.equal(countTaskRows(frame, name), 1, `${message}: ${name} should appear exactly once`);
+  };
+  const assertBefore = (frame, first, second, message) => {
+    assert.ok(rowIndex(frame, first) >= 0, `${message}: missing ${first}`);
+    assert.ok(rowIndex(frame, second) >= 0, `${message}: missing ${second}`);
+    assert.ok(rowIndex(frame, first) < rowIndex(frame, second), message);
+  };
+  const runRender = (fixture, events = '', options = {}) => {
+    const result = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
+      cwd: new URL('..', import.meta.url),
+      env: {
+        ...process.env,
+        MI_AGENT_RENDER_TEST: '1',
+        MI_AGENT_RENDER_TEST_TASKS: fixture,
+        MI_AGENT_RENDER_TEST_EVENTS: events,
+        MI_AGENT_RENDER_TEST_ROWS: String(options.rows || 20),
+        MI_AGENT_RENDER_TEST_COLS: String(options.cols || 80),
+        MI_AGENT_RENDER_TEST_NOW: options.now || iso(120000),
+        ...(options.env || {}),
+      },
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return JSON.parse(result.stdout);
+  };
+
+  const shortcutTasksPath = join(root, 'shortcut-tasks.json');
+  await writeFile(shortcutTasksPath, JSON.stringify([
+    { id: 'shortcut-a', name: 'render-shortcut-a', status: 'complete', text: 'shortcut output A', finishedAt: iso(21000), updatedAt: iso(21000) },
+    { id: 'shortcut-b', name: 'render-shortcut-b', status: 'complete', text: 'shortcut output B', finishedAt: iso(22000), updatedAt: iso(22000) },
+  ], null, 2));
+  const shortcutSnapshot = runRender(shortcutTasksPath, 'ctrlF,ctrlF,ctrlM,space,down,space,escape', { rows: 14, cols: 80 });
+  assert.match(shortcutSnapshot.frames[1].status, /Full output/, '^F enters full-output mode');
+  assert.match(visible(shortcutSnapshot.frames[1]).join('\n'), /shortcut output B/, '^F shows selected task output');
+  assert.doesNotMatch(shortcutSnapshot.frames[2].status, /Full output/, 'second ^F exits full-output mode');
+  assert.match(shortcutSnapshot.frames[3].status, /0 selected/, '^M enters multi-select mode');
+  assert.match(shortcutSnapshot.frames[4].status, /1 selected/, 'space selects a task in multi-select mode');
+  assert.match(shortcutSnapshot.frames[6].status, /2 selected/, 'multi-select can select more than one task');
+  assert.match(shortcutSnapshot.frames[7].status, /Removed 2 tasks from list/, 'Esc bulk-clears selected tasks');
+  assert.equal(taskRows(shortcutSnapshot.frames[7]).filter((line) => line.includes('render-shortcut-')).length, 0, 'bulk-cleared tasks disappear immediately');
 
   for (const frame of snapshot.frames) {
     assert.equal(frame.lines.length, 20, `${frame.event}: frame height changed`);
@@ -123,11 +172,11 @@ try {
     'needs input section sorts newest needs-input transition at top and oldest at bottom, even when updatedAt differs',
   );
   assert.ok(
-    workingSortRows.findIndex((line) => line.includes('render-work-new'))
+    workingSortRows.findIndex((line) => line.includes('render-work-old'))
       < workingSortRows.findIndex((line) => line.includes('render-work-mid'))
       && workingSortRows.findIndex((line) => line.includes('render-work-mid'))
-      < workingSortRows.findIndex((line) => line.includes('render-work-old')),
-    'working section sorts newest task start/continuation at top and oldest at bottom, even when updatedAt differs',
+      < workingSortRows.findIndex((line) => line.includes('render-work-new')),
+    'working section sorts newest start/continuation/activity at top and oldest at bottom',
   );
 
   assert.ok(
@@ -214,7 +263,7 @@ try {
       ...process.env,
       MI_AGENT_RENDER_TEST: '1',
       MI_AGENT_RENDER_TEST_TASKS: jumpTasksPath,
-      MI_AGENT_RENDER_TEST_EVENTS: `down,reload:${jumpReloadPath},down`,
+      MI_AGENT_RENDER_TEST_EVENTS: `down,reload:${jumpReloadPath},up`,
       MI_AGENT_RENDER_TEST_ROWS: '14',
       MI_AGENT_RENDER_TEST_COLS: '80',
     },
@@ -225,7 +274,7 @@ try {
   const jumpFrames = JSON.parse(jumpResult.stdout).frames;
   assert.equal(jumpFrames[1].selectedTask, 'render-jump-b', 'first Down selects the second visible task');
   assert.equal(jumpFrames[2].selectedTask, 'render-jump-b', 'refresh/reorder preserves the selected logical task');
-  assert.equal(jumpFrames[3].selectedTask, 'render-jump-a', 'next Down follows the refreshed visible section order after preserving the selected logical task');
+  assert.equal(jumpFrames[3].selectedTask, 'render-jump-a', 'next Up follows the refreshed newest-first visible section order after preserving the selected logical task');
 
   const longActivitySessionPath = join(root, 'long-activity-session.jsonl');
   await writeFile(longActivitySessionPath, `${JSON.stringify({
@@ -330,6 +379,107 @@ try {
   assert.match(pasteFrame.status, /Reply to render-paste-target/);
   assert.ok(pasteVisible.includes('first line'), 'first pasted line remains in input');
   assert.ok(pasteVisible.includes('second line'), 'second pasted line remains in input');
+
+  const visualContractPath = join(root, 'visual-contract-tasks.json');
+  const visualContractReloadPath = join(root, 'visual-contract-reload.json');
+  await writeFile(visualContractPath, JSON.stringify([
+    { id: 'needs-old', name: 'render-needs-old-ct', status: 'paused', needsUser: true, needsUserReason: 'old needs input', notifiedNeedsUserAt: iso(1000), updatedAt: iso(9000) },
+    { id: 'needs-new', name: 'render-needs-new-ct', status: 'paused', needsUser: true, needsUserReason: 'new needs input', notifiedNeedsUserAt: iso(3000), updatedAt: iso(7000) },
+    { id: 'work-old', name: 'render-work-old-ct', status: 'running', startedAt: iso(1000), updatedAt: iso(8000) },
+    { id: 'work-new', name: 'render-work-new-ct', status: 'running', startedAt: iso(3000), updatedAt: iso(9000) },
+    { id: 'done-old', name: 'render-done-old-ct', status: 'complete', finishedAt: iso(1000), updatedAt: iso(11000), text: 'old done' },
+    { id: 'done-new', name: 'render-done-new-ct', status: 'complete', finishedAt: iso(3000), updatedAt: iso(5000), text: 'new done' },
+  ], null, 2));
+  await writeFile(visualContractReloadPath, JSON.stringify([
+    { id: 'work-old', name: 'render-work-old-ct', status: 'running', startedAt: iso(1000), continuedAt: iso(7000), updatedAt: iso(7000) },
+    { id: 'work-new', name: 'render-work-new-ct', status: 'paused', needsUser: true, needsUserReason: 'now needs input', notifiedNeedsUserAt: iso(9000), startedAt: iso(3000), updatedAt: iso(9000) },
+    { id: 'needs-old', name: 'render-needs-old-ct', status: 'complete', finishedAt: iso(10000), updatedAt: iso(10000), text: 'completed after reply' },
+    { id: 'needs-new', name: 'render-needs-new-ct', status: 'paused', needsUser: true, needsUserReason: 'still needs input', notifiedNeedsUserAt: iso(3000), updatedAt: iso(9500) },
+    { id: 'done-old', name: 'render-done-old-ct', status: 'complete', finishedAt: iso(1000), updatedAt: iso(11000), text: 'old done' },
+    { id: 'done-new', name: 'render-done-new-ct', status: 'complete', finishedAt: iso(3000), updatedAt: iso(5000), text: 'new done' },
+    { id: 'work-added', name: 'render-work-added-ct', status: 'running', startedAt: iso(11000), updatedAt: iso(11000) },
+  ], null, 2));
+  const visualContract = runRender(visualContractPath, `reload:${visualContractReloadPath}`, { rows: 24, now: iso(120000) });
+  const contractInitial = visualContract.frames[0];
+  assertVisibleOnce(contractInitial, ['render-needs-new-ct', 'render-needs-old-ct', 'render-work-new-ct', 'render-work-old-ct', 'render-done-new-ct', 'render-done-old-ct'], 'initial visual contract');
+  assertBefore(contractInitial, 'render-needs-new-ct', 'render-needs-old-ct', 'needs-input section is newest to oldest');
+  assertBefore(contractInitial, 'render-work-new-ct', 'render-work-old-ct', 'working section is newest to oldest');
+  assertBefore(contractInitial, 'render-done-new-ct', 'render-done-old-ct', 'completed section is newest to oldest');
+  const contractReload = visualContract.frames[1];
+  assertVisibleOnce(contractReload, ['render-work-new-ct', 'render-needs-new-ct', 'render-work-added-ct', 'render-work-old-ct', 'render-needs-old-ct'], 'reload visual contract');
+  assertBefore(contractReload, 'render-work-new-ct', 'render-needs-new-ct', 'task entering needs-input appears at top of needs-input section');
+  assertBefore(contractReload, 'render-work-added-ct', 'render-work-old-ct', 'newest working task appears before older working task after reload');
+  assertBefore(contractReload, 'render-needs-old-ct', 'render-done-new-ct', 'newest completed task appears before older completed task after section move');
+
+  const completedCapPath = join(root, 'completed-cap-tasks.json');
+  await writeFile(completedCapPath, JSON.stringify(Array.from({ length: 5 }, (_, index) => ({
+    id: `cap-${index + 1}`,
+    name: `render-done-cap-${index + 1}`,
+    status: 'complete',
+    finishedAt: iso((index + 1) * 1000),
+    updatedAt: iso((index + 1) * 1000),
+    text: `done ${index + 1}`,
+  })), null, 2));
+  const completedCap = runRender(completedCapPath, '', { rows: 18 });
+  const capRows = taskRows(completedCap.frames[0]).filter((line) => line.includes('render-done-cap-'));
+  assert.equal(capRows.length, 5, 'when selected section is completed, completed rows are not capped as disappearance');
+  assertBefore(completedCap.frames[0], 'render-done-cap-5', 'render-done-cap-4', 'completed cap fixture remains newest first');
+
+  const optimisticPath = join(root, 'optimistic-tasks.json');
+  const optimisticReloadPath = join(root, 'optimistic-reload.json');
+  await writeFile(optimisticPath, JSON.stringify([
+    { id: 'pending_same', name: 'render-optimistic-agent', status: 'queued', progress: '/new do it', lastInput: '/new do it', startedAt: iso(1000), updatedAt: iso(1000) },
+  ], null, 2));
+  await writeFile(optimisticReloadPath, JSON.stringify([
+    { id: 'real_same', name: 'render-optimistic-agent', sessionName: 'render-optimistic-agent', status: 'running', progress: 'real daemon row', lastInput: '/new do it', startedAt: iso(1000), updatedAt: iso(3000) },
+  ], null, 2));
+  const optimistic = runRender(optimisticPath, `reload:${optimisticReloadPath}`, { rows: 14 });
+  assert.equal(countTaskRows(optimistic.frames[1], 'render-optimistic-agent'), 1, 'optimistic pending row is replaced by daemon row instead of disappearing or duplicating');
+  assert.equal(optimistic.frames[1].selectedTask, 'render-optimistic-agent', 'selection follows optimistic row to daemon row');
+
+  const multiSelectPath = join(root, 'multi-select-tasks.json');
+  await writeFile(multiSelectPath, JSON.stringify([
+    { id: 'multi-a', name: 'render-multi-a', status: 'running', startedAt: iso(1000), updatedAt: iso(1000) },
+    { id: 'multi-b', name: 'render-multi-b', status: 'running', startedAt: iso(2000), updatedAt: iso(2000) },
+    { id: 'multi-c', name: 'render-multi-c', status: 'running', startedAt: iso(3000), updatedAt: iso(3000) },
+  ], null, 2));
+  const multi = runRender(multiSelectPath, 'ctrlM,space,down,space,ctrlC,ctrlM,space,escape', { rows: 18 });
+  assert.match(multi.frames[1].status, /0 selected/, 'Ctrl-M opens multi-select mode');
+  assert.ok(taskRows(multi.frames[2]).some((line) => /→\s*✓\s+render-multi-c/.test(line)), 'Space checks the selected row in multi-select mode');
+  assert.ok(taskRows(multi.frames[4]).some((line) => /✓\s+render-multi-b/.test(line)), 'Down then Space checks another row in multi-select mode');
+  assert.equal(countTaskRows(multi.frames[5], 'render-multi-c'), 1, 'Ctrl-C exits multi-select without clearing checked rows');
+  assert.equal(countTaskRows(multi.frames[8], 'render-multi-b'), 0, 'Esc clears checked rows in multi-select mode');
+  assert.equal(countTaskRows(multi.frames[8], 'render-multi-c'), 1, 'Esc only clears currently checked rows');
+  const thinking = runRender(multiSelectPath, 'shiftTab', { rows: 12 });
+  assert.match(thinking.frames[1].status, /Thinking level:/, 'Shift+Tab cycles thinking level and updates visible status');
+  assert.ok(visible(thinking.frames[1]).join('\n').includes(':'), 'Shift+Tab keeps model/thinking footer visible');
+
+  const resumeSessionsPath = join(root, 'resume-sessions.json');
+  await writeFile(resumeSessionsPath, JSON.stringify([
+    { id: 'resume-old', name: 'render-resume-old', source: 'pi-session', status: 'complete', sessionName: 'render-resume-old', updatedAt: iso(1000) },
+    { id: 'resume-new', name: 'render-resume-new', source: 'pi-session', status: 'complete', sessionName: 'render-resume-new', updatedAt: iso(3000), openPiSession: true },
+  ], null, 2));
+  const emptyTasksPath = join(root, 'empty-tasks.json');
+  await writeFile(emptyTasksPath, '[]');
+  const resume = runRender(emptyTasksPath, 'slash:/resume', { rows: 14, env: { MI_AGENT_RENDER_TEST_RESUME_SESSIONS: resumeSessionsPath } });
+  const resumeText = visible(resume.frames[1]).join('\n');
+  assert.ok(resumeText.includes('resume pi sessions'), 'resume picker renders its heading');
+  assert.ok(resumeText.includes('render-resume-new'), 'resume picker renders injected newest session');
+  assert.ok(resumeText.includes('render-resume-old'), 'resume picker renders injected older session');
+  assertBefore(resume.frames[1], 'render-resume-new', 'render-resume-old', 'resume picker sorts sessions newest to oldest');
+  assert.ok(taskRows(resume.frames[1]).some((line) => /→\s*✓\s+render-resume-new/.test(line)), 'resume picker preselects the open/newest session');
+  const resumeEmpty = runRender(emptyTasksPath, 'slash:/resume', { rows: 12, env: { MI_AGENT_RENDER_TEST_RESUME_SESSIONS: emptyTasksPath } });
+  assert.ok(visible(resumeEmpty.frames[1]).join('\n').includes('No pi sessions found'), 'resume picker renders empty state');
+  const resumeError = runRender(emptyTasksPath, 'slash:/resume', { rows: 12, env: { MI_AGENT_RENDER_TEST_RESUME_ERROR: 'render resume failed' } });
+  assert.match(resumeError.frames[1].status, /render resume failed/, 'resume picker render-test can cover load error state');
+
+  const chromeNormal = visible(contractInitial).join('\n');
+  assert.match(chromeNormal, /^mi agents/m, 'normal golden chrome has mi agents header');
+  assert.match(chromeNormal, /needs input[\s\S]*working[\s\S]*completed/, 'normal golden chrome keeps section order');
+  const chromeMulti = visible(multi.frames[2]).join('\n');
+  assert.match(chromeMulti, /0 selected|1 selected/, 'multi-select golden chrome shows selected count');
+  const chromeFull = visible(fullFrame).join('\n');
+  assert.match(chromeFull, /mi agents[\s\S]*next input[\s\S]*next task output/, 'full-output golden chrome keeps header, input, and output order');
 
   console.log('Mi agent render snapshot checks passed.');
 } finally {

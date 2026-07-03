@@ -1,3 +1,4 @@
+import { alwaysAskReason, matchDelegation, readDelegations } from './delegations.js';
 const risky = [
     /\bedit\b/i,
     /\bchange\b/i,
@@ -50,7 +51,19 @@ const inspectionActions = [
 function matchesAny(prompt, patterns) {
     return patterns.find((r) => r.test(prompt));
 }
+export async function classifyWithDelegations(prompt) {
+    const askReason = alwaysAskReason(prompt);
+    if (askReason)
+        return { mode: 'approval-required', reason: askReason };
+    const delegation = matchDelegation(prompt, await readDelegations());
+    if (delegation)
+        return { mode: 'delegated', reason: `Matched standing delegation: ${delegation.id}`, delegationId: delegation.id };
+    return classify(prompt);
+}
 export function classify(prompt) {
+    const askReason = alwaysAskReason(prompt);
+    if (askReason)
+        return { mode: 'approval-required', reason: askReason };
     const riskyHit = matchesAny(prompt, risky);
     if (riskyHit)
         return { mode: 'approval-required', reason: `Matched risky action pattern: ${riskyHit}` };

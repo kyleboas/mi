@@ -8,11 +8,11 @@ Product definition:
 assistant = instructions + trigger + tools + permissions
 ```
 
-Mi is not a DevOps platform, workflow builder, or repair bot. Its minimal proactive mode only notices, summarizes, and nudges:
+Mi is not a DevOps platform or generic repair bot. Its proactive mode is delegation-based:
 
-- pi starts when you ask.
+- pi starts when you ask or when a standing delegation permits a bounded worker.
 - Mi can check local signals and tell you what it noticed.
-- Proactive Mi does not act on its own.
+- Mi may act first only for reversible, scoped actions listed in `assistants/delegations.md`; everything else stays ask-first.
 
 ## Product layers
 
@@ -26,10 +26,12 @@ Builder changes are reviewable file changes. Runtime assistants should suggest i
 ## Safety model
 
 - Assistants are read-only by default.
-- Risky tools or permissions require approvals.
+- The three runtime modes are read-only, delegated, and approval-required.
+- Delegated actions must match `assistants/delegations.md`, stay within budget, verify their outcome, and report after acting.
+- Risky tools or permissions outside delegation require approvals.
 - Runtime assistants cannot silently rewrite their own `assistants/*.md` files.
 - Builder edits are reviewable file changes.
-- `pi.repair` is code-changing and must stay behind an approval gate.
+- `pi.repair` is code-changing and must stay behind a delegation or approval gate.
 
 ## Core primitives
 
@@ -108,6 +110,16 @@ Daemon behavior:
 - Stale busy session state does not overwrite a terminal stored task result when no live Mi worker exists.
 - Dismissed task/session keys are persisted.
 - Known noisy project-specific pi sessions can be excluded through code/configuration when needed.
+
+Visual ordering contract:
+
+- Sections always render in this order: `needs input`, `working`, `completed`.
+- Rows inside each section render newest to oldest.
+- Needs-input recency uses the needs-input transition time; working recency uses continue/update/activity/start time; completed recency uses finish time.
+- Selection follows the same logical task across refresh/reorder when that task still exists.
+- Tasks should not disappear unless the user clears/dismisses them or they are hidden by the completed-section cap.
+- The completed section shows the newest three rows unless the current selection is inside completed, in which case the completed section expands.
+- Default visual/e2e tests use fake daemon/pi state only; real pi or LLM smoke tests must be opt-in.
 
 ## Public-control safety
 

@@ -69,6 +69,16 @@ Supported scalar permission values for v0:
 - `true`
 - `false`
 
+## Capability grants
+
+Permissions describe what an assistant may ask to do. Runtime authority is projected as capability grants:
+
+- `file://...` with `read`, `write`, or `execute` rights.
+- `https://...` with `fetch` rights.
+- `secret://...` with `exchange` rights through an approved broker.
+
+A grant is tied to a principal, has constraints such as exact path or recursive prefix, and may expire. Scoped workers receive named profiles such as `chat-read`, `worker-read`, or `worker-write-scoped`; raw host `bash` is not in those profiles by default.
+
 ## Instructions
 
 The Markdown body is the assistant's instructions. It should include:
