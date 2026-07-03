@@ -418,7 +418,7 @@ export async function dailyBrief() {
 }
 const tacticsJournalRoot = process.env.MI_TACTICS_JOURNAL_ROOT || '/home/kyle/code/research';
 const tacticsHealthDir = process.env.MI_TACTICS_HEALTH_DIR || join(tacticsJournalRoot, '.logs');
-const tacticsHealthSteps = (process.env.MI_TACTICS_HEALTH_STEPS || 'ingest,detect,report,report-worker,tune,storage-prune')
+const tacticsHealthSteps = (process.env.MI_TACTICS_HEALTH_STEPS || 'ingest,detect,report,report-pr-queue-worker')
     .split(',')
     .map((step) => step.trim())
     .filter(Boolean);
@@ -447,15 +447,14 @@ async function writeMonitorHealthState(state) {
 function transitionFor(previous, current) {
     if (!previous?.status)
         return 'seed';
-    if (previous.status === current.status && previous.reason === current.reason && previous.detail === current.detail)
+    // detail carries volatile text (checked_at timestamps); only status/reason changes are real transitions
+    if (previous.status === current.status && previous.reason === current.reason)
         return 'unchanged';
     if (previous.status !== 'ok' && current.status === 'ok')
         return 'recovered';
     if (previous.status === 'ok' && current.status !== 'ok')
         return 'broken';
-    if (previous.status !== current.status)
-        return 'changed';
-    return 'changed-detail';
+    return 'changed';
 }
 function monitorLine(observation) {
     const suffix = observation.detail ? ` — ${truncateLine(observation.detail, 180)}` : '';
@@ -697,7 +696,7 @@ export async function configuredMonitorHealth() {
     return {
         message: lines.join('\n'),
         notify: true,
-        dedupeKey: `monitorHealth:${[...becameBroken, ...changedBroken, ...humanRequired, ...recovered].map((item) => `${item.id}:${item.status}:${item.reason}:${item.detail || ''}`).sort().join('|')}`,
+        dedupeKey: `monitorHealth:${[...becameBroken, ...changedBroken, ...humanRequired, ...recovered].map((item) => `${item.id}:${item.status}:${item.reason}`).sort().join('|')}`,
         repairName: firstRepairable ? `repair-${firstRepairable.id.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}` : undefined,
         repairPrompt: firstRepairable ? makeMonitorRepairPrompt(firstRepairable) : undefined,
     };
