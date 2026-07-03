@@ -89,10 +89,10 @@ assert.doesNotMatch(cli, /status = `Agent (?:model|tier)/, 'agent view does not 
 assert.match(cli, /async function applyAgentPiCycle\(text: string\)/, 'agent view supports pi-cycle model shortcuts for new tasks and replies');
 assert.match(cli, /async function runAgentSlashCommand\(value: string\)/, 'agent view supports slash commands in input');
 assert.match(cli, /const PI_SLASH_COMMANDS = \[[^\]]*'\/plan'[^\]]*'\/marker'[^\]]*'\/end'[^\]]*\]/, 'agent view autocompletes /plan, /marker, and /end');
-assert.match(cli, /const MI_BACKGROUND_SLASH_COMMANDS = new Set\(\['\/detect', '\/plan'\]\)/, 'agent view starts /plan as a native Mi background task instead of opening Pi');
+assert.match(cli, /const MI_BACKGROUND_SLASH_COMMANDS = new Set\(Object\.entries\(MI_COMMAND_CLASSIFICATIONS\)\.filter\(\(\[, info\]\) => info\.class === 'background-task'\)/, 'agent view starts background-task classified commands without opening Pi');
 assert.match(miAgentE2e, /\/plan is a full Mi agents workflow command[\s\S]*message === '\/plan design safe change'[\s\S]*message === 'what tests should cover this\?'[\s\S]*message === 'go implement that plan'/, 'mi agents e2e covers the full /plan workflow: start, refine, and go on the same worker');
-assert.match(cli, /const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set\(\['\/marker', '\/end'\]\)/, 'agent view handles /marker and /end natively');
-assert.match(cli, /async function sendNativeAgentSlashCommand\(value: string\)[\s\S]*const isMarker = command === '\/marker'[\s\S]*const waitForDone = command === '\/end'[\s\S]*status = isMarker \? 'Marker set' : 'Summarizing increment since marker…'[\s\S]*type: 'continue_worker'[\s\S]*background: !waitForDone[\s\S]*preserveStatus: true[\s\S]*if \(waitForDone\) status = 'Increment summarized and marker advanced'/, 'native task slash commands show extension status above input; /marker and /end preserve task state');
+assert.match(cli, /const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set\(Object\.entries\(MI_COMMAND_CLASSIFICATIONS\)\.filter\(\(\[, info\]\) => info\.class === 'worker-forward'\)/, 'agent view handles worker-forward slash commands natively');
+assert.match(cli, /async function sendNativeAgentSlashCommand\(value: string\)[\s\S]*const isMarker = command === '\/marker'[\s\S]*const waitForDone = command === '\/end'[\s\S]*Sending \$\{command\} to selected task[\s\S]*type: 'continue_worker'[\s\S]*background: !waitForDone[\s\S]*preserveStatus: true[\s\S]*if \(waitForDone\) status = 'Increment summarized and marker advanced'/, 'native task slash commands show extension status above input and preserve task state');
 assert.match(cli, /MI_NATIVE_AGENT_SLASH_COMMANDS\.has\(slashCommandName\(value\)\)[\s\S]*sendNativeAgentSlashCommand\(value\)/, 'runAgentSlashCommand dispatches native task slash commands');
 assert.doesNotMatch(cli, /else if \(data === 'n' \|\| data\.startsWith\('n'\)\)/, 'n no longer creates new tasks; use /new');
 assert.match(cli, /const name = explicitName \|\| taskNameFromPrompt\(turn\.body\)/, 'new task prompts get an automatic task name');
@@ -106,7 +106,8 @@ assert.match(cli, /agentSubmitting = true;[\s\S]*void sendTaskSocketRequest\(\{ 
 assert.match(cli, /Timed out waiting for Mi main[\s\S]*rm\(MI_SOCKET_PATH, \{ force: true \}\)/, 'cli removes stale Mi socket and restarts daemon on timeout');
 assert.match(cli, /agentEditor\.onSubmit = \(value\) => \{[\s\S]*void submitAgentInput\(\)/, 'agent input submits through the pi Editor onSubmit path');
 assert.match(cli, /value === '\/quit'[\s\S]*close\(\)/, 'agent view slash quit exits');
-assert.match(cli, /if \(value === '\/goal' \|\| value\.startsWith\('\/goal '\)\) return false;[\s\S]*await runSlashCommandInPi\(value\)/, 'agent view treats /goal as worker prompt text instead of opening pi');
+assert.match(cli, /'\/goal': \{ class: 'worker-forward'/, 'agent view classifies /goal as worker-forward');
+assert.match(cli, /MI_NATIVE_AGENT_SLASH_COMMANDS\.has\(slashCommandName\(value\)\)[\s\S]*sendNativeAgentSlashCommand\(value\)/, 'agent view forwards worker-forward commands to selected worker');
 assert.match(cli, /let btwAnswer = ''/, 'agent view stores /mi answers for display');
 assert.match(cli, /let miChatTask: MiTask \| undefined/, 'agent view tracks the active /mi chat task');
 assert.match(cli, /async function askMiAboutTask\(task: MiTask, question: string\)[\s\S]*sendToMiMain\(\[[\s\S]*Selected task context:/, 'agent view /mi uses Mi main to answer only about selected task context');
@@ -117,7 +118,8 @@ assert.doesNotMatch(cli, /value\.startsWith\('\/mi'\)[\s\S]*askMi\('main', quest
 assert.match(cli, /if \(!fullLastOutput && btwAnswer\) \{[\s\S]*fgAccent\(truncateText\('mi', width\)\)[\s\S]*renderPiAssistantMessage\(btwAnswer, width\)/, 'agent view renders /mi answer with pi assistant component');
 assert.match(cli, /inputMode === 'mi-chat' && data === '\\x1b'[\s\S]*requestRender\(\);\n          return;/, 'Esc does not leave /mi chat mode');
 assert.match(cli, /const wasMiChat = inputMode === 'mi-chat'[\s\S]*status = wasMiChat \|\| data === '\\x1b' \? defaultAgentStatus : 'Use \/quit to exit'/, 'Ctrl-C leaves /mi chat mode without exiting mi agents');
-assert.match(cli, /async function runSlashCommandInPi\(value: string\)[\s\S]*openPi\(\['--session', task\.sessionFile, value\]/, 'agent view delegates non-Mi pi slash commands to real pi for selected sessions');
+assert.doesNotMatch(cli, /async function runSlashCommandInPi\(value: string\)/, 'agent view does not have a default open-Pi slash fallback');
+assert.match(cli, /Unknown command \$\{slashCommandName\(value\)\}; run mi pi-commands --json to classify it/, 'agent view reports unknown slash commands instead of opening pi');
 assert.match(cli, /value\.startsWith\('\/new'\)/, 'agent view keeps /new as Mi background task creation');
 assert.match(cli, /value === '\/resume' \|\| value\.startsWith\('\/resume '\)[\s\S]*openResumeMenu\(\)/, 'agent view opens a Mi resume picker for /resume');
 assert.match(cli, /async function listResumeSessions\(\)[\s\S]*type: 'list_pi_sessions'/, 'resume picker lists pi sessions from the daemon');
@@ -132,7 +134,7 @@ assert.match(cli, /if \(matchesKey\(data, 'ctrl\+c'\)\) \{[\s\S]*if \(resumeMode
 assert.match(cli, /if \(data === '\\x03' && !resumeMode\)/, 'Ctrl-C is handled by non-resume input mode when /resume is closed');
 assert.match(cli, /function preferredResumeSessionIndex\(sessions: MiTask\[\]\)[\s\S]*openPiSession/, 'resume picker preselects the currently open Pi session when available');
 assert.match(cli, /if \(resumeMultiSelectMode\) void addSelectedResumeSessions/, 'resume picker handles Enter in multi-select mode');
-assert.doesNotMatch(cli, /const task = replyTarget \|\| selectedTask\(\)[\s\S]*type: 'continue_worker'[\s\S]*useGoal: '0'/, 'agent view no longer approximates pi slash commands through worker RPC');
+assert.doesNotMatch(cli, /useGoal: '0'/, 'agent view no longer approximates pi slash commands through legacy worker RPC flags');
 assert.match(cli, /taskId = task\.id \|\| task\.sessionFile \|\| task\.sessionName \|\| task\.name/, 'agent view can reply to discovered session tasks by session file');
 assert.match(cli, /const pendingTaskUpdates = new Map<string, Partial<MiTask>>\(\)/, 'agent view tracks pending task updates during async replies');
 assert.match(cli, /function taskIdentityKeys\(task: MiTask\)[\s\S]*task\.sessionId[\s\S]*sessionFingerprint\(task\)[\s\S]*task\.actualSessionFile/, 'agent view builds hard task identity keys to catch partial duplicate rows');

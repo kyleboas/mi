@@ -7,7 +7,7 @@ import { fuzzyFilter, truncateToWidth, visibleWidth } from '@mariozechner/pi-tui
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { createInterface } from 'node:readline/promises';
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -70,6 +70,7 @@ Usage:
   mi temp <title>                 Create/open a temporary conversation
   mi compact [thread]             Compact old read messages in a thread
   mi agents                       Open mi agents live background agent view
+  mi pi-commands --json           List Pi slash commands and Mi agents dispatch classes
   mi check                        Run one proactive Mi check-in
   mi check health-check           Check configured monitors and repair only stale/degraded ones
   mi check question               Ask one dynamic project or goal question
@@ -1375,6 +1376,14 @@ async function miAgentsCommand() {
         status = `Thinking level: ${agentThinkingLevel}`;
         requestRender();
     }
+    function logRenderTestDispatch(entry) {
+        const path = process.env.MI_AGENT_RENDER_TEST_DISPATCH_LOG;
+        if (!renderTestMode || !path)
+            return false;
+        appendFileSync(path, `${JSON.stringify(entry)}
+`);
+        return true;
+    }
     async function sendNativeAgentSlashCommand(value) {
         const task = replyTarget || selectedTask();
         if (!task) {
@@ -1393,8 +1402,14 @@ async function miAgentsCommand() {
         const waitForDone = command === '/end';
         const taskKey = stableTaskKey(task);
         agentSubmitting = true;
-        status = isMarker ? 'Marker set' : 'Summarizing increment since marker…';
+        status = isMarker ? 'Marker set' : waitForDone ? 'Summarizing increment since marker...' : `Sending ${command} to selected task...`;
         requestRender();
+        if (logRenderTestDispatch({ class: 'worker-forward', command, taskId, message: value })) {
+            agentSubmitting = false;
+            status = isMarker ? 'Marker set' : waitForDone ? 'Increment summarized and marker advanced' : `Sent ${command} to selected task`;
+            requestRender();
+            return;
+        }
         void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: value, model: agentModelWithThinking(), background: !waitForDone, preserveStatus: true }, waitForDone ? 120000 : 30000)
             .then(async () => {
             if (taskKey) {
@@ -1406,6 +1421,8 @@ async function miAgentsCommand() {
                 status = 'Increment summarized and marker advanced';
             else if (isMarker)
                 status = 'Marker set';
+            else
+                status = `Sent ${command} to selected task`;
             setTimeout(() => void refresh(), 250);
         })
             .catch((error) => {
@@ -1419,8 +1436,6 @@ async function miAgentsCommand() {
     }
     async function runAgentSlashCommand(value) {
         if (!value.startsWith('/'))
-            return false;
-        if (value === '/goal' || value.startsWith('/goal '))
             return false;
         if (value === '/quit') {
             close();
@@ -1520,12 +1535,17 @@ async function miAgentsCommand() {
             await sendNativeAgentSlashCommand(value);
             return true;
         }
+        if (MI_HEADLESS_SLASH_COMMANDS.has(slashCommandName(value))) {
+            await runHeadlessAgentSlashCommand(value);
+            return true;
+        }
         if (MI_BLOCKED_PI_SLASH_COMMANDS.has(slashCommandName(value))) {
-            status = `${slashCommandName(value)} is a Pi app command; open Pi directly to use it.`;
+            status = `${slashCommandName(value)} is a Pi app command; use /open to enter Pi if needed.`;
             requestRender();
             return true;
         }
-        await runSlashCommandInPi(value);
+        status = `Unknown command ${slashCommandName(value)}; run mi pi-commands --json to classify it.`;
+        requestRender();
         return true;
     }
     function preferredResumeSessionIndex(sessions) {
@@ -1878,6 +1898,13 @@ async function miAgentsCommand() {
         status = `Starting ${value} in background...`;
         agentSubmitting = true;
         requestRender(true);
+        if (logRenderTestDispatch({ class: 'background-task', command: slashCommandName(value), name, cwd: HOME, message: value })) {
+            agentSubmitting = false;
+            optimisticTask.status = 'running';
+            status = `Started ${value}.`;
+            requestRender(true);
+            return;
+        }
         void sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: value, lastInput: value, background: true }, 30000)
             .then(async (result) => {
             optimisticTask.id = result.taskId || optimisticTask.id;
@@ -1900,11 +1927,72 @@ async function miAgentsCommand() {
             requestRender(true);
         });
     }
-    async function runSlashCommandInPi(value) {
+    function collectHeadlessPiText(stdout, stderr) {
+        let text = '';
+        for (const line of stdout.split('\n')) {
+            if (!line.trim())
+                continue;
+            try {
+                const event = JSON.parse(line);
+                if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta')
+                    text += event.assistantMessageEvent.delta || '';
+                else if (event.type === 'message_end' && event.message?.errorMessage && !text)
+                    text += event.message.errorMessage;
+                else if (event.type === 'error' && event.error && !text)
+                    text += String(event.error);
+            }
+            catch {
+                if (!text)
+                    text += `${line}\n`;
+            }
+        }
+        return String(redactSecrets((text || stderr || 'pi completed with no output').trim()));
+    }
+    async function runHeadlessPiCommand(args, cwd) {
+        return await new Promise((resolve, reject) => {
+            const child = spawn(process.env.PI_CMD || 'pi', args, { cwd, env: process.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+            let stdout = '';
+            let stderr = '';
+            const timer = setTimeout(() => {
+                child.kill('SIGTERM');
+                resolve({ text: collectHeadlessPiText(stdout, `${stderr}\nTimed out after 120s`) });
+            }, 120000);
+            child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+            child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+            child.on('error', (error) => { clearTimeout(timer); reject(error); });
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                const text = collectHeadlessPiText(stdout, stderr);
+                if (code === 0)
+                    resolve({ text });
+                else
+                    reject(new Error(text || `pi exited ${code}`));
+            });
+        });
+    }
+    async function runHeadlessAgentSlashCommand(value) {
         const task = replyTarget || selectedTask();
-        if (task?.sessionFile)
-            return openPi(['--session', task.sessionFile, value], task.cwd || HOME);
-        return openPi([value], HOME);
+        const cwd = task?.cwd || HOME;
+        const args = ['--mode', 'json', value];
+        status = `Running ${slashCommandName(value)}...`;
+        agentSubmitting = true;
+        requestRender();
+        if (logRenderTestDispatch({ class: 'headless-exec', command: slashCommandName(value), args, cwd })) {
+            agentSubmitting = false;
+            status = `${slashCommandName(value)} completed`;
+            requestRender(true);
+            return;
+        }
+        void runHeadlessPiCommand(args, cwd)
+            .then((result) => {
+            status = result.text || `${slashCommandName(value)} completed`;
+            if (task) {
+                task.progress = status;
+                task.updatedAt = new Date().toISOString();
+            }
+        })
+            .catch((error) => { status = error instanceof Error ? error.message : String(error); })
+            .finally(() => { agentSubmitting = false; requestRender(true); });
     }
     async function submitAgentInput() {
         const value = inputBuffer.trim();
@@ -2451,6 +2539,7 @@ async function miAgentsCommand() {
             else if (event.startsWith('slash:')) {
                 setAgentInput(event.slice('slash:'.length));
                 await submitAgentInput();
+                await new Promise((resolve) => setTimeout(resolve, Number(process.env.MI_AGENT_RENDER_TEST_SLASH_WAIT_MS || 1000)));
             }
             else if (event.startsWith('reload:')) {
                 const previouslySelectedTask = selectedTask();
@@ -2900,7 +2989,7 @@ function renderPiLastOutputMessage(text, width) {
 function renderMiTranscriptItem(item, width) {
     return item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiAssistantMessage(item.text, width);
 }
-const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/export', '/import', '/share', '/copy', '/name', '/session', '/fork', '/clone', '/tree', '/new', '/plan', '/compact', '/marker', '/end', '/resume', '/open', '/quit', '/mi'];
+const PI_SLASH_COMMANDS = ['/model', '/scoped-models', '/new', '/plan', '/detect', '/council', '/codex', '/grilling', '/loop-me', '/marker', '/end', '/goal', '/todos', '/caveman', '/cycle-models', '/auto', '/cd', '/rtk', '/tasks', '/linear-status', '/pushover-test', '/pushover-config', '/secret', '/secret-export', '/push', '/restart', '/browser-reset', '/resume', '/open', '/quit', '/mi'];
 const PI_SLASH_COMMAND_DESCRIPTIONS = {
     '/settings': 'Open settings menu',
     '/model': 'Select Mi model',
@@ -3005,10 +3094,53 @@ async function getModelAutocompleteItems(argumentPrefix) {
         description: model.provider,
     }));
 }
-const MI_LOCAL_SLASH_COMMANDS = new Set(['/new', '/mi', '/quit', '/resume', '/open', '/model', '/scoped-models']);
-const MI_BACKGROUND_SLASH_COMMANDS = new Set(['/detect', '/plan']);
-const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set(['/marker', '/end']);
-const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(['/settings', '/login', '/logout', '/reload', '/hotkeys', '/changelog']);
+const MI_COMMAND_CLASSIFICATIONS = {
+    '/new': { class: 'native-mi', description: 'Start a new Mi background agent' },
+    '/mi': { class: 'native-mi', description: 'Chat with Mi about the selected task' },
+    '/quit': { class: 'native-mi', description: 'Quit mi agents' },
+    '/resume': { class: 'native-mi', description: 'Add an existing pi session as a task' },
+    '/open': { class: 'native-mi', description: 'Open the selected agent in Pi' },
+    '/model': { class: 'native-mi', description: 'Select Mi model' },
+    '/scoped-models': { class: 'native-mi', description: 'Enable/disable models for Ctrl+P cycling' },
+    '/marker': { class: 'worker-forward', description: 'Set the incremental-workflow marker in the selected task session' },
+    '/end': { class: 'worker-forward', description: 'Summarize the increment since the marker and advance it' },
+    '/goal': { class: 'worker-forward', description: 'Pass goal command to the selected task session' },
+    '/todos': { class: 'worker-forward', description: 'Pass todo checklist command to the selected task session' },
+    '/caveman': { class: 'worker-forward', description: 'Toggle caveman mode in the selected task session' },
+    '/cycle-models': { class: 'worker-forward', description: 'Cycle models in the selected task session' },
+    '/auto': { class: 'worker-forward', description: 'Run auto compaction/cost command in the selected task session' },
+    '/cd': { class: 'worker-forward', description: 'Change directory in the selected task session' },
+    '/rtk': { class: 'worker-forward', description: 'Run RTK command in the selected task session' },
+    '/detect': { class: 'background-task', description: 'Start a detection background task' },
+    '/plan': { class: 'background-task', description: 'Start a read-only planning background agent' },
+    '/council': { class: 'background-task', description: 'Start a council background task' },
+    '/codex': { class: 'background-task', description: 'Start a Codex background task' },
+    '/grilling': { class: 'background-task', description: 'Start a grilling background task' },
+    '/loop-me': { class: 'background-task', description: 'Start a loop capture background task' },
+    '/tasks': { class: 'headless-exec', description: 'Show task status from Pi headlessly' },
+    '/linear-status': { class: 'headless-exec', description: 'Show Linear status from Pi headlessly' },
+    '/pushover-test': { class: 'headless-exec', description: 'Run Pushover test from Pi headlessly' },
+    '/pushover-config': { class: 'headless-exec', description: 'Show Pushover config status from Pi headlessly' },
+    '/secret': { class: 'headless-exec', description: 'Run secret broker command from Pi headlessly' },
+    '/secret-export': { class: 'headless-exec', description: 'Export secret metadata from Pi headlessly' },
+    '/push': { class: 'headless-exec', description: 'Run push command from Pi headlessly' },
+    '/restart': { class: 'headless-exec', description: 'Run restart command from Pi headlessly' },
+    '/browser-reset': { class: 'headless-exec', description: 'Reset browser state from Pi headlessly' },
+    '/settings': { class: 'blocked', description: 'Pi app settings UI; use Pi directly' },
+    '/login': { class: 'blocked', description: 'Pi auth UI; use Pi directly' },
+    '/logout': { class: 'blocked', description: 'Pi auth UI; use Pi directly' },
+    '/reload': { class: 'blocked', description: 'Pi app reload command; use Pi directly' },
+    '/hotkeys': { class: 'blocked', description: 'Pi hotkeys UI; use Pi directly' },
+    '/changelog': { class: 'blocked', description: 'Pi changelog UI; use Pi directly' },
+};
+const MI_LOCAL_SLASH_COMMANDS = new Set(Object.entries(MI_COMMAND_CLASSIFICATIONS).filter(([, info]) => info.class === 'native-mi').map(([command]) => command));
+const MI_BACKGROUND_SLASH_COMMANDS = new Set(Object.entries(MI_COMMAND_CLASSIFICATIONS).filter(([, info]) => info.class === 'background-task').map(([command]) => command));
+const MI_NATIVE_AGENT_SLASH_COMMANDS = new Set(Object.entries(MI_COMMAND_CLASSIFICATIONS).filter(([, info]) => info.class === 'worker-forward').map(([command]) => command));
+const MI_HEADLESS_SLASH_COMMANDS = new Set(Object.entries(MI_COMMAND_CLASSIFICATIONS).filter(([, info]) => info.class === 'headless-exec').map(([command]) => command));
+const MI_BLOCKED_PI_SLASH_COMMANDS = new Set(Object.entries(MI_COMMAND_CLASSIFICATIONS).filter(([, info]) => info.class === 'blocked').map(([command]) => command));
+for (const [command, info] of Object.entries(MI_COMMAND_CLASSIFICATIONS)) {
+    PI_SLASH_COMMAND_DESCRIPTIONS[command] ||= info.description;
+}
 function slashCommandName(value) {
     return value.match(/^\/\S+/)?.[0] || '';
 }
@@ -3024,10 +3156,12 @@ function createPiSlashAutocompleteProvider(commands = PI_SLASH_COMMANDS) {
     const baseProvider = new CombinedAutocompleteProvider(slashCommands, process.cwd());
     return {
         async getSuggestions(lines, cursorLine, cursorCol, options) {
-            const resourceCommands = getCachedPiResourceSlashCommands(process.cwd());
+            const resourceCommands = getCachedPiResourceSlashCommands(process.cwd())
+                .filter((command) => Boolean(MI_COMMAND_CLASSIFICATIONS[`/${command.name}`]));
             if (resourceCommands.length === 0)
                 return baseProvider.getSuggestions(lines, cursorLine, cursorCol, options);
-            return new CombinedAutocompleteProvider([...slashCommands, ...resourceCommands], process.cwd()).getSuggestions(lines, cursorLine, cursorCol, options);
+            const known = new Set(slashCommands.map((command) => command.name));
+            return new CombinedAutocompleteProvider([...slashCommands, ...resourceCommands.filter((command) => !known.has(command.name))], process.cwd()).getSuggestions(lines, cursorLine, cursorCol, options);
         },
         applyCompletion: baseProvider.applyCompletion.bind(baseProvider),
         shouldTriggerFileCompletion: baseProvider.shouldTriggerFileCompletion?.bind(baseProvider),
@@ -4069,6 +4203,44 @@ async function launchPiMain(args) {
         });
     });
 }
+async function piCommandsCommand(args) {
+    const json = args.includes('--json');
+    const commands = await loadPiCommandInventory(process.cwd());
+    if (json) {
+        console.log(JSON.stringify(commands, null, 2));
+        return;
+    }
+    for (const command of commands) {
+        console.log(`/${command.name}	${command.classification || 'unclassified'}	${command.source || ''}	${command.description || ''}`);
+    }
+}
+async function loadPiCommandInventory(cwd = process.cwd()) {
+    const resources = await loadPiResourceSlashCommands(cwd);
+    const builtin = PI_SLASH_COMMANDS.map((command) => ({
+        name: command.replace(/^\//, ''),
+        source: 'pi-builtin-or-mi',
+        description: PI_SLASH_COMMAND_DESCRIPTIONS[command] || '',
+    }));
+    const byName = new Map();
+    for (const rawCommand of [...builtin, ...resources]) {
+        const command = rawCommand;
+        const slashName = `/${command.name}`;
+        byName.set(command.name, {
+            name: command.name,
+            slash: slashName,
+            source: command.source || command.sourceInfo?.source || command.sourceInfo?.scope || (command.description?.match(/^\[([^\]]+)\]/)?.[1]) || 'pi-extension',
+            description: command.description || PI_SLASH_COMMAND_DESCRIPTIONS[slashName] || '',
+            classification: MI_COMMAND_CLASSIFICATIONS[slashName]?.class || null,
+            blockedReason: MI_COMMAND_CLASSIFICATIONS[slashName]?.class === 'blocked' ? MI_COMMAND_CLASSIFICATIONS[slashName]?.description : undefined,
+        });
+    }
+    for (const [slashName, info] of Object.entries(MI_COMMAND_CLASSIFICATIONS)) {
+        const name = slashName.replace(/^\//, '');
+        if (!byName.has(name))
+            byName.set(name, { name, slash: slashName, source: 'mi-classification', description: info.description, classification: info.class, blockedReason: info.class === 'blocked' ? info.description : undefined });
+    }
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
 async function cronCommand(args) {
     const subcommand = args[0] || 'list';
     if (subcommand === 'list') {
@@ -4156,6 +4328,8 @@ async function main() {
         return compactCommand(args);
     if (command === 'agents')
         return miAgentsCommand();
+    if (command === 'pi-commands')
+        return piCommandsCommand(args);
     if (command === 'tick')
         return tickCommand();
     if (command === 'status')

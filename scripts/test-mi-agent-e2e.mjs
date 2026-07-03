@@ -227,10 +227,11 @@ requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolea
 assert.ok(requests.some((request) => request.type === 'list_pi_sessions'), '/resume should open the pi-session picker');
 assert.ok(requests.some((request) => request.type === 'resume_session' && ['pi-session-old', 'pi-session-two'].includes(request.id)), 'CR Enter should add the selected pi session as a task, not enter multi-select');
 
-// Other pi slash commands should be delegated to real pi with the selected session.
-await runAgentsAndSend('/session\r', async () => (await readFile(piLog, 'utf8').catch(() => '')).includes('/session'));
-piCalls = (await readFile(piLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-assert.deepEqual(piCalls.at(-1), ['--session', sessionFile, '/session']);
+// Unclassified pi slash commands should not open interactive pi; /open is the only intentional Pi escape hatch.
+await writeFile(piLog, '');
+await runAgentsAndSend('/session\r', async (stdout) => stripAnsi(stdout).includes('Unknown command /session'));
+piCalls = (await readFile(piLog, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean);
+assert.equal(piCalls.length, 0, 'unclassified slash commands should not spawn pi');
 
 // /new is intentionally a mi agents command and must not be delegated to pi.
 await writeFile(piLog, '');
