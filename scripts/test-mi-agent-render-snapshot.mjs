@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { visibleWidth } from '@mariozechner/pi-tui';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -68,6 +69,19 @@ try {
     assert.ok(rowIndex(frame, first) >= 0, `${message}: missing ${first}`);
     assert.ok(rowIndex(frame, second) >= 0, `${message}: missing ${second}`);
     assert.ok(rowIndex(frame, first) < rowIndex(frame, second), message);
+  };
+  const assertFrameFits = (frame, width, height, message = frame.event) => {
+    assert.equal(frame.lines.length, height, `${message}: frame height should match terminal rows`);
+    for (const [index, rawLine] of frame.lines.entries()) {
+      const line = stripAnsi(rawLine);
+      assert.ok(visibleWidth(line) <= width, `${message}: line ${index + 1} exceeds ${width} columns: ${JSON.stringify(line)}`);
+    }
+    const text = visible(frame).join('\n');
+    assert.match(text, /mi agents/, `${message}: header remains visible`);
+    assert.ok(visible(frame).some((line) => line.includes('openai-codex/gpt-5.5')), `${message}: footer/model remains visible`);
+  };
+  const assertAllFramesFit = (snapshot, message) => {
+    for (const frame of snapshot.frames) assertFrameFits(frame, snapshot.width, snapshot.height, `${message} ${frame.event}`);
   };
   const runRender = (fixture, events = '', options = {}) => {
     const result = spawnSync(process.execPath, ['node_modules/.bin/tsx', 'src/cli.ts', 'agents'], {
@@ -480,6 +494,48 @@ try {
   assert.match(chromeMulti, /0 selected|1 selected/, 'multi-select golden chrome shows selected count');
   const chromeFull = visible(fullFrame).join('\n');
   assert.match(chromeFull, /mi agents[\s\S]*next input[\s\S]*next task output/, 'full-output golden chrome keeps header, input, and output order');
+
+  const sizeMatrixTasksPath = join(root, 'size-matrix-tasks.json');
+  const sizeMatrixTasks = [
+    { id: 'size-needs', name: 'render-size-needs', status: 'paused', needsUser: true, needsUserReason: 'reply needed', progress: 'needs reply', updatedAt: iso(1000) },
+    { id: 'size-work', name: 'render-size-work', status: 'running', progress: 'working '.repeat(120), startedAt: iso(2000), updatedAt: iso(2000) },
+    { id: 'size-done', name: 'render-size-done', status: 'complete', text: 'done output', finishedAt: iso(3000), updatedAt: iso(3000) },
+  ];
+  await writeFile(sizeMatrixTasksPath, JSON.stringify(sizeMatrixTasks, null, 2));
+  for (const [cols, rows] of [[80, 20], [80, 24], [120, 40], [200, 50], [40, 10], [20, 8]]) {
+    const matrix = runRender(sizeMatrixTasksPath, 'pageDown,pageUp,slash:/definitely-unknown', { cols, rows });
+    assertAllFramesFit(matrix, `size ${cols}x${rows}`);
+    assert.ok(matrix.frames.some((frame) => visible(frame).some((line) => line.includes('→') || line.includes('No background agents'))), `size ${cols}x${rows}: selection or empty indicator visible`);
+  }
+
+  const stressTasksPath = join(root, 'stress-tasks.json');
+  const stressTasks = [
+    { id: 'stress-long', name: 'render-stress-long-line', status: 'running', progress: `long ${'x'.repeat(1200)}`, startedAt: iso(1000), updatedAt: iso(1000) },
+    { id: 'stress-ansi', name: 'render-stress-ansi', status: 'complete', text: '\u001b[31mred output\u001b[0m\nsecond line', finishedAt: iso(2000), updatedAt: iso(2000) },
+    { id: 'stress-wide', name: 'render-stress-wide-東京-e\u0301', status: 'paused', needsUser: true, needsUserReason: 'wide chars', progress: 'combining e\u0301 and CJK 東京', updatedAt: iso(200000), notifiedNeedsUserAt: iso(200000) },
+    { id: 'stress-empty-name', name: '', sessionName: '', status: 'complete', text: 'empty name output', finishedAt: iso(4000), updatedAt: iso(4000) },
+    ...Array.from({ length: 105 }, (_, index) => ({
+      id: `stress-many-${index}`,
+      name: `render-stress-many-${String(index).padStart(3, '0')}`,
+      status: index % 3 === 0 ? 'paused' : index % 3 === 1 ? 'running' : 'complete',
+      needsUser: index % 3 === 0,
+      needsUserReason: index % 3 === 0 ? 'needs input' : undefined,
+      progress: `progress ${index}`,
+      text: index % 3 === 2 ? `done ${index}` : undefined,
+      startedAt: iso(5000 + index),
+      updatedAt: iso(5000 + index),
+      finishedAt: index % 3 === 2 ? iso(6000 + index) : undefined,
+    })),
+  ];
+  await writeFile(stressTasksPath, JSON.stringify(stressTasks, null, 2));
+  const stress = runRender(stressTasksPath, 'pageDown,pageDown', { cols: 80, rows: 24 });
+  assertAllFramesFit(stress, 'stress content');
+  assert.ok(visible(stress.frames[0]).join('\n').includes('render-stress-wide'), 'stress fixture renders wide/combining task name');
+  assert.doesNotMatch(visible(stress.frames[0]).join('\n'), /\u001b\[[0-?]*[ -/]*$/, 'stress frame does not end with a partial ANSI escape');
+
+  const zero = runRender(emptyTasksPath, '', { cols: 40, rows: 10 });
+  assertAllFramesFit(zero, 'zero tasks');
+  assert.ok(visible(zero.frames[0]).join('\n').includes('No background agents'), 'zero-task empty state remains visible');
 
   console.log('Mi agent render snapshot checks passed.');
 } finally {
