@@ -29,6 +29,7 @@ const MI_DAEMON_LOCK_STALE_MS = Number(process.env.MI_DAEMON_LOCK_STALE_MS || 12
 const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_MS || 2000);
 const MI_DAEMON_IDLE_EXIT_MS = Number(process.env.MI_DAEMON_IDLE_EXIT_MS || 60000);
 const MI_TASK_DISCOVERY_DELAY_MS = Number(process.env.MI_TASK_DISCOVERY_DELAY_MS || 1500);
+const MI_STOPPED_SESSION_GRACE_MS = Number(process.env.MI_STOPPED_SESSION_GRACE_MS || 180000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const MI_WORKFLOWS_DIR = resolve(process.env.MI_WORKFLOWS_DIR || join(HOME, "workflows"));
 const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
@@ -518,26 +519,41 @@ async function listPiSessionTasks() {
     if (task) parsedTasks.push(task);
   }
   const openPiSessions = inferOpenPiSessions(parsedTasks, activeProcesses);
-  const tasks = parsedTasks.map((task) => {
-    const openPiSession = openPiSessions.get(task.sessionFile);
+  const tasks = [];
+  for (const task of parsedTasks) {
     const status = String(task.status || "").toLowerCase();
+    const working = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status);
+    let openFields;
+    const openPiSession = openPiSessions.get(task.sessionFile);
     if (openPiSession) {
-      const openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput, bridgeSocket: piBridgeSocketPath(task.actualSessionFile || task.sessionFile) };
-      if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) return { ...task, ...openFields, status: "running", finishedAt: undefined };
-      return { ...task, ...openFields };
+      openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput, bridgeSocket: piBridgeSocketPath(task.actualSessionFile || task.sessionFile) };
+    } else {
+      // The /proc scan only sees interactive pis on a pts; headless drivers
+      // (web-chat turns, TUI replies) are found through their bridge socket.
+      const bridge = await probeOpenPiBridge(task.actualSessionFile || task.sessionFile);
+      if (bridge) openFields = { openPiSession: true, openPiPid: bridge.pid, bridgeSocket: bridge.bridgeSocket };
     }
-    if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
-      return enrichTask({
+    if (openFields) {
+      tasks.push(working ? { ...task, ...openFields, status: "running", finishedAt: undefined } : { ...task, ...openFields });
+      continue;
+    }
+    if (working) {
+      if (await sessionFileRecentlyActive(task)) {
+        tasks.push({ ...task, status: "running", finishedAt: undefined });
+        continue;
+      }
+      tasks.push(enrichTask({
         ...task,
         status: "paused",
         needsUser: true,
         needsUserReason: stoppedPiNeedsInputReason(task),
         finishedAt: undefined,
         progress: task.progress || "stopped before final response; needs input",
-      });
+      }));
+      continue;
     }
-    return task;
-  });
+    tasks.push(task);
+  }
   piSessionTaskCache = { at: now, tasks };
   return tasks;
 }
@@ -632,6 +648,59 @@ function stoppedPiNeedsInputReason(task) {
   return `Pi session is no longer running and no final assistant response was recorded. ${context} Next: reply to this task with whether to continue, revise, or mark it done based on the session state.`;
 }
 
+const openPiBridgeProbeCache = new Map();
+
+async function probeOpenPiBridge(sessionFile) {
+  if (!sessionFile) return undefined;
+  const cached = openPiBridgeProbeCache.get(sessionFile);
+  if (cached && Date.now() - cached.at < 2500) return cached.result;
+  let result;
+  const socketPath = piBridgeSocketPath(sessionFile);
+  if (existsSync(socketPath)) {
+    try {
+      const health = await sendBridgeRequest(socketPath, { type: "health" }, 700);
+      if (health?.ok) result = { pid: Number(health.pid || 0) || undefined, bridgeSocket: socketPath };
+    } catch {}
+  }
+  openPiBridgeProbeCache.set(sessionFile, { at: Date.now(), result });
+  return result;
+}
+
+async function sessionFileRecentlyActive(task) {
+  const file = task?.actualSessionFile || task?.sessionFile;
+  let lastWriteMs = 0;
+  if (file) {
+    try { lastWriteMs = (await stat(file)).mtimeMs; } catch {}
+  }
+  if (!lastWriteMs) lastWriteMs = Date.parse(task?.lastEventAt || "") || 0;
+  return Date.now() - lastWriteMs < MI_STOPPED_SESSION_GRACE_MS;
+}
+
+// A busy session with no matching interactive pi process is not necessarily
+// stopped: web-chat turns, headless replies, and pis the /proc heuristic missed
+// still serve the per-session bridge socket, and a driver mid-turn keeps
+// appending to the session file. Treat the session as open when either signal
+// is present; only the caller's fallback may flag it "stopped, needs input".
+async function openPiSessionOverride(task) {
+  const bridge = await probeOpenPiBridge(task?.actualSessionFile || task?.sessionFile);
+  if (bridge) {
+    return {
+      ...task,
+      status: "running",
+      needsUser: false,
+      needsUserReason: undefined,
+      finishedAt: undefined,
+      openPiSession: true,
+      openPiPid: bridge.pid || task.openPiPid,
+      bridgeSocket: bridge.bridgeSocket,
+    };
+  }
+  if (await sessionFileRecentlyActive(task)) {
+    return { ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined };
+  }
+  return undefined;
+}
+
 function taskStatePreserveActive(task) {
   if (typeof task?.preservedStatus !== "string" || task.preservedStatus.length === 0) return false;
   const status = String(task?.status || "").toLowerCase();
@@ -676,7 +745,7 @@ function clearPreservedTaskState(task) {
   };
 }
 
-function reconcileStoredTask(task) {
+async function reconcileStoredTask(task) {
   task = withPreservedTaskState(task);
   if (task?.openPiPid && !existsSync(`/proc/${Number(task.openPiPid)}`)) {
     const { openPiSession, openPiPid, openPiInput, bridgeSocket, ...rest } = task;
@@ -684,9 +753,11 @@ function reconcileStoredTask(task) {
   }
   const status = String(task.status || "").toLowerCase();
   const working = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status);
+  const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
   if (working && !taskHasActiveWorker(task)) {
-    const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
     if (isPiSession && !task.openPiSession) {
+      const open = await openPiSessionOverride(task);
+      if (open) return open;
       return enrichTask({
         ...task,
         status: "paused",
@@ -702,6 +773,14 @@ function reconcileStoredTask(task) {
     // paused/needsUser. Do not infer "inactive" from a missing in-memory worker:
     // the daemon may have restarted, or a session scan may lag behind the worker.
     return { ...task, status: task.status || "running", finishedAt: undefined };
+  }
+  // Heal tasks previously flagged "stopped before replying" once their session
+  // proves alive again (bridge answers or the file is being written): the scan
+  // that flagged them could not see headless drivers, and the merge layer
+  // preserves stored paused state unless the task is marked open again.
+  if (isPiSession && status === "paused" && task.needsUser && /no longer running|stopped before replying/i.test(String(task.needsUserReason || ""))) {
+    const open = await openPiSessionOverride(task);
+    if (open) return open;
   }
   return task;
 }
@@ -833,7 +912,7 @@ function scheduleTaskDiscovery() {
 async function listAllTasks(options = {}) {
   const dismissed = await readDismissedTaskKeys();
   const rawTasks = await readTasks();
-  const reconciledRawTasks = rawTasks.map(reconcileStoredTask);
+  const reconciledRawTasks = await Promise.all(rawTasks.map(reconcileStoredTask));
   if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
   const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
   const hasStoredActiveTask = storedTasks.some((task) => !task.finishedAt && ["running", "waiting", "active", "queued", "thinking", "thinkingqueued"].includes(String(task.status || "").toLowerCase()));

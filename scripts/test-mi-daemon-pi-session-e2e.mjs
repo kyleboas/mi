@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,8 @@ const variantDir = join(sessionDir, 'variants');
 const fakePi = join(root, 'pi');
 let daemon;
 let interactivePi;
+let bridgeServer;
+let bridgeDriver;
 
 function startInteractivePiSession() {
   return spawn('script', ['-q', '-c', `${fakePi} -c 'while true; do sleep 1; done' pi --session ${sessionFile}`, '/dev/null'], {
@@ -102,6 +105,9 @@ try {
       MI_WORKER: '0',
       MI_PI_SESSION_SCAN_CACHE_MS: '0',
       MI_ACTIVE_PI_SESSION_WINDOW_MS: String(60_000),
+      // These steps assert the immediate paused flip after a driver dies;
+      // liveness via the per-session bridge socket is exercised separately below.
+      MI_STOPPED_SESSION_GRACE_MS: '0',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -233,9 +239,53 @@ try {
     assert.doesNotMatch(`${row.progress}\n${row.text || ''}`, /old final should not be current progress|should-not-be-final-output|private reasoning/, `${variant.name} leaked non-final activity`);
   }
 
+  // A busy session with no interactive pi process but a live per-session
+  // bridge socket is driven headlessly (web-chat turn, TUI reply); it must
+  // report running instead of flipping to needs-input.
+  const bridgeSessionId = '77777777-7777-4777-8777-777777777777';
+  const bridgeSessionFile = join(variantDir, `${bridgeSessionId}.jsonl`);
+  const bridgeSocketPath = join(runtime, 'pi-bridges', `${createHash('sha1').update(bridgeSessionFile).digest('hex')}.sock`);
+  await mkdir(join(runtime, 'pi-bridges'), { recursive: true });
+  bridgeDriver = spawn('sleep', ['300'], { stdio: 'ignore' });
+  bridgeServer = net.createServer((socket) => {
+    socket.on('error', () => undefined);
+    socket.on('data', () => socket.end(`${JSON.stringify({ ok: true, pid: bridgeDriver.pid, sessionFile: bridgeSessionFile })}\n`));
+  });
+  await new Promise((resolve, reject) => bridgeServer.listen(bridgeSocketPath, resolve).on('error', reject));
+  await writeVariantSession({
+    id: bridgeSessionId,
+    name: 'headless-with-bridge',
+    records: [
+      { type: 'message', message: { role: 'user', content: 'headless turn in flight' } },
+    ],
+  });
+  const bridgeBacked = await waitFor(async () => {
+    const response = await request({ type: 'list_tasks' });
+    const task = response.tasks?.find((entry) => entry.sessionFile === bridgeSessionFile || entry.sessionId === bridgeSessionId);
+    return task && String(task.status).toLowerCase() === 'running' && task.openPiSession ? task : undefined;
+  }, 'bridge-backed headless session to stay running');
+  assert.equal(bridgeBacked.needsUser, false);
+  assert.equal(bridgeBacked.needsUserReason, undefined);
+  assert.equal(bridgeBacked.openPiPid, bridgeDriver.pid, 'bridge health pid should be adopted');
+
+  // Once the driver dies and its bridge goes away, the same session flips
+  // to needs-input.
+  bridgeDriver.kill('SIGKILL');
+  await new Promise((resolve) => bridgeServer.close(resolve));
+  await rm(bridgeSocketPath, { force: true }).catch(() => undefined);
+  const bridgeStopped = await waitFor(async () => {
+    const response = await request({ type: 'list_tasks' });
+    const task = response.tasks?.find((entry) => entry.sessionFile === bridgeSessionFile || entry.sessionId === bridgeSessionId);
+    return task && String(task.status).toLowerCase() === 'paused' ? task : undefined;
+  }, 'bridge-backed session to need input after the bridge dies');
+  assert.equal(bridgeStopped.needsUser, true);
+  assert.match(bridgeStopped.needsUserReason, /Pi session is no longer running and no final assistant response was recorded/);
+
   console.log('mi daemon pi-session e2e passed');
 } finally {
   interactivePi?.kill('SIGTERM');
+  bridgeDriver?.kill('SIGKILL');
+  bridgeServer?.close();
   daemon?.kill('SIGTERM');
   await new Promise((resolve) => setTimeout(resolve, 200));
   if (!process.env.KEEP_TMP) await rm(root, { recursive: true, force: true });
