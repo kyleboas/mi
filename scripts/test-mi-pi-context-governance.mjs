@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+const source = await readFile(new URL('../pi/extensions/auto-compact-cost.ts', import.meta.url), 'utf8');
+assert.match(source, /export function decideToolResultOffload/);
+assert.match(source, /PI_OFFLOAD_MIN_CHARS/);
+assert.match(source, /offload-read-exempt/);
+assert.match(source, /export function microcompactMessages/);
+assert.match(source, /PI_MICROCOMPACT_KEEP_RECENT/);
+assert.match(source, /PI_OFFLOAD_MAX_MB/);
+assert.match(source, /hasSecretLikeContent/);
+assert.match(source, /pi\.on\("tool_result"/);
+assert.match(source, /return \{ content: \[\{ type: "text", text: decision\.excerpt \}\] \}/);
+assert.match(source, /pi\.on\("context"/);
+console.log('test-mi-pi-context-governance ok');

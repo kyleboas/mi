@@ -31,6 +31,9 @@ for file in mi.ts mi-daemon.mjs mi-capability-guard.ts; do
   if [ -f "$DEPLOY_DIR/$file" ]; then cp -p "$DEPLOY_DIR/$file" "$BACKUP_DIR/$file"; fi
 done
 install -m 600 pi/extensions/mi.ts "$DEPLOY_DIR/mi.ts"
+if [ -f pi/extensions/auto-compact-cost.ts ]; then
+  install -m 600 pi/extensions/auto-compact-cost.ts "$DEPLOY_DIR/auto-compact-cost.ts"
+fi
 install -m 700 pi/extensions/mi-daemon.mjs "$DEPLOY_DIR/mi-daemon.mjs"
 if [ -f pi/extensions/mi-capability-guard.ts ]; then
   install -m 600 pi/extensions/mi-capability-guard.ts "$DEPLOY_DIR/mi-capability-guard.ts"
