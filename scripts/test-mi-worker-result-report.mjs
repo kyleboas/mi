@@ -15,6 +15,7 @@ const socketPath = join(runtime, 'main.sock');
 const fakePi = join(root, 'fake-pi.mjs');
 const sessionFile = join(root, 'session.jsonl');
 const finalText = 'Worker final result posted to main chat.';
+const secondFinalText = 'Second run final result.';
 
 await mkdir(home, { recursive: true });
 await mkdir(runtime, { recursive: true });
@@ -33,7 +34,10 @@ rl.on('line', (line) => {
   if (request.type === 'set_session_name') sessionName = request.name || sessionName;
   if (request.type === 'prompt') {
     send({ type: 'response', id: request.id, success: true, data: { queued: true } });
-    setTimeout(() => send({ type: 'agent_end', messages: [{ role: 'assistant', content: ${JSON.stringify(finalText)} }] }), 25);
+    const message = String(request.message || '');
+    const slow = message.includes('slow');
+    const reply = message.includes('again') ? ${JSON.stringify(secondFinalText)} : ${JSON.stringify(finalText)};
+    setTimeout(() => send({ type: 'agent_end', messages: [{ role: 'assistant', content: reply }] }), slow ? 1500 : 25);
     return;
   }
   send({ type: 'response', id: request.id, success: true, data: { sessionFile, sessionId, sessionName, model } });
@@ -124,6 +128,36 @@ try {
   const task = tasks.find((entry) => entry.name === 'result-report-e2e');
   assert.equal(task.status, 'complete');
   assert.equal(task.text, finalText);
+
+  // A second run with the same name merges into the same row (sameLogicalTask
+  // matches on name+cwd). While it is starting/running it must not display
+  // the first run's output; upsertTask resets stale result fields on a fresh id.
+  const secondStarted = await socketRequest({
+    type: 'run_worker',
+    name: 'result-report-e2e',
+    cwd: home,
+    message: 'do the task again slow',
+    lastInput: 'do the task again slow',
+    background: true,
+  });
+  assert.equal(secondStarted.ok, true);
+  assert.match(secondStarted.text, /Started background task: result-report-e2e/);
+
+  const runningRow = await waitFor(async () => {
+    const rows = JSON.parse(await readFile(join(home, 'mi', 'state', 'tasks.json'), 'utf8'));
+    const row = rows.find((entry) => entry.name === 'result-report-e2e');
+    return row && row.id === secondStarted.taskId && String(row.status) === 'running' ? row : undefined;
+  });
+  assert.notEqual(runningRow.text, finalText, 'fresh run must not display the previous run output');
+  assert.ok(!runningRow.text, 'fresh run should start with no output text');
+  assert.ok(!runningRow.finishedAt, 'fresh run should not inherit finishedAt');
+
+  const secondDone = await waitFor(async () => {
+    const rows = JSON.parse(await readFile(join(home, 'mi', 'state', 'tasks.json'), 'utf8'));
+    const row = rows.find((entry) => entry.name === 'result-report-e2e');
+    return row && String(row.status) === 'complete' && row.text === secondFinalText ? row : undefined;
+  });
+  assert.equal(secondDone.id, secondStarted.taskId);
 
   console.log('mi worker result report e2e passed');
 } finally {

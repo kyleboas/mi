@@ -104,6 +104,10 @@ try {
       MI_SOCKET_PATH: socketPath,
       MI_WORKER: '0',
       MI_PI_SESSION_SCAN_CACHE_MS: '0',
+      // Also disable the idle-scan cache: several steps write session files
+      // while no interactive pi is running, and an idle cache hit would hide
+      // them from the scan for the whole cache window.
+      MI_IDLE_PI_SESSION_SCAN_CACHE_MS: '0',
       MI_ACTIVE_PI_SESSION_WINDOW_MS: String(60_000),
       // These steps assert the immediate paused flip after a driver dies;
       // liveness via the per-session bridge socket is exercised separately below.
@@ -141,11 +145,15 @@ try {
 
   interactivePi = startInteractivePiSession();
 
+  // Wait for the scan to actually detect the interactive pi and persist its
+  // real pid over the fixture's placeholder (this test process's pid, which
+  // stays alive all run). Killing before adoption leaves the stored row
+  // pointing at a live pid, so it could never flip to needs-input.
   const running = await waitFor(async () => {
     const response = await request({ type: 'list_tasks' });
     const task = response.tasks?.find((entry) => entry.sessionFile === sessionFile || entry.actualSessionFile === sessionFile || entry.sessionId === '11111111-1111-4111-8111-111111111111');
-    return task && String(task.status).toLowerCase() === 'running' ? task : undefined;
-  }, 'typed pi session to appear as running');
+    return task && String(task.status).toLowerCase() === 'running' && task.openPiPid && task.openPiPid !== process.pid ? task : undefined;
+  }, 'typed pi session to be detected as the live interactive pi');
   assert.equal(running.name, 'typed e2e task');
 
   interactivePi.kill('SIGTERM');
@@ -280,6 +288,25 @@ try {
   }, 'bridge-backed session to need input after the bridge dies');
   assert.equal(bridgeStopped.needsUser, true);
   assert.match(bridgeStopped.needsUserReason, /Pi session is no longer running and no final assistant response was recorded/);
+
+  // Regression: a task created while a slow list pass is mid-flight must not
+  // be clobbered by that pass's stale write-back (tasks flickering out of the
+  // list right after creation). The list request is deliberately left
+  // unawaited so its reconcile/merge overlaps the pi_session_event upsert.
+  for (let round = 0; round < 5; round += 1) {
+    const raceId = `88888888-8888-4888-8888-88888888888${round}`;
+    const raceFile = await writeVariantSession({
+      id: raceId,
+      name: `race-${round}`,
+      records: [{ type: 'message', message: { role: 'user', content: `race round ${round}` } }],
+    });
+    const inflightList = request({ type: 'list_tasks' });
+    await request({ type: 'pi_session_event', sessionFile: raceFile, sessionId: raceId, kind: 'user_message', text: `race round ${round}`, status: 'running' });
+    await inflightList;
+    const after = await request({ type: 'list_tasks' });
+    const raceRow = after.tasks?.find((entry) => entry.sessionId === raceId || entry.sessionFile === raceFile || entry.actualSessionFile === raceFile);
+    assert.ok(raceRow, `race round ${round}: freshly created task must survive a concurrent list write-back`);
+  }
 
   console.log('mi daemon pi-session e2e passed');
 } finally {

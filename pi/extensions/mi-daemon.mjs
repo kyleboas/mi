@@ -229,6 +229,18 @@ async function readTasks() {
   try { return JSON.parse(await readFile(TASKS_PATH, "utf8")); } catch { return []; }
 }
 
+// tasks.json is read-modified-written by concurrent socket handlers (list
+// reconcile/merge, worker upserts/heartbeats, dismiss). Without serialization a
+// slow list pass writes its stale snapshot over a task upserted meanwhile, so
+// fresh tasks flicker out of the list until the next heartbeat re-adds them.
+// Never acquire this inside a function that already holds it.
+let taskStoreQueue = Promise.resolve();
+function withTaskStore(fn) {
+  const run = taskStoreQueue.then(fn, fn);
+  taskStoreQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 async function readDismissedTaskKeys() {
   try {
     const text = await readFile(DISMISSED_TASKS_PATH, "utf8");
@@ -493,7 +505,12 @@ async function listPiSessionTasks() {
   if (now - piSessionTaskCache.at < PI_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const activeProcesses = await listActivePiProcesses();
   const idle = activeWorkers.size === 0 && activeProcesses.length === 0;
-  if (idle && now - piSessionTaskCache.at < PI_IDLE_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
+  // An idle cache hit may still hold rows claiming an open pi whose process
+  // has since died; serving them keeps a closed session "running" (and the
+  // merge layer trusts openPiSession) for up to the idle cache window. Rescan
+  // instead when any cached open row's pid is gone.
+  const cacheHasStaleOpenRow = piSessionTaskCache.tasks.some((task) => task.openPiSession && task.openPiPid && !existsSync(`/proc/${Number(task.openPiPid)}`));
+  if (idle && !cacheHasStaleOpenRow && now - piSessionTaskCache.at < PI_IDLE_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const files = await walkSessionFiles();
   const withStats = [];
   for (const file of files) {
@@ -910,10 +927,36 @@ function scheduleTaskDiscovery() {
 }
 
 async function listAllTasks(options = {}) {
+  return withTaskStore(() => listAllTasksLocked(options));
+}
+
+// A list pass takes long enough (session scans, /proc reads, bridge probes)
+// that tasks.json can be rewritten underneath it by external tools (tests,
+// manual repairs). Only persist this pass's derived view while the file still
+// matches what the pass read; otherwise skip the write — the next pass
+// reconciles the fresh contents instead of clobbering them with a stale
+// snapshot (which made freshly added tasks, or the whole list, disappear).
+async function writeTasksBackIfUnchanged(nextTasks, previousTasks, expectedText) {
+  if (JSON.stringify(previousTasks) === JSON.stringify(nextTasks)) return expectedText;
+  const currentText = await readFile(TASKS_PATH, "utf8").catch(() => "");
+  if (currentText !== expectedText) return undefined;
+  await writeTasks(nextTasks);
+  return JSON.stringify(nextTasks, null, 2);
+}
+
+async function listAllTasksLocked(options = {}) {
   const dismissed = await readDismissedTaskKeys();
-  const rawTasks = await readTasks();
+  let storeText = "";
+  let rawTasks = [];
+  try {
+    storeText = await readFile(TASKS_PATH, "utf8");
+    rawTasks = JSON.parse(storeText);
+  } catch {
+    storeText = "";
+    rawTasks = [];
+  }
   const reconciledRawTasks = await Promise.all(rawTasks.map(reconcileStoredTask));
-  if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
+  storeText = await writeTasksBackIfUnchanged(reconciledRawTasks, rawTasks, storeText);
   const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
   const hasStoredActiveTask = storedTasks.some((task) => !task.finishedAt && ["running", "waiting", "active", "queued", "thinking", "thinkingqueued"].includes(String(task.status || "").toLowerCase()));
   if (options.lazy !== false && PI_SESSION_SCAN_CACHE_MS !== 0 && activeWorkers.size === 0 && !hasStoredActiveTask) {
@@ -925,7 +968,7 @@ async function listAllTasks(options = {}) {
   // Anything that appears in mi agents should stay there until the user clears it.
   // Discovered/open pi sessions used to disappear after the recent-session window;
   // persist the merged view so refreshes and daemon restarts keep the task row.
-  if (JSON.stringify(reconciledRawTasks) !== JSON.stringify(mergedTasks)) await writeTasks(mergedTasks);
+  if (storeText !== undefined) await writeTasksBackIfUnchanged(mergedTasks, reconciledRawTasks, storeText);
   return mergedTasks;
 }
 
@@ -958,8 +1001,11 @@ async function dismissTask(request) {
   const match = [...tasks, ...sessions].find((task) => taskDismissKeys(task).some((key) => requested.includes(key)));
   const keys = new Set([...(await readDismissedTaskKeys()), ...requested, ...taskDismissKeys(match || {})]);
   await writeDismissedTaskKeys(keys);
-  const remaining = tasks.filter((task) => !isTaskDismissed(task, keys));
-  if (remaining.length !== tasks.length) await writeTasks(remaining);
+  await withTaskStore(async () => {
+    const current = await readTasks();
+    const remaining = current.filter((task) => !isTaskDismissed(task, keys));
+    if (remaining.length !== current.length) await writeTasks(remaining);
+  });
   piSessionTaskCache = { at: 0, tasks: [] };
   return { text: `Removed ${match?.sessionName || match?.name || requested[0]} from task list` };
 }
@@ -1024,7 +1070,11 @@ async function resumePiSessions() {
 
 async function writeTasks(tasks) {
   await mkdir(dirname(TASKS_PATH), { recursive: true });
-  await writeFile(TASKS_PATH, JSON.stringify(tasks, null, 2));
+  // Write-then-rename so a concurrent readTasks never sees a truncated file
+  // (a torn read parses as [] and blanks the whole task list).
+  const tmp = `${TASKS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, JSON.stringify(tasks, null, 2));
+  await rename(tmp, TASKS_PATH);
 }
 
 function extractPrUrls(text) {
@@ -1044,13 +1094,71 @@ function enrichTask(task) {
 }
 
 async function upsertTask(task) {
-  const tasks = await readTasks();
-  const taskIsPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
+  return withTaskStore(() => upsertTaskLocked(task));
+}
+
+async function upsertTaskLocked(task) {
+  // The store lock serializes daemon writers, but tasks.json can still be
+  // rewritten by external tools between this read and write. Re-apply the
+  // upsert on the fresh contents when that happens (last attempt wins).
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { merged, tasks, storeText } = await computeTaskUpsert(task);
+    const currentText = await readFile(TASKS_PATH, "utf8").catch(() => "");
+    if (attempt < 2 && currentText !== storeText) continue;
+    await writeTasks(tasks.slice(0, 200));
+    return merged;
+  }
+}
+
+async function computeTaskUpsert(task) {
+  let storeText = "";
+  let tasks = [];
+  try {
+    storeText = await readFile(TASKS_PATH, "utf8");
+    tasks = JSON.parse(storeText);
+  } catch {
+    storeText = "";
+    tasks = [];
+  }
   const index = tasks.findIndex((entry) => entry.id === task.id || sameLogicalTask(entry, task));
   const previous = index >= 0 ? tasks[index] : undefined;
   const nowIso = new Date().toISOString();
   const next = enrichTask({ ...task, updatedAt: nowIso });
-  const merged = index >= 0 ? enrichTask({ ...previous, ...next }) : next;
+  // A brand-new run (fresh id, starting status, no output yet) can land on an
+  // older row through the name/cwd heuristics in sameLogicalTask. Spreading
+  // over that row inherits the previous run's output, error, and session
+  // pointers, so the new task displays the last task's result and replies
+  // route into the old session. Reset those fields; the new run fills its own.
+  const startingFresh = Boolean(previous && task.id && previous.id && task.id !== previous.id
+    && ["running", "queued", "waiting"].includes(String(task.status || "").toLowerCase())
+    && !task.text);
+  const base = startingFresh
+    ? {
+      ...clearPreservedTaskState(previous),
+      text: undefined,
+      error: undefined,
+      prUrls: undefined,
+      progress: undefined,
+      finishedAt: undefined,
+      needsUser: undefined,
+      needsUserReason: undefined,
+      notifiedNeedsUserAt: undefined,
+      notifiedPausedAt: undefined,
+      continuedAt: undefined,
+      lastEventAt: undefined,
+      autoContinueAttempts: undefined,
+      transportRetries: undefined,
+      startedAt: undefined,
+      sessionFile: undefined,
+      actualSessionFile: undefined,
+      sessionId: undefined,
+      openPiSession: undefined,
+      openPiPid: undefined,
+      openPiInput: undefined,
+      bridgeSocket: undefined,
+    }
+    : previous;
+  const merged = index >= 0 ? enrichTask({ ...base, ...next }) : next;
   if (merged.needsUser && !previous?.needsUser) {
     merged.notifiedNeedsUserAt = nowIso;
   }
@@ -1066,8 +1174,7 @@ async function upsertTask(task) {
     return 2;
   };
   tasks.sort((a, b) => statusRank(a) - statusRank(b) || Date.parse(b.updatedAt || b.lastEventAt || b.finishedAt || b.startedAt || 0) - Date.parse(a.updatedAt || a.lastEventAt || a.finishedAt || a.startedAt || 0));
-  await writeTasks(tasks.slice(0, 200));
-  return merged;
+  return { merged, tasks, storeText };
 }
 
 function messageId(prefix = "msg") {
