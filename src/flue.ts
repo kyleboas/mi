@@ -286,6 +286,9 @@ async function runPersistentFlueChat(message: string, payload: string, timeoutMs
 }
 
 export async function runFlueChat(message: string): Promise<FlueChatResult> {
+  const { memorySystemBlock } = await import('./memory.js');
+  const memory = await memorySystemBlock().catch(() => '');
+  if (memory) message = `${memory}\n\n${message}`;
   const flueConfigured = Boolean(process.env.FLUE_URL || process.env.FLUE_CHAT_URL || process.env.FLUE_CMD || enabledFlag(process.env.FLUE_ENABLED));
   if (process.env.FLUE_ENABLED === 'false' || !flueConfigured) return runPiChat(message, process.env.FLUE_ENABLED === 'false' ? 'FLUE_ENABLED=false' : 'Flue not configured');
 

@@ -1,0 +1,32 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const root = await mkdtemp(join(tmpdir(), 'mi-memory-'));
+process.chdir(root);
+process.env.MI_ROOT = root;
+
+const { appendThreadMessage } = await import('../dist/src/threads.js');
+const { runDreamConsolidation, readMemory, readMemoryHistory, memoryPaths } = await import('../dist/src/memory.js');
+await appendThreadMessage('main', 'user', 'Kyle prefers short answers', { source: 'test' });
+let calls = 0;
+const flueChat = async () => ({ ok: true, source: 'test', reply: JSON.stringify({ entries: [{ ts: new Date().toISOString(), source: 'thread:main', summary: 'Kyle prefers short answers', refs: [] }], memory: '# Mi memory\n\n- Kyle prefers short answers.\n' }) });
+let result = await runDreamConsolidation({ force: true, flueChat });
+assert.equal(result.status, 'ok');
+assert.equal((await readMemory()).includes('short answers'), true);
+assert.equal((await readMemoryHistory(10)).length, 1);
+assert.ok(existsSync(join(memoryPaths().dir, '.git')), 'memory dir is git-versioned when git is available');
+await appendThreadMessage('main', 'user', 'A fake token sk-test-12345678901234567890 should be redacted', { source: 'test' });
+result = await runDreamConsolidation({ force: true, flueChat: async () => { calls++; return { ok: true, source: 'test', reply: JSON.stringify({ entries: [{ ts: new Date().toISOString(), source: 'thread:main', summary: 'redacted', refs: [] }], memory: '# Mi memory\n\nsecret sk-test-12345678901234567890\n' }) }; } });
+assert.equal(result.status, 'ok');
+assert.doesNotMatch(await readFile(memoryPaths().memory, 'utf8'), /sk-test-/);
+const before = await readFile(memoryPaths().cursor, 'utf8');
+await appendThreadMessage('main', 'user', 'This should not advance on parse failure', { source: 'test' });
+result = await runDreamConsolidation({ force: true, flueChat: async () => ({ ok: true, source: 'test', reply: 'not-json' }) });
+assert.equal(result.status, 'error');
+assert.equal(await readFile(memoryPaths().cursor, 'utf8'), before);
+process.env.MI_DREAM_ENABLED = 'false';
+assert.equal((await runDreamConsolidation()).status, 'skipped');
+console.log('test-mi-memory ok');
