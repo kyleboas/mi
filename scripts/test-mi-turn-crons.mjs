@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const root = await mkdtemp(join(tmpdir(), 'mi-turn-crons-'));
+process.chdir(root);
 process.env.HOME = root;
 process.env.MI_ROOT = root;
 process.env.FLUE_ENABLED = 'false';
