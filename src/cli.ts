@@ -23,6 +23,7 @@ import { readDelegations } from './delegations.js';
 import { acceptProposal, readProposalQueue, queuedProposals, resolveProposal } from './proposals.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import { runMiTick } from './tick.js';
+import { memoryPaths, readMemory, readMemoryHistory, runDreamConsolidation } from './memory.js';
 import { handleLoopDiscoverySelection, runLoopDiscovery } from './loop-discovery.js';
 import { decideLoopFactoryImplementation, handleLoopFactoryReply, loopFactoryStatus, runLoopFactoryCapture, runLoopFactoryDigest } from './loop-factory.js';
 import { approveAsCapability, readApprovals, resolveApproval, readRecentEvents, logEvent } from './state.js';
@@ -104,10 +105,14 @@ Usage:
   mi loop-factory decide <queue now|later|never> [candidate]
                                   Decide whether to queue a build-ready spec for implementation
   mi loop-factory status          Show Loop Factory candidate counts
+  mi memory show                  Show durable Mi memory
+  mi memory dream                 Force a dream consolidation run
+  mi memory log --limit N         Show recent memory history entries
   mi cron list                    List Mi reminder crons
   mi cron check                   Run due Mi cron jobs now
   mi cron remove <name>           Remove a Mi cron job
   mi cron add <name> (--every <1h>|--at <iso>) --message <text>
+  mi cron add <name> (--every <1h>|--at <iso>) --prompt <text> [--thread <id>]
   mi cron add <name> (--every <1h>|--at <iso>) [--cwd <path>] -- <command>  (legacy/deprecated)
   mi task <name> [--cwd <path>] -- <task prompt>
   mi task reply <task-id-or-name> -- <follow-up prompt>
@@ -4138,6 +4143,15 @@ async function launchPiMain(args: string[]) {
 }
 
 
+async function memoryCommand(args: string[]) {
+  const subcommand = args[0] || 'show';
+  if (subcommand === 'show') { console.log(await readMemory(Number.MAX_SAFE_INTEGER)); return; }
+  if (subcommand === 'dream') { console.log(JSON.stringify(await runDreamConsolidation({ force: true }), null, 2)); return; }
+  if (subcommand === 'log') { const limit = Number(argValue(args, '--limit') || args[1] || 20); for (const entry of await readMemoryHistory(limit)) console.log(JSON.stringify(entry)); return; }
+  if (subcommand === 'paths') { console.log(JSON.stringify(memoryPaths(), null, 2)); return; }
+  throw new Error(`unknown memory command: ${subcommand}`);
+}
+
 async function piCommandsCommand(args: string[]) {
   const json = args.includes('--json');
   const commands = await loadPiCommandInventory(process.cwd());
@@ -4190,7 +4204,8 @@ async function cronCommand(args: string[]) {
       const schedule = cron.every ? `every ${cron.every}` : `at ${cron.at}`;
       const status = cron.enabled ? 'enabled' : 'disabled';
       const last = cron.lastRunAt ? ` last=${cron.lastRunAt} ${cron.lastStatus || ''}`.trimEnd() : ' never-run';
-      console.log(`${cron.name}\t${status}\t${schedule}\t${last}`);
+      const kind = cron.prompt ? 'prompt' : cron.message ? 'message' : 'command';
+      console.log(`${cron.name}\t${status}\t${kind}\t${schedule}\t${last}`);
     }
     console.log(`State: ${paths.cronsPath}`);
     console.log(`Log: ${paths.logPath}`);
@@ -4220,11 +4235,13 @@ async function cronCommand(args: string[]) {
     const at = argValue(meta, '--at');
     const cwd = argValue(meta, '--cwd');
     const message = argValue(meta, '--message');
+    const prompt = argValue(meta, '--prompt');
+    const thread = argValue(meta, '--thread');
     const enabled = !meta.includes('--disabled');
     if (Boolean(every) === Boolean(at)) throw new Error('provide exactly one of --every or --at');
-    if (!message && commandParts.length === 0) throw new Error('cron reminder message required; command crons are legacy and require -- <command>');
-    const cron = await upsertCron(message ? { name, every, at, enabled, message } : { name, every, at, cwd, enabled, command: commandParts.join(' ') });
-    console.log(`Saved ${cron.name}${message ? '' : ' (legacy command cron)'}`);
+    if (!message && !prompt && commandParts.length === 0) throw new Error('cron requires exactly one of --message, --prompt, or legacy -- <command>');
+    const cron = await upsertCron(prompt ? { name, every, at, enabled, prompt, thread } : message ? { name, every, at, enabled, message } : { name, every, at, cwd, enabled, command: commandParts.join(' ') });
+    console.log(`Saved ${cron.name}${prompt ? ' (turn cron)' : message ? '' : ' (legacy command cron)'}`);
     return;
   }
   throw new Error(`unknown cron command: ${subcommand}`);
@@ -4257,6 +4274,7 @@ async function main() {
   if (command === 'loop-discovery') return loopDiscoveryCommand(args);
   if (command === 'loop-factory') return loopFactoryCommand(args);
   if (command === 'check' && (args.length === 0 || ['all', 'pendingApprovals', 'failedCrons', 'dailyBrief', 'pending-approvals', 'approval-reminders', 'failed-crons', 'crons', 'daily-brief', 'brief', 'health-check', 'heartbeat', 'configured-monitor-health', 'projectQuestion', 'project-question', 'question', 'questions', 'ask'].includes(args[0]))) return proactiveCheckCommand(args);
+  if (command === 'memory') return memoryCommand(args);
   if (command === 'cron') return cronCommand(args);
   if (command === 'task') return taskCommand(args);
   if (command === 'make') return makeCommand(args);
