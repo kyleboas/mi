@@ -82,7 +82,9 @@ async function ensureState() {
 export async function readCrons(): Promise<MiCron[]> {
   await ensureState();
   if (!existsSync(CRONS_PATH)) return [];
-  const crons = JSON.parse(await readFile(CRONS_PATH, 'utf8')) as MiCron[];
+  const raw = await readFile(CRONS_PATH, 'utf8');
+  if (!raw.trim()) return [];
+  const crons = JSON.parse(raw) as MiCron[];
   let changed = false;
   for (const cron of crons) {
     const reason = validateCronShape(cron);
