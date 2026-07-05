@@ -80,6 +80,8 @@ try {
   const runner = join(scheduleRoot, 'run-schedule.mjs');
   await writeFile(runner, `
     import assert from 'node:assert/strict';
+    process.env.MI_QUESTIONS_ENABLED = 'true';
+    process.env.MI_TICK_QUESTIONS_ENABLED = 'true';
     process.env.MI_QUESTIONS_MAX_PER_DAY = '2';
     process.env.MI_QUESTIONS_QUIET_BEFORE = '9';
     process.env.MI_QUESTIONS_QUIET_AFTER = '21';
