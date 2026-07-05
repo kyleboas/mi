@@ -66,7 +66,7 @@ try {
   assert.match(result.stdout, /Saved standup/);
 
   result = runCli(['cron', 'list'], { env, cwd });
-  assert.match(result.stdout, /standup\s+enabled\s+every 1m/);
+  assert.match(result.stdout, /standup\s+enabled\s+message\s+every 1m/);
 
   result = runCli(['cron', 'check'], { env, cwd });
   assert.match(result.stdout, /standup: ok/);
