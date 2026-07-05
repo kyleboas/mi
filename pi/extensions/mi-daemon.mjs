@@ -29,6 +29,7 @@ const MI_DAEMON_LOCK_STALE_MS = Number(process.env.MI_DAEMON_LOCK_STALE_MS || 12
 const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_MS || 2000);
 const MI_DAEMON_IDLE_EXIT_MS = Number(process.env.MI_DAEMON_IDLE_EXIT_MS || 60000);
 const MI_TASK_DISCOVERY_DELAY_MS = Number(process.env.MI_TASK_DISCOVERY_DELAY_MS || 1500);
+const MI_STOPPED_SESSION_GRACE_MS = Number(process.env.MI_STOPPED_SESSION_GRACE_MS || 180000);
 const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
 const MI_WORKFLOWS_DIR = resolve(process.env.MI_WORKFLOWS_DIR || join(HOME, "workflows"));
 const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
@@ -226,6 +227,18 @@ async function acquireDaemonLock() {
 
 async function readTasks() {
   try { return JSON.parse(await readFile(TASKS_PATH, "utf8")); } catch { return []; }
+}
+
+// tasks.json is read-modified-written by concurrent socket handlers (list
+// reconcile/merge, worker upserts/heartbeats, dismiss). Without serialization a
+// slow list pass writes its stale snapshot over a task upserted meanwhile, so
+// fresh tasks flicker out of the list until the next heartbeat re-adds them.
+// Never acquire this inside a function that already holds it.
+let taskStoreQueue = Promise.resolve();
+function withTaskStore(fn) {
+  const run = taskStoreQueue.then(fn, fn);
+  taskStoreQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 async function readDismissedTaskKeys() {
@@ -492,7 +505,12 @@ async function listPiSessionTasks() {
   if (now - piSessionTaskCache.at < PI_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const activeProcesses = await listActivePiProcesses();
   const idle = activeWorkers.size === 0 && activeProcesses.length === 0;
-  if (idle && now - piSessionTaskCache.at < PI_IDLE_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
+  // An idle cache hit may still hold rows claiming an open pi whose process
+  // has since died; serving them keeps a closed session "running" (and the
+  // merge layer trusts openPiSession) for up to the idle cache window. Rescan
+  // instead when any cached open row's pid is gone.
+  const cacheHasStaleOpenRow = piSessionTaskCache.tasks.some((task) => task.openPiSession && task.openPiPid && !existsSync(`/proc/${Number(task.openPiPid)}`));
+  if (idle && !cacheHasStaleOpenRow && now - piSessionTaskCache.at < PI_IDLE_SESSION_SCAN_CACHE_MS) return piSessionTaskCache.tasks;
   const files = await walkSessionFiles();
   const withStats = [];
   for (const file of files) {
@@ -518,26 +536,41 @@ async function listPiSessionTasks() {
     if (task) parsedTasks.push(task);
   }
   const openPiSessions = inferOpenPiSessions(parsedTasks, activeProcesses);
-  const tasks = parsedTasks.map((task) => {
-    const openPiSession = openPiSessions.get(task.sessionFile);
+  const tasks = [];
+  for (const task of parsedTasks) {
     const status = String(task.status || "").toLowerCase();
+    const working = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status);
+    let openFields;
+    const openPiSession = openPiSessions.get(task.sessionFile);
     if (openPiSession) {
-      const openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput, bridgeSocket: piBridgeSocketPath(task.actualSessionFile || task.sessionFile) };
-      if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) return { ...task, ...openFields, status: "running", finishedAt: undefined };
-      return { ...task, ...openFields };
+      openFields = { openPiSession: true, openPiPid: openPiSession.pid, openPiInput: openPiSession.openPiInput, bridgeSocket: piBridgeSocketPath(task.actualSessionFile || task.sessionFile) };
+    } else {
+      // The /proc scan only sees interactive pis on a pts; headless drivers
+      // (web-chat turns, TUI replies) are found through their bridge socket.
+      const bridge = await probeOpenPiBridge(task.actualSessionFile || task.sessionFile);
+      if (bridge) openFields = { openPiSession: true, openPiPid: bridge.pid, bridgeSocket: bridge.bridgeSocket };
     }
-    if (["running", "active", "queued", "thinking", "thinkingqueued"].includes(status)) {
-      return enrichTask({
+    if (openFields) {
+      tasks.push(working ? { ...task, ...openFields, status: "running", finishedAt: undefined } : { ...task, ...openFields });
+      continue;
+    }
+    if (working) {
+      if (await sessionFileRecentlyActive(task)) {
+        tasks.push({ ...task, status: "running", finishedAt: undefined });
+        continue;
+      }
+      tasks.push(enrichTask({
         ...task,
         status: "paused",
         needsUser: true,
         needsUserReason: stoppedPiNeedsInputReason(task),
         finishedAt: undefined,
         progress: task.progress || "stopped before final response; needs input",
-      });
+      }));
+      continue;
     }
-    return task;
-  });
+    tasks.push(task);
+  }
   piSessionTaskCache = { at: now, tasks };
   return tasks;
 }
@@ -632,6 +665,59 @@ function stoppedPiNeedsInputReason(task) {
   return `Pi session is no longer running and no final assistant response was recorded. ${context} Next: reply to this task with whether to continue, revise, or mark it done based on the session state.`;
 }
 
+const openPiBridgeProbeCache = new Map();
+
+async function probeOpenPiBridge(sessionFile) {
+  if (!sessionFile) return undefined;
+  const cached = openPiBridgeProbeCache.get(sessionFile);
+  if (cached && Date.now() - cached.at < 2500) return cached.result;
+  let result;
+  const socketPath = piBridgeSocketPath(sessionFile);
+  if (existsSync(socketPath)) {
+    try {
+      const health = await sendBridgeRequest(socketPath, { type: "health" }, 700);
+      if (health?.ok) result = { pid: Number(health.pid || 0) || undefined, bridgeSocket: socketPath };
+    } catch {}
+  }
+  openPiBridgeProbeCache.set(sessionFile, { at: Date.now(), result });
+  return result;
+}
+
+async function sessionFileRecentlyActive(task) {
+  const file = task?.actualSessionFile || task?.sessionFile;
+  let lastWriteMs = 0;
+  if (file) {
+    try { lastWriteMs = (await stat(file)).mtimeMs; } catch {}
+  }
+  if (!lastWriteMs) lastWriteMs = Date.parse(task?.lastEventAt || "") || 0;
+  return Date.now() - lastWriteMs < MI_STOPPED_SESSION_GRACE_MS;
+}
+
+// A busy session with no matching interactive pi process is not necessarily
+// stopped: web-chat turns, headless replies, and pis the /proc heuristic missed
+// still serve the per-session bridge socket, and a driver mid-turn keeps
+// appending to the session file. Treat the session as open when either signal
+// is present; only the caller's fallback may flag it "stopped, needs input".
+async function openPiSessionOverride(task) {
+  const bridge = await probeOpenPiBridge(task?.actualSessionFile || task?.sessionFile);
+  if (bridge) {
+    return {
+      ...task,
+      status: "running",
+      needsUser: false,
+      needsUserReason: undefined,
+      finishedAt: undefined,
+      openPiSession: true,
+      openPiPid: bridge.pid || task.openPiPid,
+      bridgeSocket: bridge.bridgeSocket,
+    };
+  }
+  if (await sessionFileRecentlyActive(task)) {
+    return { ...task, status: "running", needsUser: false, needsUserReason: undefined, finishedAt: undefined };
+  }
+  return undefined;
+}
+
 function taskStatePreserveActive(task) {
   if (typeof task?.preservedStatus !== "string" || task.preservedStatus.length === 0) return false;
   const status = String(task?.status || "").toLowerCase();
@@ -676,7 +762,7 @@ function clearPreservedTaskState(task) {
   };
 }
 
-function reconcileStoredTask(task) {
+async function reconcileStoredTask(task) {
   task = withPreservedTaskState(task);
   if (task?.openPiPid && !existsSync(`/proc/${Number(task.openPiPid)}`)) {
     const { openPiSession, openPiPid, openPiInput, bridgeSocket, ...rest } = task;
@@ -684,9 +770,11 @@ function reconcileStoredTask(task) {
   }
   const status = String(task.status || "").toLowerCase();
   const working = ["running", "active", "queued", "thinking", "thinkingqueued"].includes(status);
+  const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
   if (working && !taskHasActiveWorker(task)) {
-    const isPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
     if (isPiSession && !task.openPiSession) {
+      const open = await openPiSessionOverride(task);
+      if (open) return open;
       return enrichTask({
         ...task,
         status: "paused",
@@ -702,6 +790,14 @@ function reconcileStoredTask(task) {
     // paused/needsUser. Do not infer "inactive" from a missing in-memory worker:
     // the daemon may have restarted, or a session scan may lag behind the worker.
     return { ...task, status: task.status || "running", finishedAt: undefined };
+  }
+  // Heal tasks previously flagged "stopped before replying" once their session
+  // proves alive again (bridge answers or the file is being written): the scan
+  // that flagged them could not see headless drivers, and the merge layer
+  // preserves stored paused state unless the task is marked open again.
+  if (isPiSession && status === "paused" && task.needsUser && /no longer running|stopped before replying/i.test(String(task.needsUserReason || ""))) {
+    const open = await openPiSessionOverride(task);
+    if (open) return open;
   }
   return task;
 }
@@ -831,10 +927,36 @@ function scheduleTaskDiscovery() {
 }
 
 async function listAllTasks(options = {}) {
+  return withTaskStore(() => listAllTasksLocked(options));
+}
+
+// A list pass takes long enough (session scans, /proc reads, bridge probes)
+// that tasks.json can be rewritten underneath it by external tools (tests,
+// manual repairs). Only persist this pass's derived view while the file still
+// matches what the pass read; otherwise skip the write — the next pass
+// reconciles the fresh contents instead of clobbering them with a stale
+// snapshot (which made freshly added tasks, or the whole list, disappear).
+async function writeTasksBackIfUnchanged(nextTasks, previousTasks, expectedText) {
+  if (JSON.stringify(previousTasks) === JSON.stringify(nextTasks)) return expectedText;
+  const currentText = await readFile(TASKS_PATH, "utf8").catch(() => "");
+  if (currentText !== expectedText) return undefined;
+  await writeTasks(nextTasks);
+  return JSON.stringify(nextTasks, null, 2);
+}
+
+async function listAllTasksLocked(options = {}) {
   const dismissed = await readDismissedTaskKeys();
-  const rawTasks = await readTasks();
-  const reconciledRawTasks = rawTasks.map(reconcileStoredTask);
-  if (JSON.stringify(rawTasks) !== JSON.stringify(reconciledRawTasks)) await writeTasks(reconciledRawTasks);
+  let storeText = "";
+  let rawTasks = [];
+  try {
+    storeText = await readFile(TASKS_PATH, "utf8");
+    rawTasks = JSON.parse(storeText);
+  } catch {
+    storeText = "";
+    rawTasks = [];
+  }
+  const reconciledRawTasks = await Promise.all(rawTasks.map(reconcileStoredTask));
+  storeText = await writeTasksBackIfUnchanged(reconciledRawTasks, rawTasks, storeText);
   const storedTasks = reconciledRawTasks.filter((task) => !isTaskDismissed(task, dismissed) && !isExcludedPiSessionTask(task));
   const hasStoredActiveTask = storedTasks.some((task) => !task.finishedAt && ["running", "waiting", "active", "queued", "thinking", "thinkingqueued"].includes(String(task.status || "").toLowerCase()));
   if (options.lazy !== false && PI_SESSION_SCAN_CACHE_MS !== 0 && activeWorkers.size === 0 && !hasStoredActiveTask) {
@@ -846,7 +968,7 @@ async function listAllTasks(options = {}) {
   // Anything that appears in mi agents should stay there until the user clears it.
   // Discovered/open pi sessions used to disappear after the recent-session window;
   // persist the merged view so refreshes and daemon restarts keep the task row.
-  if (JSON.stringify(reconciledRawTasks) !== JSON.stringify(mergedTasks)) await writeTasks(mergedTasks);
+  if (storeText !== undefined) await writeTasksBackIfUnchanged(mergedTasks, reconciledRawTasks, storeText);
   return mergedTasks;
 }
 
@@ -879,8 +1001,11 @@ async function dismissTask(request) {
   const match = [...tasks, ...sessions].find((task) => taskDismissKeys(task).some((key) => requested.includes(key)));
   const keys = new Set([...(await readDismissedTaskKeys()), ...requested, ...taskDismissKeys(match || {})]);
   await writeDismissedTaskKeys(keys);
-  const remaining = tasks.filter((task) => !isTaskDismissed(task, keys));
-  if (remaining.length !== tasks.length) await writeTasks(remaining);
+  await withTaskStore(async () => {
+    const current = await readTasks();
+    const remaining = current.filter((task) => !isTaskDismissed(task, keys));
+    if (remaining.length !== current.length) await writeTasks(remaining);
+  });
   piSessionTaskCache = { at: 0, tasks: [] };
   return { text: `Removed ${match?.sessionName || match?.name || requested[0]} from task list` };
 }
@@ -945,7 +1070,11 @@ async function resumePiSessions() {
 
 async function writeTasks(tasks) {
   await mkdir(dirname(TASKS_PATH), { recursive: true });
-  await writeFile(TASKS_PATH, JSON.stringify(tasks, null, 2));
+  // Write-then-rename so a concurrent readTasks never sees a truncated file
+  // (a torn read parses as [] and blanks the whole task list).
+  const tmp = `${TASKS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, JSON.stringify(tasks, null, 2));
+  await rename(tmp, TASKS_PATH);
 }
 
 function extractPrUrls(text) {
@@ -965,13 +1094,71 @@ function enrichTask(task) {
 }
 
 async function upsertTask(task) {
-  const tasks = await readTasks();
-  const taskIsPiSession = task?.source === "pi-session" || String(task?.id || "").startsWith("pi-session:");
+  return withTaskStore(() => upsertTaskLocked(task));
+}
+
+async function upsertTaskLocked(task) {
+  // The store lock serializes daemon writers, but tasks.json can still be
+  // rewritten by external tools between this read and write. Re-apply the
+  // upsert on the fresh contents when that happens (last attempt wins).
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { merged, tasks, storeText } = await computeTaskUpsert(task);
+    const currentText = await readFile(TASKS_PATH, "utf8").catch(() => "");
+    if (attempt < 2 && currentText !== storeText) continue;
+    await writeTasks(tasks.slice(0, 200));
+    return merged;
+  }
+}
+
+async function computeTaskUpsert(task) {
+  let storeText = "";
+  let tasks = [];
+  try {
+    storeText = await readFile(TASKS_PATH, "utf8");
+    tasks = JSON.parse(storeText);
+  } catch {
+    storeText = "";
+    tasks = [];
+  }
   const index = tasks.findIndex((entry) => entry.id === task.id || sameLogicalTask(entry, task));
   const previous = index >= 0 ? tasks[index] : undefined;
   const nowIso = new Date().toISOString();
   const next = enrichTask({ ...task, updatedAt: nowIso });
-  const merged = index >= 0 ? enrichTask({ ...previous, ...next }) : next;
+  // A brand-new run (fresh id, starting status, no output yet) can land on an
+  // older row through the name/cwd heuristics in sameLogicalTask. Spreading
+  // over that row inherits the previous run's output, error, and session
+  // pointers, so the new task displays the last task's result and replies
+  // route into the old session. Reset those fields; the new run fills its own.
+  const startingFresh = Boolean(previous && task.id && previous.id && task.id !== previous.id
+    && ["running", "queued", "waiting"].includes(String(task.status || "").toLowerCase())
+    && !task.text);
+  const base = startingFresh
+    ? {
+      ...clearPreservedTaskState(previous),
+      text: undefined,
+      error: undefined,
+      prUrls: undefined,
+      progress: undefined,
+      finishedAt: undefined,
+      needsUser: undefined,
+      needsUserReason: undefined,
+      notifiedNeedsUserAt: undefined,
+      notifiedPausedAt: undefined,
+      continuedAt: undefined,
+      lastEventAt: undefined,
+      autoContinueAttempts: undefined,
+      transportRetries: undefined,
+      startedAt: undefined,
+      sessionFile: undefined,
+      actualSessionFile: undefined,
+      sessionId: undefined,
+      openPiSession: undefined,
+      openPiPid: undefined,
+      openPiInput: undefined,
+      bridgeSocket: undefined,
+    }
+    : previous;
+  const merged = index >= 0 ? enrichTask({ ...base, ...next }) : next;
   if (merged.needsUser && !previous?.needsUser) {
     merged.notifiedNeedsUserAt = nowIso;
   }
@@ -987,8 +1174,7 @@ async function upsertTask(task) {
     return 2;
   };
   tasks.sort((a, b) => statusRank(a) - statusRank(b) || Date.parse(b.updatedAt || b.lastEventAt || b.finishedAt || b.startedAt || 0) - Date.parse(a.updatedAt || a.lastEventAt || a.finishedAt || a.startedAt || 0));
-  await writeTasks(tasks.slice(0, 200));
-  return merged;
+  return { merged, tasks, storeText };
 }
 
 function messageId(prefix = "msg") {

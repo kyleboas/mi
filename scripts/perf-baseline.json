@@ -1,0 +1,14 @@
+{
+  "capturedAt": "2026-07-03T00:00:00.000Z",
+  "notes": "Pass-1 hermetic render-test wall-clock baseline. Values are intentionally generous because they include Node process startup; tighten after in-process render instrumentation lands.",
+  "metrics": {
+    "coldRender8WallMs": 2100,
+    "render200WallMs": 2300,
+    "hostile40x10WallMs": 1950
+  },
+  "budgets": {
+    "coldRender8WallMs": 3000,
+    "render200WallMs": 3500,
+    "hostile40x10WallMs": 3000
+  }
+}

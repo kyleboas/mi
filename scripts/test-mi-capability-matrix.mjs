@@ -13,6 +13,7 @@ const coverage = {
     '--once': ['test-mi-cli-surfaces.mjs'],
     raw: ['test-mi-capability-matrix.mjs'],
     pi: ['test-mi-capabilities.mjs'],
+    'pi-commands': ['test-mi-agent-extension-parity.mjs'],
     ui: ['test-mi-main-queue-render.mjs'],
     chat: ['test-mi-cli-surfaces.mjs'],
     open: ['test-mi-cli-surfaces.mjs'],
@@ -89,7 +90,7 @@ function actualCliCommands(source) {
     found.add(match[1]);
     found.add(match[2]);
   }
-  for (const alias of ['--once', 'raw', 'pi', 'ui', 'chat', 'open', 'ask', 'inbox', 'threads', 'temp', 'compact', 'agents', 'tick', 'project-status', 'status', 'approvals', 'proposals', 'delegations', 'loop-discovery', 'loop-factory', 'check', 'cron', 'task', 'make', 'run', 'edit', 'logs']) {
+  for (const alias of ['--once', 'raw', 'pi', 'pi-commands', 'ui', 'chat', 'open', 'ask', 'inbox', 'threads', 'temp', 'compact', 'agents', 'tick', 'project-status', 'status', 'approvals', 'proposals', 'delegations', 'loop-discovery', 'loop-factory', 'check', 'cron', 'task', 'make', 'run', 'edit', 'logs']) {
     if (main.includes(`command === '${alias}'`)) found.add(alias);
   }
   found.delete('help');

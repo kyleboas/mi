@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,8 @@ const variantDir = join(sessionDir, 'variants');
 const fakePi = join(root, 'pi');
 let daemon;
 let interactivePi;
+let bridgeServer;
+let bridgeDriver;
 
 function startInteractivePiSession() {
   return spawn('script', ['-q', '-c', `${fakePi} -c 'while true; do sleep 1; done' pi --session ${sessionFile}`, '/dev/null'], {
@@ -101,7 +104,14 @@ try {
       MI_SOCKET_PATH: socketPath,
       MI_WORKER: '0',
       MI_PI_SESSION_SCAN_CACHE_MS: '0',
+      // Also disable the idle-scan cache: several steps write session files
+      // while no interactive pi is running, and an idle cache hit would hide
+      // them from the scan for the whole cache window.
+      MI_IDLE_PI_SESSION_SCAN_CACHE_MS: '0',
       MI_ACTIVE_PI_SESSION_WINDOW_MS: String(60_000),
+      // These steps assert the immediate paused flip after a driver dies;
+      // liveness via the per-session bridge socket is exercised separately below.
+      MI_STOPPED_SESSION_GRACE_MS: '0',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -135,11 +145,15 @@ try {
 
   interactivePi = startInteractivePiSession();
 
+  // Wait for the scan to actually detect the interactive pi and persist its
+  // real pid over the fixture's placeholder (this test process's pid, which
+  // stays alive all run). Killing before adoption leaves the stored row
+  // pointing at a live pid, so it could never flip to needs-input.
   const running = await waitFor(async () => {
     const response = await request({ type: 'list_tasks' });
     const task = response.tasks?.find((entry) => entry.sessionFile === sessionFile || entry.actualSessionFile === sessionFile || entry.sessionId === '11111111-1111-4111-8111-111111111111');
-    return task && String(task.status).toLowerCase() === 'running' ? task : undefined;
-  }, 'typed pi session to appear as running');
+    return task && String(task.status).toLowerCase() === 'running' && task.openPiPid && task.openPiPid !== process.pid ? task : undefined;
+  }, 'typed pi session to be detected as the live interactive pi');
   assert.equal(running.name, 'typed e2e task');
 
   interactivePi.kill('SIGTERM');
@@ -233,9 +247,72 @@ try {
     assert.doesNotMatch(`${row.progress}\n${row.text || ''}`, /old final should not be current progress|should-not-be-final-output|private reasoning/, `${variant.name} leaked non-final activity`);
   }
 
+  // A busy session with no interactive pi process but a live per-session
+  // bridge socket is driven headlessly (web-chat turn, TUI reply); it must
+  // report running instead of flipping to needs-input.
+  const bridgeSessionId = '77777777-7777-4777-8777-777777777777';
+  const bridgeSessionFile = join(variantDir, `${bridgeSessionId}.jsonl`);
+  const bridgeSocketPath = join(runtime, 'pi-bridges', `${createHash('sha1').update(bridgeSessionFile).digest('hex')}.sock`);
+  await mkdir(join(runtime, 'pi-bridges'), { recursive: true });
+  bridgeDriver = spawn('sleep', ['300'], { stdio: 'ignore' });
+  bridgeServer = net.createServer((socket) => {
+    socket.on('error', () => undefined);
+    socket.on('data', () => socket.end(`${JSON.stringify({ ok: true, pid: bridgeDriver.pid, sessionFile: bridgeSessionFile })}\n`));
+  });
+  await new Promise((resolve, reject) => bridgeServer.listen(bridgeSocketPath, resolve).on('error', reject));
+  await writeVariantSession({
+    id: bridgeSessionId,
+    name: 'headless-with-bridge',
+    records: [
+      { type: 'message', message: { role: 'user', content: 'headless turn in flight' } },
+    ],
+  });
+  const bridgeBacked = await waitFor(async () => {
+    const response = await request({ type: 'list_tasks' });
+    const task = response.tasks?.find((entry) => entry.sessionFile === bridgeSessionFile || entry.sessionId === bridgeSessionId);
+    return task && String(task.status).toLowerCase() === 'running' && task.openPiSession ? task : undefined;
+  }, 'bridge-backed headless session to stay running');
+  assert.equal(bridgeBacked.needsUser, false);
+  assert.equal(bridgeBacked.needsUserReason, undefined);
+  assert.equal(bridgeBacked.openPiPid, bridgeDriver.pid, 'bridge health pid should be adopted');
+
+  // Once the driver dies and its bridge goes away, the same session flips
+  // to needs-input.
+  bridgeDriver.kill('SIGKILL');
+  await new Promise((resolve) => bridgeServer.close(resolve));
+  await rm(bridgeSocketPath, { force: true }).catch(() => undefined);
+  const bridgeStopped = await waitFor(async () => {
+    const response = await request({ type: 'list_tasks' });
+    const task = response.tasks?.find((entry) => entry.sessionFile === bridgeSessionFile || entry.sessionId === bridgeSessionId);
+    return task && String(task.status).toLowerCase() === 'paused' ? task : undefined;
+  }, 'bridge-backed session to need input after the bridge dies');
+  assert.equal(bridgeStopped.needsUser, true);
+  assert.match(bridgeStopped.needsUserReason, /Pi session is no longer running and no final assistant response was recorded/);
+
+  // Regression: a task created while a slow list pass is mid-flight must not
+  // be clobbered by that pass's stale write-back (tasks flickering out of the
+  // list right after creation). The list request is deliberately left
+  // unawaited so its reconcile/merge overlaps the pi_session_event upsert.
+  for (let round = 0; round < 5; round += 1) {
+    const raceId = `88888888-8888-4888-8888-88888888888${round}`;
+    const raceFile = await writeVariantSession({
+      id: raceId,
+      name: `race-${round}`,
+      records: [{ type: 'message', message: { role: 'user', content: `race round ${round}` } }],
+    });
+    const inflightList = request({ type: 'list_tasks' });
+    await request({ type: 'pi_session_event', sessionFile: raceFile, sessionId: raceId, kind: 'user_message', text: `race round ${round}`, status: 'running' });
+    await inflightList;
+    const after = await request({ type: 'list_tasks' });
+    const raceRow = after.tasks?.find((entry) => entry.sessionId === raceId || entry.sessionFile === raceFile || entry.actualSessionFile === raceFile);
+    assert.ok(raceRow, `race round ${round}: freshly created task must survive a concurrent list write-back`);
+  }
+
   console.log('mi daemon pi-session e2e passed');
 } finally {
   interactivePi?.kill('SIGTERM');
+  bridgeDriver?.kill('SIGKILL');
+  bridgeServer?.close();
   daemon?.kill('SIGTERM');
   await new Promise((resolve) => setTimeout(resolve, 200));
   if (!process.env.KEEP_TMP) await rm(root, { recursive: true, force: true });
