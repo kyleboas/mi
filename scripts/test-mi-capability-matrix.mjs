@@ -38,6 +38,7 @@ const coverage = {
     run: ['test-mi-cli-surfaces.mjs'],
     edit: ['test-mi-cli-surfaces.mjs'],
     logs: ['test-mi-cli-surfaces.mjs'],
+    memory: ['test-mi-memory.mjs'],
   },
   daemon: {
     prompt: ['test-mi-daemon-pi-session-e2e.mjs'],
