@@ -10,6 +10,7 @@ import { runOpportunityScans } from './opportunity-scans.js';
 import { generateProjectsStatus } from './project-status.js';
 import { runMiCheck } from './proactive.js';
 import { logEvent } from './state.js';
+import { runDreamConsolidation } from './memory.js';
 import { renderWeeklyReview, weeklyReviewDue } from './weekly-review.js';
 
 export type MiTickResult = {
@@ -188,6 +189,7 @@ export async function runMiTick(): Promise<MiTickResult> {
     const state = normalizeQuestionSchedule(await readTickState());
     const reminders = await tickReminderCrons();
     const capabilityGrantGc = await runCapabilityGrantGc();
+    const dream = await runDreamConsolidation().catch((error) => ({ status: 'error' as const, error: error instanceof Error ? error.message : String(error) }));
     await writeCapabilityGrantGcMarker(capabilityGrantGc);
     const health = await runMiCheck({ checkIds: ['health-check'] });
     const imessageMonitor = await runImessageMonitor();
@@ -254,7 +256,7 @@ export async function runMiTick(): Promise<MiTickResult> {
       skippedLoopFactory = loopFactoryResult.status === 'skipped';
     }
     await writeTickState(state);
-    await logEvent('mi.tick.complete', { reminders: reminders.length, capabilityGrantGc, healthNotices: health.notices.length, imessageMonitor: imessageMonitor.status, dailyBrief: Boolean(dailyBrief), projectQuestion: Boolean(projectQuestionResult?.notices.length), loopDiscovery: loopDiscoveryResult?.status, loopFactory: loopFactoryResult?.status, opportunityScans: opportunityScans.status, projectStatus: projectStatus.status, weeklyReview: weeklyReview.status });
+    await logEvent('mi.tick.complete', { reminders: reminders.length, capabilityGrantGc, dream: dream.status, healthNotices: health.notices.length, imessageMonitor: imessageMonitor.status, dailyBrief: Boolean(dailyBrief), projectQuestion: Boolean(projectQuestionResult?.notices.length), loopDiscovery: loopDiscoveryResult?.status, loopFactory: loopFactoryResult?.status, opportunityScans: opportunityScans.status, projectStatus: projectStatus.status, weeklyReview: weeklyReview.status });
     return { reminders, health, imessageMonitor, capabilityGrantGc, dailyBrief, projectQuestion: projectQuestionResult, loopDiscovery: loopDiscoveryResult, loopFactory: loopFactoryResult, opportunityScans, projectStatus, weeklyReview, skippedDailyBrief, skippedProjectQuestion, skippedLoopDiscovery, skippedLoopFactory, skippedOpportunityScans, skippedProjectStatus, skippedWeeklyReview };
   });
 }

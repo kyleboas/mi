@@ -37,6 +37,11 @@ function collectPiText(stdout: string) {
 }
 
 async function runPi(prompt: string, cwd: string, tools: string, timeoutMs = 180_000): Promise<WorkerResult> {
+  if (process.env.MI_MEMORY_IN_WORKERS !== 'false') {
+    const { memorySystemBlock } = await import('./memory.js');
+    const memory = await memorySystemBlock().catch(() => '');
+    if (memory) prompt = `${memory}\n\n${prompt}`;
+  }
   const cmd = process.env.PI_CMD || 'pi';
   const args = ['--mode', 'json', ...piModelArgs(), '--tools', tools, prompt];
 
