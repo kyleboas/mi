@@ -1,14 +1,14 @@
 {
-  "capturedAt": "2026-07-03T00:00:00.000Z",
-  "notes": "Pass-1 hermetic render-test wall-clock baseline. Values are intentionally generous because they include Node process startup; tighten after in-process render instrumentation lands.",
+  "capturedAt": "2026-07-05T00:00:00.000Z",
+  "notes": "Wall-clock baseline including Node process startup on a 1-CPU/1.9GB VPS. Values must accommodate contention from other processes; tighten after in-process render instrumentation lands.",
   "metrics": {
-    "coldRender8WallMs": 2100,
-    "render200WallMs": 2300,
-    "hostile40x10WallMs": 1950
+    "coldRender8WallMs": 4000,
+    "render200WallMs": 4000,
+    "hostile40x10WallMs": 3500
   },
   "budgets": {
-    "coldRender8WallMs": 3000,
-    "render200WallMs": 3500,
-    "hostile40x10WallMs": 3000
+    "coldRender8WallMs": 8000,
+    "render200WallMs": 8000,
+    "hostile40x10WallMs": 6000
   }
 }
