@@ -1,21 +1,23 @@
 import { appendFile, chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { runFlueChat, type FlueChatResult } from './flue.js';
 import { listThreads, readThreadMessages } from './threads.js';
 import { redactSecrets } from './redact.js';
 import { logEvent } from './state.js';
 
-const MEMORY_DIR = join(process.cwd(), 'state', 'memory');
+const MI_ROOT = process.env.MI_ROOT || join(process.env.HOME || homedir(), 'assistant');
+const MEMORY_DIR = join(MI_ROOT, 'state', 'memory');
 const MEMORY_MD = join(MEMORY_DIR, 'MEMORY.md');
 const HISTORY = join(MEMORY_DIR, 'history.jsonl');
 const CURSOR = join(MEMORY_DIR, '.dream_cursor');
 const PROMPT = join(MEMORY_DIR, 'dream-prompt.md');
-const EVENTS = join(process.cwd(), 'state', 'events.jsonl');
+const EVENTS = join(MI_ROOT, 'state', 'events.jsonl');
 const DEFAULT_PROMPT = 'Distill durable facts for Mi. Return strict JSON: {"entries":[{"ts":"ISO","source":"...","summary":"...","refs":[]}],"memory":"full replacement MEMORY.md"}. Keep only reusable facts, decisions, feedback, and project context. Do not include secrets.';
 
-type Cursor = { threads?: Record<string, number>; eventsOffset?: number; lastRunAt?: string };
+type Cursor = { threads?: Record<string, number>; eventsOffset?: number; lastRunAt?: string; lastAttemptAt?: string };
 export type DreamResult = { status: 'ok' | 'skipped' | 'error'; inputChars?: number; entriesAppended?: number; memoryBytes?: number; error?: string };
 
 async function ensureMemory() {
@@ -40,7 +42,7 @@ export async function memorySystemBlock() { const memory = await readMemory(); r
 export async function readMemoryHistory(limit = 20) { await ensureMemory(); const text = await readFile(HISTORY, 'utf8').catch(() => ''); return text.trim().split('\n').filter(Boolean).slice(-limit).map((line) => JSON.parse(line)); }
 
 async function git(args: string[]) { return new Promise<boolean>((resolve) => { const child = spawn('git', args, { cwd: MEMORY_DIR, shell: false, stdio: 'ignore' }); child.on('error', () => resolve(false)); child.on('close', (code) => resolve(code === 0)); }); }
-async function gitCommit() { if (!existsSync(join(MEMORY_DIR, '.git'))) { if (!await git(['init'])) { await logEvent('mi.dream.git_warning', { step: 'init' }); return; } } await git(['add', 'MEMORY.md', '.dream_cursor']); const ok = await git(['commit', '-m', `mi-dream: ${new Date().toISOString()}`]); if (!ok) await logEvent('mi.dream.git_warning', { step: 'commit' }); }
+async function gitCommit() { if (!existsSync(join(MEMORY_DIR, '.git'))) { if (!await git(['init'])) { await logEvent('mi.dream.git_warning', { step: 'init' }); return; } await git(['config', 'user.name', 'Mi Dream']); await git(['config', 'user.email', 'mi-dream@example.invalid']); } await git(['add', 'MEMORY.md', '.dream_cursor']); const ok = await git(['commit', '-m', `mi-dream: ${new Date().toISOString()}`]); if (!ok) await logEvent('mi.dream.git_warning', { step: 'commit' }); }
 
 async function collectInput(cursor: Cursor, maxChars: number) {
   let input = ''; const next: Cursor = { threads: { ...(cursor.threads || {}) }, eventsOffset: cursor.eventsOffset || 0 };
@@ -66,28 +68,33 @@ export async function runDreamConsolidation(options: { force?: boolean; flueChat
   await ensureMemory();
   const cursor = await readCursor();
   const interval = Number(process.env.MI_DREAM_INTERVAL_HOURS || 24) * 60 * 60 * 1000;
+  const errorBackoff = Number(process.env.MI_DREAM_ERROR_BACKOFF_HOURS || 1) * 60 * 60 * 1000;
   if (!options.force && cursor.lastRunAt && Date.now() - Date.parse(cursor.lastRunAt) < interval) return { status: 'skipped' };
+  if (!options.force && cursor.lastAttemptAt && (!cursor.lastRunAt || Date.parse(cursor.lastAttemptAt) > Date.parse(cursor.lastRunAt)) && Date.now() - Date.parse(cursor.lastAttemptAt) < errorBackoff) return { status: 'skipped' };
   const maxChars = Number(process.env.MI_DREAM_MAX_INPUT_CHARS || 24000);
-  for (let round = 0; round < (options.maxRounds || 5); round++) {
-    const current = await readCursor();
-    const { input, next } = await collectInput(current, maxChars);
-    if (!input.trim()) return { status: 'skipped', inputChars: 0 };
-    const prompt = await readFile(PROMPT, 'utf8');
-    const existing = await readMemory(12000);
-    const chat = await (options.flueChat || runFlueChat)(`${prompt}\n\nExisting MEMORY.md:\n${existing}\n\nNew source material:\n${input}`);
-    if (!chat.ok) { const error = chat.error || 'dream model failed'; await logEvent('mi.dream.error', { error }); return { status: 'error', error }; }
-    let parsed: any; try { parsed = JSON.parse(chat.reply); } catch (e) { const error = 'dream response was not JSON'; await logEvent('mi.dream.error', { error }); return { status: 'error', error }; }
-    if (!Array.isArray(parsed.entries) || typeof parsed.memory !== 'string') { const error = 'dream response shape invalid'; await logEvent('mi.dream.error', { error }); return { status: 'error', error }; }
-    for (const entry of parsed.entries) await appendPrivate(HISTORY, JSON.stringify(redactSecrets(entry)) + '\n');
-    await writePrivate(MEMORY_MD, parsed.memory);
-    next.lastRunAt = new Date().toISOString();
-    await writeCursor(next);
-    await gitCommit();
-    const memoryBytes = (await stat(MEMORY_MD)).size;
-    await logEvent('mi.dream.run', { inputChars: input.length, entriesAppended: parsed.entries.length, memoryBytes });
-    return { status: 'ok', inputChars: input.length, entriesAppended: parsed.entries.length, memoryBytes };
-  }
-  return { status: 'skipped' };
+  const current = await readCursor();
+  const { input, next } = await collectInput(current, maxChars);
+  if (!input.trim()) return { status: 'skipped', inputChars: 0 };
+  const prompt = await readFile(PROMPT, 'utf8');
+  const existing = await readMemory(12000);
+  const recordAttemptError = async (error: string) => {
+    await writeCursor({ ...current, lastAttemptAt: new Date().toISOString() });
+    await logEvent('mi.dream.error', { error });
+    return { status: 'error' as const, error };
+  };
+  const chat = await (options.flueChat || runFlueChat)(`${prompt}\n\nExisting MEMORY.md:\n${existing}\n\nNew source material:\n${input}`);
+  if (!chat.ok) return recordAttemptError(chat.error || 'dream model failed');
+  let parsed: any; try { parsed = JSON.parse(chat.reply); } catch (e) { return recordAttemptError('dream response was not JSON'); }
+  if (!Array.isArray(parsed.entries) || typeof parsed.memory !== 'string') return recordAttemptError('dream response shape invalid');
+  for (const entry of parsed.entries) await appendPrivate(HISTORY, JSON.stringify(redactSecrets(entry)) + '\n');
+  await writePrivate(MEMORY_MD, parsed.memory);
+  next.lastRunAt = new Date().toISOString();
+  next.lastAttemptAt = next.lastRunAt;
+  await writeCursor(next);
+  await gitCommit();
+  const memoryBytes = (await stat(MEMORY_MD)).size;
+  await logEvent('mi.dream.run', { inputChars: input.length, entriesAppended: parsed.entries.length, memoryBytes });
+  return { status: 'ok', inputChars: input.length, entriesAppended: parsed.entries.length, memoryBytes };
 }
 
 export function memoryPaths() { return { dir: MEMORY_DIR, memory: MEMORY_MD, history: HISTORY, cursor: CURSOR, prompt: PROMPT }; }
