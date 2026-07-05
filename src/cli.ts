@@ -107,6 +107,7 @@ Usage:
   mi cron check                   Run due Mi cron jobs now
   mi cron remove <name>           Remove a Mi cron job
   mi cron add <name> (--every <1h>|--at <iso>) --message <text>
+  mi cron add <name> (--every <1h>|--at <iso>) --prompt <text> [--thread <id>]
   mi cron add <name> (--every <1h>|--at <iso>) [--cwd <path>] -- <command>  (legacy/deprecated)
   mi task <name> [--cwd <path>] -- <task prompt>
   mi task reply <task-id-or-name> -- <follow-up prompt>
@@ -4015,7 +4016,8 @@ async function cronCommand(args: string[]) {
       const schedule = cron.every ? `every ${cron.every}` : `at ${cron.at}`;
       const status = cron.enabled ? 'enabled' : 'disabled';
       const last = cron.lastRunAt ? ` last=${cron.lastRunAt} ${cron.lastStatus || ''}`.trimEnd() : ' never-run';
-      console.log(`${cron.name}\t${status}\t${schedule}\t${last}`);
+      const kind = cron.prompt ? 'prompt' : cron.message ? 'message' : 'command';
+      console.log(`${cron.name}\t${status}\t${kind}\t${schedule}\t${last}`);
     }
     console.log(`State: ${paths.cronsPath}`);
     console.log(`Log: ${paths.logPath}`);
@@ -4045,11 +4047,13 @@ async function cronCommand(args: string[]) {
     const at = argValue(meta, '--at');
     const cwd = argValue(meta, '--cwd');
     const message = argValue(meta, '--message');
+    const prompt = argValue(meta, '--prompt');
+    const thread = argValue(meta, '--thread');
     const enabled = !meta.includes('--disabled');
     if (Boolean(every) === Boolean(at)) throw new Error('provide exactly one of --every or --at');
-    if (!message && commandParts.length === 0) throw new Error('cron reminder message required; command crons are legacy and require -- <command>');
-    const cron = await upsertCron(message ? { name, every, at, enabled, message } : { name, every, at, cwd, enabled, command: commandParts.join(' ') });
-    console.log(`Saved ${cron.name}${message ? '' : ' (legacy command cron)'}`);
+    if (!message && !prompt && commandParts.length === 0) throw new Error('cron requires exactly one of --message, --prompt, or legacy -- <command>');
+    const cron = await upsertCron(prompt ? { name, every, at, enabled, prompt, thread } : message ? { name, every, at, enabled, message } : { name, every, at, cwd, enabled, command: commandParts.join(' ') });
+    console.log(`Saved ${cron.name}${prompt ? ' (turn cron)' : message ? '' : ' (legacy command cron)'}`);
     return;
   }
   throw new Error(`unknown cron command: ${subcommand}`);
