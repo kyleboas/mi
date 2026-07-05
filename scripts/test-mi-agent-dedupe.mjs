@@ -101,6 +101,7 @@ const daemon = spawn(process.execPath, [new URL('../pi/extensions/mi-daemon.mjs'
     MI_PI_BIN: fakePiPath,
     MI_ACTIVE_PI_SESSION_WINDOW_MS: String(365 * 24 * 60 * 60_000),
     MI_PI_SESSION_SCAN_CACHE_MS: '0',
+    MI_IDLE_PI_SESSION_SCAN_CACHE_MS: '0',
   },
   stdio: ['ignore', 'ignore', 'pipe'],
 });
