@@ -980,11 +980,17 @@ async function stopTask(request) {
   const task = [...tasks, ...sessions].find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
   const activeWorker = task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) : undefined;
+  const taskStatus = String(task?.status || "").toLowerCase();
+  if (task && ["complete", "completed", "done"].includes(taskStatus)) {
+    return { text: `${name} is already complete` };
+  }
+  // Set this before the state write so a concurrent settled callback cannot
+  // publish a result after the user has stopped its worker.
+  if (activeWorker) activeWorker.expectedStop = true;
   if (task) {
     await upsertTask({ ...task, status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined, error: undefined, progress: "stopped by Escape; needs input", updatedAt: new Date().toISOString() });
   }
   if (activeWorker && !activeWorker.proc.killed) {
-    activeWorker.expectedStop = true;
     activeWorker.proc.kill();
   }
   if (task) {
@@ -1148,6 +1154,7 @@ async function computeTaskUpsert(task) {
       lastEventAt: undefined,
       autoContinueAttempts: undefined,
       transportRetries: undefined,
+      resultDeliveryKey: undefined,
       startedAt: undefined,
       sessionFile: undefined,
       actualSessionFile: undefined,
@@ -1193,17 +1200,34 @@ async function ensureMainThread() {
   return threads;
 }
 
-async function appendMainThreadMessage(text, source = "mi-agent-view") {
-  const ts = new Date().toISOString();
-  const threads = await ensureMainThread();
-  const record = threads.find((thread) => thread.id === "main");
-  const message = { id: messageId(), threadId: "main", role: "assistant", text, ts, unread: true, source };
-  await appendFile(join(THREADS_DIR, "main.jsonl"), `${JSON.stringify(message)}\n`);
-  if (record) {
-    record.updatedAt = ts;
-    record.unread = (record.unread || 0) + 1;
-    await writeFile(THREAD_INDEX_PATH, JSON.stringify(threads, null, 2));
-  }
+const mainThreadDeliveries = new Map();
+
+async function appendMainThreadMessage(text, source = "mi-agent-view", deliveryKey) {
+  if (deliveryKey && mainThreadDeliveries.has(deliveryKey)) return mainThreadDeliveries.get(deliveryKey);
+  const delivery = (async () => {
+    const ts = new Date().toISOString();
+    const threads = await ensureMainThread();
+    const record = threads.find((thread) => thread.id === "main");
+    const threadPath = join(THREADS_DIR, "main.jsonl");
+    if (deliveryKey) {
+      const existing = await readFile(threadPath, "utf8").catch(() => "");
+      if (existing.split("\n").some((line) => {
+        try { return JSON.parse(line).deliveryKey === deliveryKey; } catch { return false; }
+      })) return false;
+    }
+    const message = { id: messageId(), threadId: "main", role: "assistant", text, ts, unread: true, source, ...(deliveryKey ? { deliveryKey } : {}) };
+    await appendFile(threadPath, `${JSON.stringify(message)}\n`);
+    if (record) {
+      record.updatedAt = ts;
+      record.unread = (record.unread || 0) + 1;
+      await writeFile(THREAD_INDEX_PATH, JSON.stringify(threads, null, 2));
+    }
+    return true;
+  })();
+  if (!deliveryKey) return delivery;
+  mainThreadDeliveries.set(deliveryKey, delivery);
+  try { return await delivery; }
+  finally { mainThreadDeliveries.delete(deliveryKey); }
 }
 
 function defaultSessionDir(cwd) {
@@ -1441,8 +1465,9 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
   let rpcBuffer = "";
   let rpcNextId = 1;
   const rpcPending = new Map();
-  const agentEndWaiters = [];
+  const agentSettledWaiters = [];
   const eventListeners = [];
+  let lastAgentEnd;
 
   proc.stdout.on("data", (chunk) => {
     rpcBuffer += chunk.toString("utf8");
@@ -1460,8 +1485,14 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
         rpcPending.delete(payload.id);
         payload.success ? entry.resolve(payload.data ?? payload) : entry.reject(new Error(payload.error || "Worker RPC failed"));
       } else if (payload.type === "agent_end") {
-        const waiter = agentEndWaiters.shift();
-        if (waiter) waiter.resolve(payload);
+        // agent_end is emitted for every completed agent loop, including
+        // loops that will retry or drain queued work. Its text is useful, but
+        // it is not a terminal signal.
+        lastAgentEnd = payload;
+      } else if (payload.type === "agent_settled") {
+        const waiter = agentSettledWaiters.shift();
+        if (waiter) waiter.resolve(lastAgentEnd || { type: "agent_end", messages: [] });
+        lastAgentEnd = undefined;
       }
       for (const listener of eventListeners) listener(payload);
     }
@@ -1471,7 +1502,7 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
     const error = new Error(`Worker pi process exited ${code ?? "null"}/${signal ?? "null"}`);
     for (const entry of rpcPending.values()) entry.reject(error);
     rpcPending.clear();
-    for (const waiter of agentEndWaiters.splice(0)) waiter.reject(error);
+    for (const waiter of agentSettledWaiters.splice(0)) waiter.reject(error);
   });
 
   function rpc(cmd) {
@@ -1489,9 +1520,9 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
     });
   }
 
-  function waitAgentEnd() {
+  function waitForSettled() {
     return new Promise((resolve, reject) => {
-      agentEndWaiters.push({ resolve, reject });
+      agentSettledWaiters.push({ resolve, reject });
     });
   }
 
@@ -1499,7 +1530,7 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
     eventListeners.push(listener);
   }
 
-  return { proc, rpc, waitAgentEnd, onEvent };
+  return { proc, rpc, waitForSettled, onEvent };
 }
 
 function isSlashCommand(message) {
@@ -1605,7 +1636,7 @@ async function resumeTaskAfterWorkerError({ task, before, sessionFile, name, kin
   void (async () => {
     const retryBefore = await retryWorker.rpc({ type: "get_state" }).catch(() => before || {});
     installTaskHeartbeat(retryWorker, retryTask);
-    const retryDone = retryWorker.waitAgentEnd();
+    const retryDone = retryWorker.waitForSettled();
     await retryWorker.rpc({ type: "prompt", message: workerContinuationPrompt(retryTask, error), streamingBehavior: "followUp" });
     await finishTask({ task: retryTask, worker: retryWorker, before: retryBefore, sessionFile: resumeSessionFile, name, done: retryDone, kind, reportToMain });
   })().catch(async (retryError) => {
@@ -1622,15 +1653,35 @@ async function resumeTaskAfterWorkerError({ task, before, sessionFile, name, kin
   return true;
 }
 
+async function settledWorkerText(worker, end) {
+  const eventText = lastAssistantText(end?.messages);
+  if (eventText) return eventText;
+  const result = await worker.rpc({ type: "get_last_assistant_text" }).catch(() => undefined);
+  return typeof result?.text === "string" ? result.text.trim() : "";
+}
+
+function workerResultDeliveryKey(task) {
+  return task.resultDeliveryKey || `mi-worker-result:${task.id || task.sessionId || task.sessionFile}`;
+}
+
 async function finishTask({ task, worker, before, sessionFile, name, done, kind, reportToMain = false }) {
   try {
     const end = await done;
+    if (worker.expectedStop) return await log(`worker_expected_stop ${name}`);
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
-    const text = lastAssistantText(end.messages);
-    if (!text) throw new Error("Worker produced no response text.");
+    if (worker.expectedStop) return await log(`worker_expected_stop ${name}`);
+    const text = await settledWorkerText(worker, end);
+    if (!text) throw new Error("Worker settled without final assistant response text.");
+    if (worker.expectedStop) return await log(`worker_expected_stop ${name}`);
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
-    await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, error: undefined, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), autoContinueAttempts: undefined, transportRetries: undefined });
-    if (reportToMain) await appendMainThreadMessage(text, "mi-worker-result");
+    const completed = await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, error: undefined, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), resultDeliveryKey: workerResultDeliveryKey(task), autoContinueAttempts: undefined, transportRetries: undefined });
+    // stop_task sets this synchronously before it waits for its state write.
+    // Never let a late settlement revive or report a stopped task.
+    if (worker.expectedStop) {
+      await upsertTask({ ...completed, status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined, text: undefined, progress: "stopped by Escape; needs input" });
+      return await log(`worker_expected_stop ${name}`);
+    }
+    if (reportToMain) await appendMainThreadMessage(text, "mi-worker-result", completed.resultDeliveryKey);
   } catch (error) {
     if (worker.expectedStop) {
       await log(`worker_expected_stop ${name}`);
@@ -1729,7 +1780,7 @@ async function runWorker(request) {
       lastInput: taskInput,
     });
     installTaskHeartbeat(worker, task);
-    const done = worker.waitAgentEnd();
+    const done = worker.waitForSettled();
     await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
     if (request.background) {
       trackActiveWorker(task, name, worker);
@@ -1738,8 +1789,8 @@ async function runWorker(request) {
     }
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
-    const text = lastAssistantText(end.messages);
-    if (!text) throw new Error("Worker produced no response text.");
+    const text = await settledWorkerText(worker, end);
+    if (!text) throw new Error("Worker settled without final assistant response text.");
     await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, autoContinueAttempts: undefined, transportRetries: undefined });
     return { text, sessionFile: await mirrorSessionToHome(after.sessionFile || before.sessionFile), sessionId: after.sessionId || before.sessionId, sessionName: after.sessionName || name, model: after.model || before.model };
   } catch (error) {
@@ -1924,7 +1975,7 @@ async function continueWorker(request) {
     void (async () => {
       const before = await worker.rpc({ type: "get_state" });
       installTaskHeartbeat(worker, updated);
-      const done = worker.waitAgentEnd();
+      const done = worker.waitForSettled();
       await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
       void finishTask({ task: updated, worker, before, sessionFile, name, done, kind: "Task updated", reportToMain: Boolean(request.reportToMain) });
     })().catch(async (error) => {
@@ -1946,12 +1997,12 @@ async function continueWorker(request) {
   try {
     const before = await worker.rpc({ type: "get_state" });
     installTaskHeartbeat(worker, updated);
-    const done = worker.waitAgentEnd();
+    const done = worker.waitForSettled();
     await worker.rpc({ type: "prompt", message: workerInputMessage(message, request.useGoal) });
     const end = await done;
     const after = await worker.rpc({ type: "get_state" }).catch(() => before);
-    const text = lastAssistantText(end.messages);
-    if (!text) throw new Error("Worker produced no response text.");
+    const text = await settledWorkerText(worker, end);
+    if (!text) throw new Error("Worker settled without final assistant response text.");
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile);
     await upsertTask({ ...updated, status: "complete", finishedAt: new Date().toISOString(), text, actualSessionFile: after.sessionFile || sessionFile, sessionFile: visibleSessionFile, autoContinueAttempts: undefined, transportRetries: undefined });
     return { text, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name };
