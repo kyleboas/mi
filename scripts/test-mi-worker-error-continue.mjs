@@ -44,6 +44,7 @@ rl.on('line', (line) => {
     setTimeout(() => {
       if (run === 1) send({ type: 'agent_end', messages: [] });
       else send({ type: 'agent_end', messages: [{ role: 'assistant', content: finalText }] });
+      send({ type: 'agent_settled' });
     }, 25);
     return;
   }

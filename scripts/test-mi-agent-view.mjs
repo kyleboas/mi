@@ -293,7 +293,7 @@ assert.doesNotMatch(cli, /data\.includes\('\\x1b\[A'\)[\s\S]*scrollBy\(Math\.max
 
 assert.match(daemon, /const TASKS_PATH = join\(HOME, "mi", "state", "tasks\.json"\)/, 'daemon persists task state');
 assert.match(daemon, /command\(\{ type: "set_session_name", name: "mi-main" \}\)/, 'daemon gives Mi main pi session a clear name');
-assert.match(daemon, /async function finishTask\(\{[\s\S]*reportToMain = false[\s\S]*appendMainThreadMessage\(text, "mi-worker-result"\)/, 'daemon posts background worker final results back into Mi main when requested');
+assert.match(daemon, /async function finishTask\(\{[\s\S]*reportToMain = false[\s\S]*appendMainThreadMessage\(text, "mi-worker-result", completed\.resultDeliveryKey\)/, 'daemon posts background worker final results back into Mi main exactly once when requested');
 assert.match(daemon, /const LOCK_PATH = join\(RUNTIME_DIR, "mi-daemon\.lock"\)/, 'daemon has a singleton lock to prevent multiple writers/glitchy renders');
 assert.match(daemon, /async function acquireDaemonLock\(\)[\s\S]*socketHealth\(2000\)[\s\S]*singleton exit/, 'daemon exits when another healthy daemon owns the socket');
 assert.match(daemon, /const MI_DAEMON_LOCK_START_GRACE_MS = Number\(process\.env\.MI_DAEMON_LOCK_START_GRACE_MS \|\| 30000\)/, 'daemon gives a starting lock owner enough grace to avoid killing workers during slow startup');
@@ -439,8 +439,9 @@ assert.doesNotMatch(daemon, /Task needs \$\{miUserName\(\)\}: \$\{merged\.sessio
 assert.doesNotMatch(daemon, /Task paused: \$\{merged\.sessionName \|\| merged\.name \|\| merged\.id\}/, 'daemon does not push paused task transitions to main thread');
 assert.match(daemon, /notifiedNeedsUserAt/, 'daemon still records needs-User transition state');
 assert.match(daemon, /notifiedPausedAt/, 'daemon still records paused transition state');
-const waitAgentEnd = daemon.match(/function waitAgentEnd\(\) \{[\s\S]*?\n  \}/)?.[0] || '';
-assert(waitAgentEnd, 'daemon defines timeout-free waitAgentEnd');
-assert(!/setTimeout|timeoutMs|300000|Timed out waiting for worker/.test(waitAgentEnd), 'worker wait has no arbitrary timeout');
+const waitForSettled = daemon.match(/function waitForSettled\(\) \{[\s\S]*?\n  \}/)?.[0] || '';
+assert(waitForSettled, 'daemon defines timeout-free waitForSettled');
+assert(!/setTimeout|timeoutMs|300000|Timed out waiting for worker/.test(waitForSettled), 'worker wait has no arbitrary timeout');
+assert.match(daemon, /payload\.type === "agent_settled"[\s\S]*lastAgentEnd/, 'daemon waits for settled state rather than treating intermediate agent_end events as final');
 
 console.log('Mi agent view checks passed.');
