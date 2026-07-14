@@ -160,7 +160,7 @@ Setup:
 
 1. Create/login to Photon at https://photon.codes/ / https://app.photon.codes/.
 2. Create a Spectrum/iMessage project and get the project id/secret.
-3. Start Mi web chat locally or over Tailscale.
+3. Start Mi web chat locally or over Tailscale. For the user service, run `./scripts/install-mi-web-chat-systemd.sh`; it derives the machine's current Tailscale DNS name when issuing its certificate, then run `systemctl --user restart mi-web-chat.service`.
 4. Run the bridge with only your phone number allowlisted:
 
 ```bash
