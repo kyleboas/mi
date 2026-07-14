@@ -6,6 +6,9 @@ import { buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope } fr
 import { createHermeticMiEnv, httpJson, readJsonl, startFakeDaemon, startWebChat, waitFor } from './mi-test-harness.mjs';
 
 const hugeSecret = `sk-${'x'.repeat(40)}`;
+const webSource = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
+assert.match(webSource, /process\.env\.MI_IMESSAGE_MODEL \|\| 'vps-gateway\/coding-main'/, 'V2 defaults to the canonical local gateway model');
+assert.doesNotMatch(webSource.slice(webSource.indexOf('async function runImessageV2'), webSource.indexOf('async function handleImessageV2')), /--no-context-files|openai-codex\/gpt-5\.6-sol/, 'V2 spawn uses no unsupported option or stale model');
 const prompt = buildImessageV2Prompt({
   timestamp: '2026-07-14T12:00:00.000Z',
   userMessage: 'Can you check it?',
@@ -76,6 +79,8 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else proces
   assert.equal(result.handoff, false);
   const piCalls = await readJsonl(piLog);
   assert.ok(piCalls.every((args) => args.includes('--offline')), 'every V2 spawn disables startup package discovery/install without replacing model settings');
+  assert.ok(piCalls.every((args) => !args.includes('--no-context-files')), 'V2 never passes unsupported Pi CLI options');
+  assert.ok(piCalls.every((args) => args.includes('fake-model') && !args.some((arg) => /openai-codex|gpt-5\.6-sol/.test(arg))), 'V2 preserves the configured model override and never injects the stale model');
   assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources beyond its explicit guard');
   assert.ok(piCalls.at(-1).at(-1).includes('We decided on the garden plan.'), 'pronoun follow-up receives prior thread context');
   assert.doesNotMatch(piCalls.at(-1).at(-1), new RegExp(hugeSecret), 'fake Pi receives redacted context only');

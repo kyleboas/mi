@@ -2046,7 +2046,7 @@ function imessageV2SafeStderr(stderr, prompt, message) {
 
 async function runImessageV2(message, threadId) {
   const piCmd = process.env.PI_CMD || 'pi';
-  const model = process.env.MI_IMESSAGE_MODEL || 'openai-codex/gpt-5.6-sol';
+  const model = process.env.MI_IMESSAGE_MODEL || 'vps-gateway/coding-main';
   const prompt = await buildImessageV2Context(threadId, message);
   const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
   const guard = capabilityGuardPath();
@@ -2056,7 +2056,7 @@ async function runImessageV2(message, threadId) {
   // --offline is Pi's documented per-run switch for disabling startup package
   // checks/installs while retaining the configured model/provider and explicit
   // extension. The --no-* flags keep every discovered resource disabled.
-  const baseArgs = ['--mode', 'json', '--offline', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
+  const baseArgs = ['--mode', 'json', '--offline', '--no-session', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
   const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
   return await new Promise((resolve) => {
     const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ PI_OFFLINE: '1', MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
