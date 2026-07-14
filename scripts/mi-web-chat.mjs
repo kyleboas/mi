@@ -51,6 +51,7 @@ const miDaemonSystemdUnit = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.ser
 const miDaemonHost = process.env.MI_DAEMON_HOST || path.join(home, 'bin', 'mi-daemon-host');
 const workerModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';
 const workerThresholdSeconds = Number(process.env.MI_WEB_WORKER_THRESHOLD_SECONDS || 8);
+const workerMonitorIntervalMs = Number(process.env.MI_WEB_WORKER_POLL_MS || 5000);
 const pushoverEndpoint = 'https://api.pushover.net/1/messages.json';
 const pushoverEnvPath = path.join(home, '.config', 'pushover', 'env');
 const pushoverMessageLimit = 1024;
@@ -853,6 +854,19 @@ function activeWorkerForThread(threadId) {
   return Array.from(activeWorkers.values()).find((worker) => worker.threadId === threadId && workerIsActive(worker));
 }
 
+function workerCorrelationId(worker) {
+  return worker?.correlationId || worker?.taskId || worker?.id;
+}
+
+function workerMatchesContinuationId(worker, taskId) {
+  const value = String(taskId || '');
+  return Boolean(value && [worker?.correlationId, worker?.taskId, worker?.id, worker?.sessionId, worker?.sessionFile, worker?.sessionName, worker?.name].filter(Boolean).some((id) => String(id) === value));
+}
+
+function activeWorkerForV2Continuation(threadId, taskId) {
+  return Array.from(activeWorkers.values()).find((worker) => worker.threadId === threadId && workerIsActive(worker) && workerMatchesContinuationId(worker, taskId));
+}
+
 function recentWorkerForThread(threadId) {
   return Array.from(activeWorkers.values())
     .filter((worker) => worker.threadId === threadId && !workerIsActive(worker) && workerIsRecent(worker))
@@ -1062,6 +1076,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
     text: message,
     subject: options.subject || '',
     imessageV2: options.taskId === true,
+    correlationId: options.correlationId || (options.taskId === true ? randomUUID() : undefined),
     createdAt: startedAt,
     updatedAt: startedAt,
     awaitingResultSince: startedAt,
@@ -1069,7 +1084,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   activeWorkers.set(worker.id, worker);
   await saveActiveWorkers();
   const reply = sanitizeMiConversationText(options.ackReply || workerAck(message, 'start', decision));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack', taskId: options.taskId === true ? worker.taskId || worker.id : undefined });
+  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack', taskId: options.taskId === true ? workerCorrelationId(worker) : undefined });
   return { ok: true, reply, worker };
 }
 
@@ -1121,21 +1136,22 @@ async function buildWorkerFollowupPrompt(threadId, message) {
   ].join('\n\n');
 }
 
-async function continueBackgroundWorker(threadId, worker, message, options = {}) {
-  const workerPrompt = await buildWorkerFollowupPrompt(threadId, message);
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: options.userSource || 'web', taskId: options.taskId === true ? worker.taskId || worker.id : undefined });
-  await logEvent('mi.web.worker.followup', { threadId, taskId: worker.taskId || worker.id, message });
+async function continueBackgroundWorker(threadId, worker, objective, options = {}) {
+  const userMessage = options.threadMessage || objective;
+  const workerPrompt = await buildWorkerFollowupPrompt(threadId, objective);
+  await appendThreadMessage(threadId, 'user', userMessage, { unread: false, source: options.userSource || 'web', taskId: options.taskId === true ? workerCorrelationId(worker) : undefined });
+  await logEvent('mi.web.worker.followup', { threadId, taskId: worker.taskId || worker.id, message: userMessage });
   const taskId = worker.taskId || worker.sessionFile || worker.sessionName || worker.name || worker.id;
   const continuedAt = now();
   let result;
   try {
-    result = await sendTaskSocketRequest({ type: 'continue_worker', taskId, message: workerPrompt, lastInput: message, background: true, reportToMain: true, model: workerModel }, 30000);
+    result = await sendTaskSocketRequest({ type: 'continue_worker', taskId, message: workerPrompt, lastInput: objective, background: true, reportToMain: true, model: workerModel }, 30000);
   } catch (error) {
     if (!isStaleWorkerTaskError(error)) throw error;
     activeWorkers.delete(worker.id);
     await saveActiveWorkers().catch(() => undefined);
     await logEvent('mi.web.worker.stale', { threadId, taskId, error: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
-    return startBackgroundWorker(threadId, message, { appendUser: false });
+    return startBackgroundWorker(threadId, objective, { appendUser: false, userSource: options.userSource, ackReply: options.ackReply, ackSource: options.ackSource, taskId: options.taskId, correlationId: options.taskId === true ? workerCorrelationId(worker) : undefined, subject: options.subject });
   }
   worker.taskId = result.taskId || worker.taskId;
   if (options.subject) worker.subject = options.subject;
@@ -1151,8 +1167,8 @@ async function continueBackgroundWorker(threadId, worker, message, options = {})
   worker.updatedAt = now();
   activeWorkers.set(worker.id, worker);
   await saveActiveWorkers();
-  const reply = sanitizeMiConversationText(options.ackReply || workerAck(message, 'followup', workerRoutingDecision(message), worker));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack', taskId: options.taskId === true ? worker.taskId || worker.id : undefined });
+  const reply = sanitizeMiConversationText(options.ackReply || workerAck(objective, 'followup', workerRoutingDecision(objective), worker));
+  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack', taskId: options.taskId === true ? workerCorrelationId(worker) : undefined });
   return { ok: true, reply, worker };
 }
 
@@ -1278,7 +1294,7 @@ async function workerResultSince(worker) {
   const messages = await readMessages(worker.threadId, 50);
   return messages
     .filter((message) => message.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(message.source) && ((Date.parse(message.ts || '') || 0) >= since))
-    .filter((message) => worker.imessageV2 ? message.taskId === (worker.taskId || worker.id) : true)
+    .filter((message) => worker.imessageV2 ? message.taskId === workerCorrelationId(worker) : true)
     .at(-1);
 }
 
@@ -1330,7 +1346,7 @@ async function monitorBackgroundWorkers() {
         await appendThreadMessage(worker.threadId, 'assistant', completion, {
           unread: false,
           source: task.error ? 'mi-worker-error' : 'mi-worker-result',
-          taskId: worker.taskId || worker.id,
+          taskId: worker.imessageV2 ? workerCorrelationId(worker) : worker.taskId || worker.id,
         }).catch(() => undefined);
         notifyUser(completion, worker.threadId).catch(() => {});
       }
@@ -2006,7 +2022,7 @@ async function buildImessageV2Context(threadId, message) {
   const workers = Array.from(activeWorkers.values())
     .filter((worker) => worker.threadId === threadId && (workerIsActive(worker) || workerIsRecent(worker)))
     .slice(-10)
-    .map((worker) => `${worker.updatedAt || worker.createdAt || 'unknown time'} | ${worker.status || 'unknown'} | ${redactV2Text(worker.subject || worker.name || worker.text || 'work').slice(0, 220)} | task ${worker.taskId || worker.id}`)
+    .map((worker) => `${worker.updatedAt || worker.createdAt || 'unknown time'} | ${worker.status || 'unknown'} | ${redactV2Text(worker.subject || worker.name || worker.text || 'work').slice(0, 220)} | task ${workerCorrelationId(worker)}`)
     .join('\n');
   const snapshot = [
     ['state/tick.json', tick], ['state/monitor-health.json', health], ['state/approvals.json', approvals],
@@ -2062,10 +2078,13 @@ async function runImessageV2(message, threadId) {
 async function handleImessageV2(threadId, message) {
   const decision = await runImessageV2(message, threadId);
   if (decision.kind === 'task') {
-    const active = activeWorkerForThread(threadId);
+    const active = decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined;
     if (active) {
-      const result = await continueBackgroundWorker(threadId, active, decision.objective, { userSource: 'imessage-v2-user', ackReply: decision.ack, ackSource: 'imessage-v2-task-ack', taskId: true, subject: decision.objective });
-      return { ok: true, reply: redact(result.reply), handoff: true, taskId: result.worker.taskId || result.worker.id };
+      const result = await continueBackgroundWorker(threadId, active, decision.objective, {
+        threadMessage: message, userSource: 'imessage-v2-user', ackReply: decision.ack,
+        ackSource: 'imessage-v2-task-ack', taskId: true, subject: decision.objective,
+      });
+      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
     }
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     const result = await startBackgroundWorker(threadId, decision.objective, {
@@ -2073,7 +2092,7 @@ async function handleImessageV2(threadId, message) {
       userSource: 'imessage-v2-user', subject: decision.objective, allowDuplicate: true,
       decision: { start: true, reason: 'iMessage V2 assistant judgment' },
     });
-    return { ok: true, reply: redact(result.reply), handoff: true, taskId: result.worker.taskId || result.worker.id };
+    return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
   }
   const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
   const reply = sanitizeMiConversationText(imessageCleanReply(decision.reply));
@@ -2252,7 +2271,7 @@ async function handle(req, res) {
 
 await ensureMainThread();
 await loadActiveWorkers();
-setInterval(() => monitorBackgroundWorkers().catch(() => undefined), 5000);
+setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
 void monitorBackgroundWorkers().catch(() => undefined);
 const server = http.createServer(handle);
 server.listen(port, host, () => {

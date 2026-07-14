@@ -9,7 +9,7 @@ const allowAll = /^(1|true|yes|on)$/i.test(process.env.PHOTON_ALLOW_ALL_USERS ||
 const miBaseUrl = (process.env.MI_WEB_URL || 'http://127.0.0.1:8787').replace(/\/$/, '');
 const miThread = process.env.MI_PHOTON_THREAD || 'main';
 const pollMs = Number(process.env.MI_PHOTON_POLL_MS || 1500);
-const maxWaitMs = Number(process.env.MI_PHOTON_MAX_WAIT_MS || 180000);
+const maxWaitMs = Number(process.env.MI_PHOTON_MAX_WAIT_MS || 30 * 60 * 1000);
 const bootTestSend = /^(1|true|yes|on)$/i.test(process.env.PHOTON_BOOT_TEST_SEND || '');
 const maxReplyChars = Number(process.env.MI_PHOTON_MAX_REPLY_CHARS || 1200);
 const notifyHost = process.env.MI_PHOTON_NOTIFY_HOST || '127.0.0.1';
@@ -186,38 +186,37 @@ async function miJson(path, init = {}) {
 }
 
 async function askImessage(message) {
-  const start = Date.now();
+  const startedAt = Date.now();
   console.log(`imessage send chars=${String(message || '').length}`);
   const data = await miJson('/api/imessage', {
     method: 'POST',
     body: JSON.stringify({ thread: miThread, message }),
   });
-  const reply = cleanReply(data.reply);
-  if (!data.handoff) return { reply, followUp: null };
-  const taskId = String(data.taskId || '').trim();
+  return { reply: cleanReply(data.reply), handoff: Boolean(data.handoff), taskId: String(data.taskId || '').trim(), startedAt };
+}
 
+async function waitForWorkerResult(startedAt, taskId) {
   console.log(`imessage handoff - polling for ${taskId ? 'task result' : 'legacy worker result'}`);
-  while (Date.now() - start < maxWaitMs) {
+  while (Date.now() - startedAt < maxWaitMs) {
     await sleep(pollMs);
     try {
       const poll = await miJson(`/api/messages?thread=${encodeURIComponent(miThread)}`);
       const workerReplies = (poll.messages || []).filter((m) => {
         if (m.role !== 'assistant' || !['mi-worker-result', 'mi-worker-error'].includes(m.source)) return false;
         if (taskId) return String(m.taskId || '') === taskId;
-        const ts = Date.parse(m.ts || '') || 0;
-        return ts >= start;
+        return (Date.parse(m.ts || '') || 0) >= startedAt;
       });
       if (workerReplies.length) {
         const latest = workerReplies.at(-1);
         console.log(latest.source === 'mi-worker-error' ? 'imessage worker error ready' : 'imessage worker result ready');
         const fallback = latest.source === 'mi-worker-error' ? 'I hit an issue finishing that. I’ll need another pass.' : 'Done.';
-        return { reply, followUp: cleanReply(latest.text || fallback) };
+        return cleanReply(latest.text || fallback);
       }
     } catch (error) {
       console.warn('imessage poll error:', error?.message || String(error));
     }
   }
-  return { reply, followUp: null };
+  return null;
 }
 
 async function send(space, reply) {
@@ -270,6 +269,11 @@ function startTypingBestEffort(space, delayMs = 700) {
   };
 }
 
+function trackFollowUp(task) {
+  inFlightHandlers.add(task);
+  task.finally(() => inFlightHandlers.delete(task));
+}
+
 async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
   const id = String(message?.id || `${space?.id}:${message?.timestamp || Date.now()}`);
@@ -291,18 +295,32 @@ async function handle(space, message) {
   }
   if (space?.id) knownSpaces.set(space.id, space);
   const stopTyping = startTypingBestEffort(space);
+  let typingStopped = false;
+  const stopTypingNow = async () => {
+    if (typingStopped) return;
+    typingStopped = true;
+    await stopTyping();
+  };
   try {
     // Do not wrap the Mi call in space.responding(): Photon typing/read-state RPCs
     // can fail with upstream connection drops before Mi is even asked. Typing is
     // cosmetic and best-effort; replies must continue without it.
-    const { reply, followUp } = await askImessage(body);
-    await send(space, reply);
-    if (followUp && followUp !== reply) await send(space, followUp);
+    const result = await askImessage(body);
+    const ackSent = await send(space, result.reply);
+    await stopTypingNow();
+    if (result.handoff && ackSent) {
+      // Poll after the acknowledgement is visible, without keeping this inbound
+      // callback or its typing indicator open for a potentially slow task.
+      const followUp = waitForWorkerResult(result.startedAt, result.taskId)
+        .then((text) => text && text !== result.reply ? send(space, text) : undefined)
+        .catch((error) => console.warn('imessage follow-up failed:', error?.message || String(error)));
+      trackFollowUp(followUp);
+    }
   } catch (error) {
     console.error('mi photon handling failed:', error?.message || String(error));
     await send(space, 'I hit an issue on my side. Try that again?');
   } finally {
-    await stopTyping();
+    await stopTypingNow();
   }
 }
 
@@ -423,7 +441,9 @@ for (;;) {
       if (!shuttingDown) trackHandle(space, message);
     }
     if (testMode) {
-      await Promise.allSettled(Array.from(inFlightHandlers));
+      // A handler can detach a result poll just before it settles; drain until
+      // none remain so the hermetic relay harness observes that follow-up.
+      while (inFlightHandlers.size > 0) await Promise.allSettled(Array.from(inFlightHandlers));
       await app?.stop?.().catch((error) => {
         console.error('Mi Photon bridge stop failed:', error?.message || String(error));
       });
