@@ -2048,18 +2048,12 @@ async function runImessageV2(message, threadId) {
   const piCmd = process.env.PI_CMD || 'pi';
   const model = process.env.MI_IMESSAGE_MODEL || 'vps-gateway/coding-main';
   const prompt = await buildImessageV2Context(threadId, message);
-  const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
-  const guard = capabilityGuardPath();
-  const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
-  const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage-v2', type: 'imessage', displayName: 'Mi iMessage V2' });
-  const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
-  // --print gives one plain completion body. V2 already asks for the decision
-  // envelope, so it must not request Pi's JSON event stream. --offline prevents
-  // startup package operations; the --no-* flags retain only the explicit guard.
-  const baseArgs = ['--print', '--offline', '--no-session', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
+  // The foreground decision is context-only. It has no tools or capability grant,
+  // so live verification is delegated through the existing controlled worker path.
+  const baseArgs = ['--print', '--offline', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-tools'];
   const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
   return await new Promise((resolve) => {
-    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ PI_OFFLINE: '1', MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ PI_OFFLINE: '1' }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let settled = false;
