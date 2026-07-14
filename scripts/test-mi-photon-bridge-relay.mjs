@@ -33,21 +33,23 @@ function readBody(req) {
 function startMiServer(workerReply) {
   const { source, text } = workerReply;
   const calls = [];
+  let resultAvailableAt = 0;
   let messagesPolls = 0;
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '/', 'http://127.0.0.1');
       if (req.method === 'POST' && url.pathname === '/api/imessage') {
         const body = await readBody(req);
-        calls.push({ method: req.method, path: url.pathname, body });
+        calls.push({ method: req.method, path: url.pathname, body, at: Date.now() });
+        resultAvailableAt = Date.now() + Number(workerReply.delayMs || 0);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, reply: 'On it. I’ll follow up here.', handoff: true, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}) }));
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/messages') {
         messagesPolls += 1;
-        calls.push({ method: req.method, path: url.pathname, thread: url.searchParams.get('thread'), messagesPolls });
-        const messages = messagesPolls >= 2
+        calls.push({ method: req.method, path: url.pathname, thread: url.searchParams.get('thread'), messagesPolls, at: Date.now() });
+        const messages = messagesPolls >= 2 && Date.now() >= resultAvailableAt
           ? (workerReply.interleaved
             ? [
               { role: 'assistant', source: 'mi-worker-result', text: workerReply.interleaved, taskId: 'other-task', ts: new Date().toISOString() },
@@ -72,6 +74,7 @@ function startMiServer(workerReply) {
         server,
         calls,
         baseUrl: `http://127.0.0.1:${server.address().port}`,
+        get resultAvailableAt() { return resultAvailableAt; },
         close: () => new Promise((done) => server.close(done)),
       });
     });
@@ -148,6 +151,11 @@ async function runRelayCase(root, name, workerReply) {
     assert.equal(sends[1].text, workerReply.text);
     assert.equal(sends[0].phone, '+15551234567');
     assert.equal(sends[1].phone, '+15551234567');
+    if (workerReply.delayMs) {
+      assert.ok(Date.parse(sends[0].ts) < mi.resultAvailableAt, `${name}: acknowledgement must send before the delayed result exists`);
+      const firstPoll = mi.calls.find((call) => call.method === 'GET' && call.path === '/api/messages');
+      assert.ok(firstPoll && Date.parse(sends[0].ts) <= firstPoll.at, `${name}: acknowledgement must precede result polling`);
+    }
 
     assert.ok(mi.calls.some((call) => call.method === 'POST' && call.path === '/api/imessage' && call.body.message === 'check detect status' && call.body.thread === 'main'), `${name}: bridge should forward inbound iMessage to Mi web`);
     assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
@@ -158,7 +166,7 @@ async function runRelayCase(root, name, workerReply) {
 
 const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
 try {
-  await runRelayCase(root, 'exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  await runRelayCase(root, 'delayed-exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', delayMs: 160, interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
   console.log('Mi Photon bridge relay checks passed.');
