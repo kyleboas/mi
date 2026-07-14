@@ -23,6 +23,11 @@ try {
   assert.doesNotMatch(unit, /hermes/);
   assert.match(unit, /Wants=llm-gateway\.service/);
   assert.match(unit, /After=network-online\.target llm-gateway\.service/);
+  const dropin = await readFile(path.join(tmp, 'config/systemd/user/mi-web-chat.service.d/10-nvm-pi-path.conf'), 'utf8');
+  const expectedNvmPiBin = '/home/kyle/.nvm/versions/node/v24.15.0/bin';
+  assert.match(dropin, new RegExp(`Environment=PATH=${expectedNvmPiBin.replace(/[./]/g, '\\$&')}:/usr/local/bin:/usr/bin:/bin`));
+  assert.equal(dropin.split('Environment=PATH=')[1].split(':')[0], expectedNvmPiBin, 'deployed service PATH resolves pi from the supported NVM directory first');
+  assert.doesNotMatch(dropin, /@mariozechner|\/usr\/lib\/node_modules/, 'deployed service must not select global Pi');
   const stackInstaller = await readFile(path.resolve(import.meta.dirname, 'install-mi-imessage-stack-root.sh'), 'utf8');
   assert.match(stackInstaller, /override_lines\[@\][\s\S]*Environment=MI_WEB_URL=/, 'stack installer recognizes the obsolete single-setting override');
   assert.match(stackInstaller, /override_lines\[1\][\s\S]*127\.0\.0\.1:8787[\s\S]*rm -f/, 'stack installer preserves the canonical loopback value and removes stale values');
