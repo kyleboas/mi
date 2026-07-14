@@ -178,7 +178,7 @@ Optional env:
 - `PHOTON_ALLOW_ALL_USERS=true` — dev only; do not use for a terminal-capable assistant.
 - `MI_PHOTON_MAX_WAIT_MS=1800000` — how long the bridge waits for a background-worker result after sending its acknowledgement; defaults to 30 minutes.
 - `MI_IMESSAGE_V2=0` — immediately use the retained legacy V1 iMessage router instead of the default minimal V2 concierge.
-- `MI_IMESSAGE_MODEL` — override V2's default `vps-gateway/coding-main` local gateway model.
+- `MI_IMESSAGE_MODEL` — override V2's default `vps-gateway/coding-main` local gateway model. The default is an authenticated request to the sole local LiteLLM listener (`127.0.0.1:4000`); it is not a direct provider bypass.
 - `MI_IMESSAGE_ASK_FIRST=1` — legacy V1 opt-in to always asking before iMessage starts tool-backed work.
 - `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint for Mi proactive notices.
 - `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — send Mi proactive notifications to iMessage through the local Photon notify endpoint.
@@ -187,6 +187,16 @@ Optional env:
 - `MI_IMESSAGE_REPAIR_USER_SERVICES=mi-web-chat.service,mi-daemon.service` — user services restarted during safe iMessage repair attempts.
 
 The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify` by default. `mi tick` uses that endpoint for opt-in proactive iMessage notifications; it does not expose Photon credentials to the tick process.
+
+### Local Codex subscription gateway
+
+`vps-gateway/coding-main` is backed by the existing authenticated LiteLLM listener and a tightly scoped local Pi subprocess using the Codex subscription model `openai-codex/gpt-5.6-sol`. It has no OpenRouter, Cloudflare, or OpenAI API-key route; `coding-fast` is intentionally not exposed. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
+
+The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`. Its prepared root entrypoint is `/home/kyle/install-mi-subscription-gateway.sh`; it installs only the tracked LiteLLM config/handler/wrapper/drop-in, reloads and restarts `llm-gateway`, then performs the authenticated local health check. It does not configure provider secrets:
+
+```bash
+sudo /home/kyle/install-mi-subscription-gateway.sh
+```
 
 For always-on use, store the Photon values once, then install/restart:
 

@@ -1,0 +1,15 @@
+# Installed as /etc/litellm/config.yaml by the tracked root installer.
+# The sole coding route is Pi's local Codex subscription custom provider.
+model_list:
+  - model_name: coding-main
+    litellm_params:
+      model: pi-subscription/coding-main
+      api_key: ""
+litellm_settings:
+  drop_params: true
+  telemetry: false
+  custom_provider_map:
+    - provider: pi-subscription
+      custom_handler: pi_subscription_handler.pi_subscription_llm
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
