@@ -9,6 +9,8 @@
     "test:quality": "npm run build && node scripts/test-mi-assistant-quality.mjs",
     "test:live": "node scripts/test-mi-live-smoke.mjs",
     "test:subscription-gateway": "node scripts/test-mi-subscription-gateway-installer.mjs && /opt/litellm/bin/python gateway/test_pi_subscription_handler.py",
+    "test:mi-model-eval": "node scripts/test-mi-model-eval.mjs",
+    "eval:mi-models": "/home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs",
     "test:mi-surfaces": "npm run build && node scripts/test-mi-capability-matrix.mjs && node scripts/test-mi-cli-surfaces.mjs && node scripts/test-mi-web-api-e2e.mjs && node scripts/test-mi-assistant-quality.mjs && node scripts/test-mi-photon-bridge-relay.mjs",
     "build": "tsc",
     "proactive": "tsx scripts/proactive.ts",

@@ -198,6 +198,16 @@ The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`.
 sudo /home/kyle/install-mi-subscription-gateway.sh
 ```
 
+#### Decision-only model evaluation
+
+The immutable authenticated aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-terra-low`, and `mi-eval-sol-high` exist only for the synthetic Mi V2 decision evaluation. They keep `coding-main` unchanged. Install the aliases with `sudo /home/kyle/install-mi-model-eval-gateway.sh`, then run the two-pass, sequential (maximum concurrency two) comparison with:
+
+```bash
+npm run eval:mi-models
+```
+
+It uses `/home/kyle/bin/run-heavy`, invokes only `/home/kyle/bin/pi-gateway`, writes sanitized synthetic summaries and blinded outputs under ignored `.tmp/mi-model-eval/`, and never dispatches a task.
+
 For always-on use, store the Photon values once, then install/restart:
 
 ```bash
