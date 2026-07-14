@@ -28,16 +28,17 @@ const SECRET_PATTERN = /(?:\b(?:api[_ -]?key|secret|password|token)\b\s*(?:=|:)\
 
 function usage(message = '') {
   if (message) console.error(message);
-  console.error('Usage: /home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs [--passes 1|2] [--max-concurrency 1|2] [--output-dir .tmp/mi-model-eval/<name>]');
+  console.error('Usage: /home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs [--passes 1|2] [--max-concurrency 1|2] [--case fixture-id] [--output-dir .tmp/mi-model-eval/<name>]');
 }
 
 export function parseArgs(args) {
-  const options = { passes: 2, maxConcurrency: 1, outputDir: resolve(outputRoot, 'latest') };
+  const options = { passes: 2, maxConcurrency: 1, outputDir: resolve(outputRoot, 'latest'), caseId: undefined };
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index];
     if (value === '--passes') options.passes = Number(args[++index]);
     else if (value === '--max-concurrency') options.maxConcurrency = Number(args[++index]);
     else if (value === '--output-dir') options.outputDir = resolve(root, args[++index] || '');
+    else if (value === '--case') options.caseId = String(args[++index] || '').trim() || undefined;
     else throw new Error(`unknown argument: ${value}`);
   }
   if (![1, 2].includes(options.passes)) throw new Error('--passes must be 1 or 2');
@@ -192,7 +193,10 @@ async function main() {
   let options;
   try { options = parseArgs(process.argv.slice(2)); } catch (error) { usage(error.message); process.exitCode = 2; return; }
   await mkdir(options.outputDir, { recursive: true, mode: 0o700 });
-  const evaluation = await runEvaluation({ passes: options.passes });
+  const allFixtures = JSON.parse(await readFile(fixturePath, 'utf8'));
+  const fixtures = options.caseId ? allFixtures.filter((fixture) => fixture.id === options.caseId) : allFixtures;
+  if (fixtures.length === 0) { usage(`unknown fixture: ${options.caseId}`); process.exitCode = 2; return; }
+  const evaluation = await runEvaluation({ fixtures, passes: options.passes });
   const summary = {
     suite: 'synthetic-mi-v2-decision-only-v1',
     casesPerPass: evaluation.caseCount,

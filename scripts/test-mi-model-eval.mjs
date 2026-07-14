@@ -15,6 +15,7 @@ assert.match(packageJson.scripts['eval:mi-models'], /run-heavy --class eval -- n
 assert.throws(() => parseArgs(['--output-dir', '/tmp/not-allowed']), /must remain under/);
 assert.throws(() => parseArgs(['--passes', '3']), /must be 1 or 2/);
 assert.equal(parseArgs(['--passes', '2', '--max-concurrency', '2']).maxConcurrency, 2);
+assert.equal(parseArgs(['--case', 'natural-chat']).caseId, 'natural-chat');
 
 const restart = fixtures.find((item) => item.id === 'consequential-restart-confirmation');
 let score = scoreDecision('{"kind":"confirm","reply":"Should I restart the synthetic garden service?"}', restart);
