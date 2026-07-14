@@ -126,7 +126,10 @@ function cleanOutput(value) {
 function aggregate(profile, runs) {
   const checks = runs.flatMap((run) => run.score.checks);
   const failures = {};
-  for (const run of runs) for (const failure of run.score.failures) failures[failure] = (failures[failure] || 0) + 1;
+  for (const run of runs) {
+    if (run.failure) failures[`invocation-${run.failure}`] = (failures[`invocation-${run.failure}`] || 0) + 1;
+    for (const failure of run.score.failures) failures[failure] = (failures[failure] || 0) + 1;
+  }
   return {
     profile: profile.label,
     alias: profile.id,
