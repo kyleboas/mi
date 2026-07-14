@@ -200,7 +200,13 @@ sudo /home/kyle/install-mi-subscription-gateway.sh
 
 #### Decision-only model evaluation
 
-The immutable authenticated aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-terra-low`, and `mi-eval-sol-high` exist only for the synthetic Mi V2 decision evaluation. They keep `coding-main` unchanged. Install the aliases with `sudo /home/kyle/install-mi-model-eval-gateway.sh`, then run the two-pass, sequential (maximum concurrency two) comparison with:
+The immutable authenticated aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-terra-low`, and `mi-eval-sol-high` exist only for the synthetic Mi V2 decision evaluation. They keep `coding-main` unchanged. Install the non-secret, user-level Pi registry entries first, then install the authenticated aliases with `sudo /home/kyle/install-mi-model-eval-gateway.sh`:
+
+```bash
+npm run setup:mi-model-eval-models
+```
+
+Then run the two-pass, sequential (maximum concurrency two) comparison with:
 
 ```bash
 npm run eval:mi-models
