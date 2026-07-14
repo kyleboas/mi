@@ -1,0 +1,14 @@
+#!/bin/sh
+# Wait for LiteLLM's asynchronous listener startup without printing transient curl errors.
+set -eu
+
+health_command=${1:?health command is required}
+for attempt in $(seq 1 30); do
+  if runuser -u kyle -- "$health_command" >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 1
+done
+
+printf '%s\n' 'llm-gateway did not become healthy within 30 seconds' >&2
+exit 1

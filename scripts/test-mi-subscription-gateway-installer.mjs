@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const root = resolve(import.meta.dirname, '..');
 const config = readFileSync(resolve(root, 'gateway/litellm-config.yaml'), 'utf8');
 const installer = readFileSync(resolve(root, 'scripts/install-mi-subscription-gateway-root.sh'), 'utf8');
 const wrapper = readFileSync(resolve(root, 'gateway/start-llm-gateway'), 'utf8');
 const dropin = readFileSync(resolve(root, 'gateway/llm-gateway.service.d/20-codex-subscription.conf'), 'utf8');
+const healthWaiter = resolve(root, 'gateway/wait-for-llm-gateway-health');
 const handler = readFileSync(resolve(root, 'gateway/pi_subscription_handler.py'), 'utf8');
 const entrypoint = '/home/kyle/install-mi-subscription-gateway.sh';
 
@@ -18,6 +21,8 @@ assert.doesNotMatch(config, /openrouter|cloudflare|coding-fast/i);
 assert.match(installer, /gateway\/litellm-config\.yaml/);
 assert.match(installer, /gateway\/pi_subscription_handler\.py/);
 assert.match(installer, /gateway\/start-llm-gateway/);
+assert.match(installer, /gateway\/wait-for-llm-gateway-health/);
+assert.match(installer, /wait-for-llm-gateway-health \/home\/kyle\/bin\/llm-gateway-health/);
 assert.match(installer, /systemctl daemon-reload/);
 assert.match(installer, /systemctl restart llm-gateway\.service/);
 assert.match(installer, /llm-gateway-health/);
@@ -30,6 +35,26 @@ assert.match(dropin, /ProtectHome=read-only/);
 assert.match(handler, /--no-tools/);
 assert.match(handler, /openai-codex\/gpt-5\.6-sol/);
 assert.match(handler, /env=PI_ENV/);
+
+// systemctl considers the service active as soon as LiteLLM execs, before Uvicorn
+// binds 127.0.0.1:4000. Exercise the exact tracked wait helper with two initial
+// connection-refused-equivalent failures, without touching systemd or port 4000.
+const temp = mkdtempSync(resolve(tmpdir(), 'mi-gateway-health-'));
+try {
+  const count = resolve(temp, 'count');
+  const fakeHealth = resolve(temp, 'health');
+  const fakeRunuser = resolve(temp, 'runuser');
+  writeFileSync(fakeHealth, `#!/bin/sh\ncount_file=${JSON.stringify(count)}\ncount=0\n[ -f "$count_file" ] && count=$(cat "$count_file")\ncount=$((count + 1))\nprintf '%s\\n' "$count" > "$count_file"\n[ "$count" -ge 3 ]\n`);
+  writeFileSync(fakeRunuser, '#!/bin/sh\nshift 3\nexec "$@"\n');
+  chmodSync(fakeHealth, 0o755);
+  chmodSync(fakeRunuser, 0o755);
+  const result = spawnSync('sh', [healthWaiter, fakeHealth], { encoding: 'utf8', timeout: 8_000, env: { ...process.env, PATH: `${temp}:/usr/bin:/bin` } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(count, 'utf8').trim(), '3', 'waiter must retry transient refused connections');
+} finally {
+  rmSync(temp, { recursive: true, force: true });
+}
+
 assert.ok(existsSync(entrypoint), 'root deployment entrypoint missing');
 assert.equal(statSync(entrypoint).mode & 0o777, 0o700, 'root deployment entrypoint must be mode 0700');
 assert.match(readFileSync(entrypoint, 'utf8'), /install-mi-subscription-gateway-root\.sh/);
