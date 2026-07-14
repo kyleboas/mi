@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope } from './mi-imessage-v2.mjs';
@@ -11,6 +12,8 @@ assert.match(webSource, /process\.env\.MI_IMESSAGE_MODEL \|\| 'vps-gateway\/codi
 const v2InvocationSource = webSource.slice(webSource.indexOf('async function runImessageV2'), webSource.indexOf('async function handleImessageV2'));
 assert.doesNotMatch(v2InvocationSource, /--mode', 'json'|--no-context-files|openai-codex\/gpt-5\.6-sol/, 'V2 uses bounded plain print output without stale flags or models');
 assert.match(v2InvocationSource, /'--print', '--offline'/, 'V2 explicitly requests Pi plain print output');
+assert.match(v2InvocationSource, /'--no-tools'/, 'V2 foreground decisions have no tools');
+assert.doesNotMatch(v2InvocationSource, /--extension|MI_CAPABILITY_|writeCapabilityGrantsFile|capabilityGuardPath/, 'V2 creates no guard or capability artifacts');
 assert.match(v2InvocationSource, /IMESSAGE_V2_LIMITS\.output/, 'V2 bounds plain stdout');
 const prompt = buildImessageV2Prompt({
   timestamp: '2026-07-14T12:00:00.000Z',
@@ -25,6 +28,9 @@ assert.ok(prompt.length <= IMESSAGE_V2_LIMITS.prompt, 'V2 prompt is globally cap
 assert.doesNotMatch(prompt, new RegExp(hugeSecret), 'V2 prompt redacts secret-like values');
 assert.match(prompt, /Recent thread \[thread JSONL/, 'V2 prompt labels thread provenance');
 assert.match(prompt, /mi-worker-result/, 'V2 context retains worker results');
+assert.match(prompt, /cannot inspect live state/, 'V2 contract makes foreground context-only');
+assert.match(prompt, /read-only task/, 'V2 contract delegates live verification to controlled work');
+assert.doesNotMatch(prompt, /inspect it with the read-only tools/, 'V2 contract never directs the tool-free foreground call to inspect');
 assert.deepEqual(parseImessageV2Envelope('```json\n{"kind":"reply","reply":"All good."}\n```'), { kind: 'reply', reply: 'All good.' });
 assert.deepEqual(parseImessageV2Envelope('{"kind":"task","objective":"Check the garden plan status and report the result.","ack":"I’ll check the garden plan.","continueTaskId":"task-17"}'), { kind: 'task', objective: 'Check the garden plan status and report the result.', ack: 'I’ll check the garden plan.', continueTaskId: 'task-17' });
 assert.equal(parseImessageV2Envelope('{"kind":"task","objective":"Check it.","ack":"I’ll check it.","continueTaskId":"../bad"}').fallback, true, 'invalid continuation ids fall back safely');
@@ -47,6 +53,7 @@ if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', objective: 'Dr
 if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Repair the notebook sync[^\\n]*\\| task ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', objective: 'Correct the notebook sync repair using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
 if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now?' };
 if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
+if (prompt.includes('CURRENT_STATE_TASK')) envelope = { kind: 'task', objective: 'Read-only verify the current status and report the result.', ack: 'I’ll check the current status.' };
 if (prompt.includes('NONZERO_CASE')) { process.stderr.write('provider failed for sk-test-secret and NONZERO_CASE\\n'); process.exit(7); }
 if (prompt.includes('EMPTY_CASE')) process.exit(0);
 if (prompt.includes('HUGE_OUTPUT_CASE')) process.stdout.write('x'.repeat(IMESSAGE_V2_LIMITS.output + 1));
@@ -76,6 +83,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
 
   let result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'What is the current status?' } })).json;
   assert.equal(result.handoff, false, 'conversational state question starts no worker');
+  assert.equal(result.reply, 'The current status looks good.', 'plain fake Pi envelope reaches /api/imessage');
   assert.equal(daemon.requests.filter((item) => item.type === 'run_worker').length, 0);
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'We decided on the garden plan.' } })).json;
@@ -85,9 +93,11 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   const piCalls = await readJsonl(piLog);
   assert.ok(piCalls.every((args) => args.includes('--offline')), 'every V2 spawn disables startup package discovery/install without replacing model settings');
   assert.ok(piCalls.every((args) => args.includes('--print') && !args.includes('--mode') && !args.includes('json')), 'V2 consumes plain print stdout rather than a JSON event stream');
+  assert.ok(piCalls.every((args) => args.includes('--no-tools') && !args.includes('--extension') && !args.includes('--tools')), 'V2 exact foreground argv is extension-free and tool-free');
   assert.ok(piCalls.every((args) => !args.includes('--no-context-files')), 'V2 never passes unsupported Pi CLI options');
+  assert.equal(existsSync(join(fixture.runtime, 'capabilities')), false, 'V2 creates no capability grant directory');
   assert.ok(piCalls.every((args) => args.includes('fake-model') && !args.some((arg) => /openai-codex|gpt-5\.6-sol/.test(arg))), 'V2 preserves the configured model override and never injects the stale model');
-  assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources beyond its explicit guard');
+  assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources');
   assert.ok(piCalls.at(-1).at(-1).includes('We decided on the garden plan.'), 'pronoun follow-up receives prior thread context');
   assert.doesNotMatch(piCalls.at(-1).at(-1), new RegExp(hugeSecret), 'fake Pi receives redacted context only');
 
@@ -129,11 +139,18 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   assert.equal(result.handoff, false);
   assert.doesNotMatch(result.reply, /Pi|worker|Photon/i, 'internal model output is replaced safely');
 
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CURRENT_STATE_TASK: What is the current status right now?' } })).json;
+  assert.equal(result.handoff, true, 'current-state uncertainty can hand off instead of fabricating a live reply');
+  assert.equal(result.reply, 'I’ll check the current status.');
+  assert.equal(runCount, 4, 'current-state task starts the controlled worker path');
+
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALFORMED_PLAIN_CASE' } })).json;
   assert.equal(result.ok, true);
   assert.equal(result.handoff, false);
   assert.match(result.reply, /Could you say that another way/i, 'malformed plain stdout keeps the safe reply fallback');
 
+  const unavailableBefore = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages
+    .filter((item) => item.source === 'imessage-v2-unavailable').length;
   for (const failureCase of ['NONZERO_CASE', 'EMPTY_CASE', 'TIMEOUT_CASE', 'HUGE_OUTPUT_CASE']) {
     result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: failureCase } })).json;
     assert.equal(result.ok, false, `${failureCase} reports invocation failure`);
@@ -141,9 +158,9 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
     assert.equal(result.temporary, true, `${failureCase} is marked temporary`);
     assert.match(result.reply, /temporarily unable to reach my assistant service/i, `${failureCase} has a truthful reply`);
   }
-  assert.equal(runCount, 3, 'invocation failures start no workers');
+  assert.equal(runCount, 4, 'invocation failures start no workers');
   messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
-  assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, 4, 'failure replies are durably categorized');
+  assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, unavailableBefore + 4, 'failure replies are durably categorized');
 
   console.log('Mi iMessage V2 checks passed.');
 } finally {
