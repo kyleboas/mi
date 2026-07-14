@@ -2057,6 +2057,10 @@ function v2Cancellation(message) {
   return /\b(?:cancel|never mind|nevermind|stop|don['’]t do it)\b/i.test(String(message || ''));
 }
 
+function v2ConfirmationQuestion(value) {
+  return String(value || '').trim().replace(/[.!?]+$/, '').trim() + '?';
+}
+
 async function v2CreatePendingAction(threadId, objective, capability) {
   const approval = await createApproval('Confirm this pending iMessage action.', 'iMessage V2 non-read action requires explicit confirmation.');
   const approvals = await readApprovals();
@@ -2153,11 +2157,10 @@ async function handleImessageV2(threadId, message) {
       pending.v2PendingAction?.capability === capability);
     if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
       if (!approved) {
-        const confirmationId = await v2CreatePendingAction(threadId, objective, capability || 'execute');
-        const reply = capability ? `Confirm this ${capability} action: ${objective}?` : 'I need you to confirm the exact action before I proceed.';
+        const reply = 'What exactly should I act on?';
         await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm', taskId: confirmationId });
-        return { ok: true, reply, handoff: false, confirmationId };
+        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
+        return { ok: true, reply, handoff: false };
       }
       await resolveApproval(pending.id, 'approved', 'bound confirmation accepted');
     }
@@ -2184,7 +2187,9 @@ async function handleImessageV2(threadId, message) {
     return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
   }
   const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
-  const reply = sanitizeMiConversationText(imessageCleanReply(decision.reply));
+  const reply = decision.kind === 'confirm'
+    ? v2ConfirmationQuestion(sanitizeMiConversationText(imessageCleanReply(decision.reply)))
+    : sanitizeMiConversationText(imessageCleanReply(decision.reply));
   await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
   await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source });
   return { ok: true, reply: redact(reply), handoff: false };

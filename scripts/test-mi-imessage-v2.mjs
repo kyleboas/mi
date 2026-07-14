@@ -51,7 +51,7 @@ if (prompt.includes('CORRELATION_TASK')) envelope = { kind: 'task', capability: 
 if (prompt.includes('ACTIVE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status and report the result.', ack: 'I’ll repair notebook sync.' };
 if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the quarterly travel plan and report it.', ack: 'I’ll draft the travel plan.' };
 if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Read the notebook sync[^\\n]*\\| task ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
-if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now?' };
+if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now.?' };
 if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
 if (prompt.includes('CURRENT_STATE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read-only verify the current status and report the result.', ack: 'I’ll check the current status.' };
 if (prompt.includes('MALICIOUS_RESTART_READ')) envelope = { kind: 'task', capability: 'read', objective: 'Restart mi-web-chat.service now.', ack: 'I’ll restart it.' };
@@ -134,7 +134,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CONFIRM_CASE' } })).json;
   assert.equal(result.handoff, false);
-  assert.match(result.reply, /Should I deploy/);
+  assert.equal(result.reply, 'Should I deploy the garden-plan change now?');
   assert.equal(runCount, 3, 'confirm starts no worker');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'INTERNAL_CASE' } })).json;
@@ -149,10 +149,13 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   const workersBeforeBlockedTasks = runCount;
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALICIOUS_RESTART_READ' } })).json;
   assert.equal(result.handoff, false, 'restart mislabeled read never starts a worker');
-  assert.match(result.reply, /Confirm this read action/i);
+  assert.equal(result.reply, 'What exactly should I act on?');
+  assert.equal(result.confirmationId, undefined, 'ambiguous model task creates no pending confirmation');
   assert.equal(runCount, workersBeforeBlockedTasks, 'blocked restart emits no worker');
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MISSING_CAP_DEPLOY' } })).json;
   assert.equal(result.handoff, false, 'missing capability never starts a worker');
+  assert.equal(result.confirmationId, undefined, 'missing capability creates no pending confirmation');
+  assert.equal(result.reply, 'What exactly should I act on?');
   assert.equal(runCount, workersBeforeBlockedTasks, 'missing capability emits no worker');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALFORMED_PLAIN_CASE' } })).json;
