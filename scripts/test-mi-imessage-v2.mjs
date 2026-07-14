@@ -8,7 +8,10 @@ import { createHermeticMiEnv, httpJson, readJsonl, startFakeDaemon, startWebChat
 const hugeSecret = `sk-${'x'.repeat(40)}`;
 const webSource = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
 assert.match(webSource, /process\.env\.MI_IMESSAGE_MODEL \|\| 'vps-gateway\/coding-main'/, 'V2 defaults to the canonical local gateway model');
-assert.doesNotMatch(webSource.slice(webSource.indexOf('async function runImessageV2'), webSource.indexOf('async function handleImessageV2')), /--no-context-files|openai-codex\/gpt-5\.6-sol/, 'V2 spawn uses no unsupported option or stale model');
+const v2InvocationSource = webSource.slice(webSource.indexOf('async function runImessageV2'), webSource.indexOf('async function handleImessageV2'));
+assert.doesNotMatch(v2InvocationSource, /--mode', 'json'|--no-context-files|openai-codex\/gpt-5\.6-sol/, 'V2 uses bounded plain print output without stale flags or models');
+assert.match(v2InvocationSource, /'--print', '--offline'/, 'V2 explicitly requests Pi plain print output');
+assert.match(v2InvocationSource, /IMESSAGE_V2_LIMITS\.output/, 'V2 bounds plain stdout');
 const prompt = buildImessageV2Prompt({
   timestamp: '2026-07-14T12:00:00.000Z',
   userMessage: 'Can you check it?',
@@ -46,7 +49,9 @@ if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Shoul
 if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
 if (prompt.includes('NONZERO_CASE')) { process.stderr.write('provider failed for sk-test-secret and NONZERO_CASE\\n'); process.exit(7); }
 if (prompt.includes('EMPTY_CASE')) process.exit(0);
-if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: JSON.stringify(envelope) } }) + '\\n');
+if (prompt.includes('HUGE_OUTPUT_CASE')) process.stdout.write('x'.repeat(IMESSAGE_V2_LIMITS.output + 1));
+if (prompt.includes('MALFORMED_PLAIN_CASE')) process.stdout.write('not an envelope\\n');
+if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!prompt.includes('HUGE_OUTPUT_CASE') && !prompt.includes('MALFORMED_PLAIN_CASE')) process.stdout.write(JSON.stringify(envelope) + '\\n');
 `, { mode: 0o755 });
   await chmod(fixture.fakePi, 0o755);
   await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
@@ -79,6 +84,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else proces
   assert.equal(result.handoff, false);
   const piCalls = await readJsonl(piLog);
   assert.ok(piCalls.every((args) => args.includes('--offline')), 'every V2 spawn disables startup package discovery/install without replacing model settings');
+  assert.ok(piCalls.every((args) => args.includes('--print') && !args.includes('--mode') && !args.includes('json')), 'V2 consumes plain print stdout rather than a JSON event stream');
   assert.ok(piCalls.every((args) => !args.includes('--no-context-files')), 'V2 never passes unsupported Pi CLI options');
   assert.ok(piCalls.every((args) => args.includes('fake-model') && !args.some((arg) => /openai-codex|gpt-5\.6-sol/.test(arg))), 'V2 preserves the configured model override and never injects the stale model');
   assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources beyond its explicit guard');
@@ -123,7 +129,12 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else proces
   assert.equal(result.handoff, false);
   assert.doesNotMatch(result.reply, /Pi|worker|Photon/i, 'internal model output is replaced safely');
 
-  for (const failureCase of ['NONZERO_CASE', 'EMPTY_CASE', 'TIMEOUT_CASE']) {
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALFORMED_PLAIN_CASE' } })).json;
+  assert.equal(result.ok, true);
+  assert.equal(result.handoff, false);
+  assert.match(result.reply, /Could you say that another way/i, 'malformed plain stdout keeps the safe reply fallback');
+
+  for (const failureCase of ['NONZERO_CASE', 'EMPTY_CASE', 'TIMEOUT_CASE', 'HUGE_OUTPUT_CASE']) {
     result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: failureCase } })).json;
     assert.equal(result.ok, false, `${failureCase} reports invocation failure`);
     assert.equal(result.handoff, false, `${failureCase} starts no worker`);
@@ -132,7 +143,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else proces
   }
   assert.equal(runCount, 3, 'invocation failures start no workers');
   messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
-  assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, 3, 'failure replies are durably categorized');
+  assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, 4, 'failure replies are durably categorized');
 
   console.log('Mi iMessage V2 checks passed.');
 } finally {
