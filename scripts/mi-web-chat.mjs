@@ -863,8 +863,20 @@ function workerMatchesContinuationId(worker, taskId) {
   return Boolean(value && [worker?.correlationId, worker?.taskId, worker?.id, worker?.sessionId, worker?.sessionFile, worker?.sessionName, worker?.name].filter(Boolean).some((id) => String(id) === value));
 }
 
+function v2StableContinuationCandidates(threadId) {
+  return Array.from(activeWorkers.values()).filter((worker) => worker.threadId === threadId && worker.correlationId && (workerIsActive(worker) || workerIsRecent(worker)));
+}
+
 function activeWorkerForV2Continuation(threadId, taskId) {
-  return Array.from(activeWorkers.values()).find((worker) => worker.threadId === threadId && workerIsActive(worker) && workerMatchesContinuationId(worker, taskId));
+  return v2StableContinuationCandidates(threadId).find((worker) => String(worker.correlationId) === String(taskId));
+}
+
+function v2ExplicitCorrelation(message, threadId) {
+  const ids = [...new Set(String(message || '').match(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi) || [])];
+  if (!ids.length) return { worker: undefined };
+  if (ids.length !== 1) return { invalid: true };
+  const worker = activeWorkerForV2Continuation(threadId, ids[0]);
+  return worker ? { worker } : { invalid: true };
 }
 
 function recentWorkerForThread(threadId) {
@@ -2170,7 +2182,14 @@ async function handleImessageV2(threadId, message) {
       await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
       return { ok: true, reply, handoff: false };
     }
-    const active = decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined;
+    const explicit = v2ExplicitCorrelation(message, threadId);
+    if (explicit.invalid || (decision.continueTaskId && !activeWorkerForV2Continuation(threadId, decision.continueTaskId))) {
+      const reply = 'Which earlier task should I continue?';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
+      return { ok: true, reply, handoff: false };
+    }
+    const active = explicit.worker || (decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined);
     if (active) {
       const result = await continueBackgroundWorker(threadId, active, objective, {
         threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
