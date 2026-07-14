@@ -22,6 +22,13 @@ export type Approval = {
   principal?: Principal;
   expiresAt?: string;
   capabilityId?: string;
+  v2PendingAction?: {
+    threadId: string;
+    objective: string;
+    capability: string;
+    confirmationId: string;
+    consumedAt?: string;
+  };
 };
 
 export async function ensureState() {

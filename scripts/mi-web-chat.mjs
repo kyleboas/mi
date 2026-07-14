@@ -12,7 +12,7 @@ import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
 import { buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text } from './mi-imessage-v2.mjs';
-import { logEvent } from '../dist/src/state.js';
+import { createApproval, logEvent, readApprovals, resolveApproval, writeApprovals } from '../dist/src/state.js';
 import {
   imessageAskFirstReply,
   imessageDetectCandidatesQuery,
@@ -1063,7 +1063,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   const name = options.name || `${taskNameFromPrompt(message)}-${Date.now().toString(36).slice(-6)}`;
   const workerPrompt = await buildBackgroundWorkerPrompt(threadId, message, decision);
   const startedAt = now();
-  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: true, model: workerModel, allowDuplicate: options.allowDuplicate === true }, 30000);
+  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
   const worker = {
     id: result.taskId || result.sessionId || result.sessionFile || `worker_${Date.now().toString(36)}`,
     threadId,
@@ -2036,6 +2036,48 @@ async function buildImessageV2Context(threadId, message) {
 }
 
 const imessageV2UnavailableReply = 'I’m temporarily unable to reach my assistant service. Please try again shortly.';
+const v2TaskCapabilities = new Set(['read', 'write', 'execute', 'external']);
+const v2NeutralReadAck = 'I’ll check that and get back to you.';
+
+function v2CanonicalObjective(value) {
+  return redactV2Text(String(value || '')).replace(/\s+/g, ' ').trim().slice(0, 4000);
+}
+
+function v2ReadOnlyObjective(objective) {
+  const text = objective.toLowerCase();
+  if (!/\b(read|inspect|check|verify|report|summari[sz]e|status|list|find|grep|package|readme)\b/.test(text)) return false;
+  return !/\b(restart|systemctl|service|deploy|publish|merge|delete|write|edit|install|send|message|email|http|curl|network|token|secret|password|key)\b/.test(text);
+}
+
+function v2Affirmative(message) {
+  return /^(?:yes|yep|yeah|confirm|approve|do it|go ahead|proceed)\b[.! ]*$/i.test(String(message || '').trim());
+}
+
+function v2Cancellation(message) {
+  return /\b(?:cancel|never mind|nevermind|stop|don['’]t do it)\b/i.test(String(message || ''));
+}
+
+async function v2CreatePendingAction(threadId, objective, capability) {
+  const approval = await createApproval('Confirm this pending iMessage action.', 'iMessage V2 non-read action requires explicit confirmation.');
+  const approvals = await readApprovals();
+  const pending = approvals.find((item) => item.id === approval.id);
+  if (pending) {
+    pending.v2PendingAction = { threadId, objective, capability, confirmationId: approval.id, consumedAt: undefined };
+    await writeApprovals(approvals);
+  }
+  return approval.id;
+}
+
+async function v2PendingAction(threadId) {
+  const approvals = await readApprovals();
+  return approvals.find((item) => item.status === 'pending' && item.v2PendingAction?.threadId === threadId && !item.v2PendingAction?.consumedAt);
+}
+
+async function v2ClearPendingAction(threadId) {
+  const pending = await v2PendingAction(threadId);
+  if (pending) await resolveApproval(pending.id, 'rejected', 'cancelled');
+}
+
 
 function imessageV2SafeStderr(stderr, prompt, message) {
   return redactV2Text(String(stderr || '')
@@ -2089,6 +2131,12 @@ async function runImessageV2(message, threadId) {
 }
 
 async function handleImessageV2(threadId, message) {
+  if (v2Cancellation(message)) {
+    await v2ClearPendingAction(threadId);
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', 'Okay, I won’t proceed with that action.', { unread: false, source: 'imessage-v2-confirm-cancelled' });
+    return { ok: true, reply: 'Okay, I won’t proceed with that action.', handoff: false };
+  }
   const invocation = await runImessageV2(message, threadId);
   if (invocation.failure) {
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
@@ -2097,19 +2145,41 @@ async function handleImessageV2(threadId, message) {
   }
   const decision = invocation.decision;
   if (decision.kind === 'task') {
+    const objective = v2CanonicalObjective(decision.objective);
+    const capability = v2TaskCapabilities.has(decision.capability) ? decision.capability : undefined;
+    const pending = await v2PendingAction(threadId);
+    const approved = Boolean(pending && v2Affirmative(message) && decision.confirmationId === pending.id &&
+      pending.v2PendingAction?.confirmationId === decision.confirmationId && pending.v2PendingAction?.objective === objective &&
+      pending.v2PendingAction?.capability === capability);
+    if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
+      if (!approved) {
+        const confirmationId = await v2CreatePendingAction(threadId, objective, capability || 'execute');
+        const reply = capability ? `Confirm this ${capability} action: ${objective}?` : 'I need you to confirm the exact action before I proceed.';
+        await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm', taskId: confirmationId });
+        return { ok: true, reply, handoff: false, confirmationId };
+      }
+      await resolveApproval(pending.id, 'approved', 'bound confirmation accepted');
+    }
+    if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
+      const reply = 'That action is approved, but this channel can only dispatch read-only checks.';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
+      return { ok: true, reply, handoff: false };
+    }
     const active = decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined;
     if (active) {
-      const result = await continueBackgroundWorker(threadId, active, decision.objective, {
-        threadMessage: message, userSource: 'imessage-v2-user', ackReply: decision.ack,
-        ackSource: 'imessage-v2-task-ack', taskId: true, subject: decision.objective,
+      const result = await continueBackgroundWorker(threadId, active, objective, {
+        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
+        ackSource: 'imessage-v2-task-ack', taskId: true, subject: objective,
       });
       return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
     }
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    const result = await startBackgroundWorker(threadId, decision.objective, {
-      appendUser: false, ackReply: decision.ack, ackSource: 'imessage-v2-task-ack', taskId: true,
-      userSource: 'imessage-v2-user', subject: decision.objective, allowDuplicate: true,
-      decision: { start: true, reason: 'iMessage V2 assistant judgment' },
+    const result = await startBackgroundWorker(threadId, objective, {
+      appendUser: false, ackReply: v2NeutralReadAck, ackSource: 'imessage-v2-task-ack', taskId: true,
+      userSource: 'imessage-v2-user', subject: objective, capabilityProfile: 'worker-read', allowDuplicate: true,
+      decision: { start: true, reason: 'iMessage V2 read-only task gate' },
     });
     return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
   }

@@ -32,7 +32,7 @@ assert.match(prompt, /cannot inspect live state/, 'V2 contract makes foreground 
 assert.match(prompt, /read-only task/, 'V2 contract delegates live verification to controlled work');
 assert.doesNotMatch(prompt, /inspect it with the read-only tools/, 'V2 contract never directs the tool-free foreground call to inspect');
 assert.deepEqual(parseImessageV2Envelope('```json\n{"kind":"reply","reply":"All good."}\n```'), { kind: 'reply', reply: 'All good.' });
-assert.deepEqual(parseImessageV2Envelope('{"kind":"task","objective":"Check the garden plan status and report the result.","ack":"I’ll check the garden plan.","continueTaskId":"task-17"}'), { kind: 'task', objective: 'Check the garden plan status and report the result.', ack: 'I’ll check the garden plan.', continueTaskId: 'task-17' });
+assert.deepEqual(parseImessageV2Envelope('{"kind":"task","capability":"read","objective":"Check the garden plan status and report the result.","ack":"I’ll check the garden plan.","continueTaskId":"task-17"}'), { kind: 'task', capability: 'read', objective: 'Check the garden plan status and report the result.', ack: 'I’ll check the garden plan.', continueTaskId: 'task-17' });
 assert.equal(parseImessageV2Envelope('{"kind":"task","objective":"Check it.","ack":"I’ll check it.","continueTaskId":"../bad"}').fallback, true, 'invalid continuation ids fall back safely');
 assert.equal(parseImessageV2Envelope('not json').kind, 'reply', 'malformed output safely falls back');
 assert.equal(parseImessageV2Envelope('{"kind":"reply","reply":"I used Pi workers."}').fallback, true, 'internal terms never reach the user');
@@ -47,13 +47,15 @@ import { appendFileSync } from 'node:fs';
 const prompt = process.argv.at(-1) || '';
 appendFileSync(${JSON.stringify(piLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');
 let envelope = { kind: 'reply', reply: 'The current status looks good.' };
-if (prompt.includes('CORRELATION_TASK')) envelope = { kind: 'task', objective: 'Check the garden plan status and report a concise update.', ack: 'I’ll check the garden plan.' };
-if (prompt.includes('ACTIVE_TASK')) envelope = { kind: 'task', objective: 'Repair the notebook sync and report the result.', ack: 'I’ll repair notebook sync.' };
-if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', objective: 'Draft the quarterly travel plan and report it.', ack: 'I’ll draft the travel plan.' };
-if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Repair the notebook sync[^\\n]*\\| task ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', objective: 'Correct the notebook sync repair using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
+if (prompt.includes('CORRELATION_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Check the garden plan status and report a concise update.', ack: 'I’ll check the garden plan.' };
+if (prompt.includes('ACTIVE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status and report the result.', ack: 'I’ll repair notebook sync.' };
+if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the quarterly travel plan and report it.', ack: 'I’ll draft the travel plan.' };
+if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Read the notebook sync[^\\n]*\\| task ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
 if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now?' };
 if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
-if (prompt.includes('CURRENT_STATE_TASK')) envelope = { kind: 'task', objective: 'Read-only verify the current status and report the result.', ack: 'I’ll check the current status.' };
+if (prompt.includes('CURRENT_STATE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read-only verify the current status and report the result.', ack: 'I’ll check the current status.' };
+if (prompt.includes('MALICIOUS_RESTART_READ')) envelope = { kind: 'task', capability: 'read', objective: 'Restart mi-web-chat.service now.', ack: 'I’ll restart it.' };
+if (prompt.includes('MISSING_CAP_DEPLOY')) envelope = { kind: 'task', objective: 'Deploy the service now.', ack: 'I’ll deploy it.' };
 if (prompt.includes('NONZERO_CASE')) { process.stderr.write('provider failed for sk-test-secret and NONZERO_CASE\\n'); process.exit(7); }
 if (prompt.includes('EMPTY_CASE')) process.exit(0);
 if (prompt.includes('HUGE_OUTPUT_CASE')) process.stdout.write('x'.repeat(IMESSAGE_V2_LIMITS.output + 1));
@@ -105,7 +107,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   assert.equal(result.handoff, true);
   const correlationId = result.taskId;
   assert.match(correlationId, /^[0-9a-f-]{36}$/i, 'V2 exposes a generated stable correlation id, not a daemon id');
-  assert.equal(result.reply, 'I’ll check the garden plan.');
+  assert.equal(result.reply, 'I’ll check that and get back to you.');
   assert.equal(daemon.requests.filter((item) => item.type === 'run_worker').length, 1, 'task starts exactly one worker');
   let messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
   assert.ok(messages.some((item) => item.source === 'imessage-v2-task-ack' && item.taskId === correlationId), 'V2 acknowledgement carries the stable correlation id');
@@ -128,7 +130,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   assert.equal(daemon.requests.filter((item) => item.type === 'continue_worker').length, 1, 'explicit continuation uses the matching active worker');
   messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
   assert.equal(messages.filter((item) => item.role === 'user' && item.text === 'FOLLOWUP_TASK: use the new notes').length, 1, 'continuation persists Kyle’s natural wording exactly once');
-  assert.equal(messages.filter((item) => item.role === 'user' && /Correct the notebook sync repair/.test(item.text)).length, 0, 'continuation does not persist the model objective as the user message');
+  assert.equal(messages.filter((item) => item.role === 'user' && /Read the notebook sync status using/.test(item.text)).length, 0, 'continuation does not persist the model objective as the user message');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CONFIRM_CASE' } })).json;
   assert.equal(result.handoff, false);
@@ -141,8 +143,17 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CURRENT_STATE_TASK: What is the current status right now?' } })).json;
   assert.equal(result.handoff, true, 'current-state uncertainty can hand off instead of fabricating a live reply');
-  assert.equal(result.reply, 'I’ll check the current status.');
+  assert.equal(result.reply, 'I’ll check that and get back to you.');
   assert.equal(runCount, 4, 'current-state task starts the controlled worker path');
+
+  const workersBeforeBlockedTasks = runCount;
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALICIOUS_RESTART_READ' } })).json;
+  assert.equal(result.handoff, false, 'restart mislabeled read never starts a worker');
+  assert.match(result.reply, /Confirm this read action/i);
+  assert.equal(runCount, workersBeforeBlockedTasks, 'blocked restart emits no worker');
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MISSING_CAP_DEPLOY' } })).json;
+  assert.equal(result.handoff, false, 'missing capability never starts a worker');
+  assert.equal(runCount, workersBeforeBlockedTasks, 'missing capability emits no worker');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALFORMED_PLAIN_CASE' } })).json;
   assert.equal(result.ok, true);
