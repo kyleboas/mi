@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT_PATH="$UNIT_DIR/mi-web-chat.service"
+DROPIN_DIR="$UNIT_DIR/mi-web-chat.service.d"
+DROPIN_PATH="$DROPIN_DIR/10-nvm-pi-path.conf"
+NVM_PI_PATH_DROPIN="$ROOT/systemd/mi-web-chat.service.d/10-nvm-pi-path.conf"
 DNS_NAME="${1:-}"
 
 if [ -z "$DNS_NAME" ]; then
@@ -26,7 +29,8 @@ fi
 TLS_DIR="$ROOT/state/tls"
 CERT_PATH="$TLS_DIR/$DNS_NAME.crt"
 KEY_PATH="$TLS_DIR/$DNS_NAME.key"
-install -d -m 700 "$UNIT_DIR" "$TLS_DIR"
+install -d -m 700 "$UNIT_DIR" "$TLS_DIR" "$DROPIN_DIR"
+install -m 644 "$NVM_PI_PATH_DROPIN" "$DROPIN_PATH"
 
 cat > "$UNIT_PATH" <<EOF
 [Unit]
