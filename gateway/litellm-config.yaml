@@ -5,6 +5,24 @@ model_list:
     litellm_params:
       model: pi-subscription/coding-main
       api_key: ""
+  # Authenticated local-only aliases for the offline Mi decision evaluation.
+  # They are immutable profiles in pi_subscription_handler.py, not user inputs.
+  - model_name: mi-eval-luna-low
+    litellm_params:
+      model: pi-subscription/mi-eval-luna-low
+      api_key: ""
+  - model_name: mi-eval-sol-low
+    litellm_params:
+      model: pi-subscription/mi-eval-sol-low
+      api_key: ""
+  - model_name: mi-eval-terra-low
+    litellm_params:
+      model: pi-subscription/mi-eval-terra-low
+      api_key: ""
+  - model_name: mi-eval-sol-high
+    litellm_params:
+      model: pi-subscription/mi-eval-sol-high
+      api_key: ""
 litellm_settings:
   drop_params: true
   telemetry: false

@@ -16,6 +16,9 @@ const entrypoint = '/home/kyle/install-mi-subscription-gateway.sh';
 
 assert.match(config, /model_name: coding-main/);
 assert.match(config, /model: pi-subscription\/coding-main/);
+for (const alias of ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-high']) {
+  assert.match(config, new RegExp(`model_name: ${alias}\\n\\s+litellm_params:\\n\\s+model: pi-subscription/${alias}`), `${alias} must be an explicit gateway alias`);
+}
 assert.match(config, /custom_handler: pi_subscription_handler\.pi_subscription_llm/);
 assert.doesNotMatch(config, /openrouter|cloudflare|coding-fast/i);
 assert.match(installer, /gateway\/litellm-config\.yaml/);
@@ -34,6 +37,8 @@ assert.match(dropin, /LoadCredential=gateway:\/etc\/agent-secrets\/local-agent-g
 assert.match(dropin, /ProtectHome=read-only/);
 assert.match(handler, /--no-tools/);
 assert.match(handler, /openai-codex\/gpt-5\.6-sol/);
+assert.match(handler, /mi-eval-luna-low/);
+assert.match(handler, /subscription profile does not accept effort overrides/);
 assert.match(handler, /env=PI_ENV/);
 
 // systemctl considers the service active as soon as LiteLLM execs, before Uvicorn

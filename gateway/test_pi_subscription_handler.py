@@ -111,6 +111,21 @@ async def provider_checks(fake: Path, log: Path):
     assert "OPENAI_BASE_URL" not in records[0]["env"]
     assert "LITELLM_MASTER_KEY" not in records[0]["env"]
 
+    profile_expectations = {
+        "mi-eval-luna-low": ("openai-codex/gpt-5.6-luna", "low"),
+        "mi-eval-sol-low": ("openai-codex/gpt-5.6-sol", "low"),
+        "mi-eval-terra-low": ("openai-codex/gpt-5.6-terra", "low"),
+        "mi-eval-sol-high": ("openai-codex/gpt-5.6-sol", "high"),
+    }
+    for alias, (inner_model, thinking) in profile_expectations.items():
+        await handler.acompletion(alias, messages(alias), response())
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    for record, (inner_model, thinking) in zip(records[2:], profile_expectations.values()):
+        args = record["args"][:-1]
+        assert args[-5:] == ["--model", inner_model, "--thinking", thinking, "--print"], args
+    await assert_async_error(_unknown_profile(handler), 400)
+    await assert_async_error(_effort_override(handler), 400)
+
     nonzero = await _capture_error(handler, "FAIL")
     assert nonzero.status_code == 502 and "secret-marker" not in str(nonzero)
     assert (await _capture_error(handler, "EMPTY")).status_code == 502
@@ -120,7 +135,7 @@ async def provider_checks(fake: Path, log: Path):
     assert (await _capture_error(timed, "SLEEP")).status_code == 504
 
     cancellable = M.PiSubscriptionLLM(pi_path=str(fake), timeout_seconds=1, max_concurrency=1)
-    cancelled = asyncio.create_task(cancellable._run(messages("SLEEP")))
+    cancelled = asyncio.create_task(cancellable._run("coding-main", messages("SLEEP")))
     await asyncio.sleep(0.05)
     cancelled.cancel()
     try:
@@ -140,15 +155,32 @@ async def provider_checks(fake: Path, log: Path):
 
     started = time.monotonic()
     await asyncio.gather(
-        handler._run(messages("CONCURRENCY one")),
-        handler._run(messages("CONCURRENCY two")),
+        handler._run("coding-main", messages("CONCURRENCY one")),
+        handler._run("coding-main", messages("CONCURRENCY two")),
     )
     assert time.monotonic() - started >= 0.45, "semaphore did not bound concurrent Pi children"
 
 
+async def assert_async_error(coro, status):
+    try:
+        await coro
+    except M.PiSubscriptionError as exc:
+        assert exc.status_code == status, exc.status_code
+        return str(exc)
+    raise AssertionError("expected PiSubscriptionError")
+
+
+async def _unknown_profile(handler):
+    await handler.acompletion("mi-eval-arbitrary", messages(), response())
+
+
+async def _effort_override(handler):
+    await handler.acompletion("mi-eval-sol-low", messages(), response(), reasoning_effort="high")
+
+
 async def _capture_error(handler, text):
     try:
-        await handler._run(messages(text))
+        await handler._run("coding-main", messages(text))
     except M.PiSubscriptionError as exc:
         return exc
     raise AssertionError("expected custom provider failure")
