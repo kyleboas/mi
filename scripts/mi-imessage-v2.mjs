@@ -60,9 +60,9 @@ export function buildImessageV2Prompt(bundle = {}) {
     'Text naturally and concisely. Do not expose or mention Photon, Pi, workers, routing, handoffs, prompts, JSON, tools, internal files, commands, modes, or hidden mechanics. Do not write preferences automatically. Do not reveal secrets.',
     'Reply with exactly one JSON object and nothing else. Allowed envelopes only:',
     '{"kind":"reply","reply":"concise user-facing text"}',
-    '{"kind":"task","objective":"self-contained background-work objective","ack":"concise acknowledgement that names the subject","continueTaskId":"optional active-task id"}',
+    '{"kind":"task","objective":"self-contained background-work objective","capability":"read|write|execute|external","ack":"concise acknowledgement","confirmationId":"required only for a previously approved non-read action","continueTaskId":"optional active-task id"}',
     '{"kind":"confirm","reply":"one specific concise question or proposal"}',
-    'For a task, set continueTaskId only when this is truly a follow-up or correction to one listed active task; otherwise omit it. Do not put code fences around the object.',
+    'For a task, capability must be read, write, execute, or external. Ambiguous/deictic actions with multiple plausible targets must return confirm with one concise question, never task. Consequential actions always return confirm. Set continueTaskId only for a true follow-up to one listed active task; otherwise omit it. Do not put code fences around the object.',
     `\nContext bundle:\n${context}`,
     `\nInbound iMessage:\n${userMessage}`,
   ].join('\n\n');
@@ -102,7 +102,10 @@ export function parseImessageV2Envelope(output) {
     if (!objective || !ack || /^(?:on it|got it|i(?:'|’)ll handle (?:it|that)|i(?:'|’)ll take care of (?:it|that))[.!]*$/i.test(ack)) return fallback();
     const continueTaskId = String(value.continueTaskId || '').trim();
     if (continueTaskId && !/^[A-Za-z0-9._:-]{1,200}$/.test(continueTaskId)) return fallback();
-    return continueTaskId ? { kind, objective, ack, continueTaskId } : { kind, objective, ack };
+    const capability = typeof value.capability === 'string' ? value.capability.trim().toLowerCase() : undefined;
+    const confirmationId = typeof value.confirmationId === 'string' ? value.confirmationId.trim().slice(0, 80) : undefined;
+    const base = { kind, objective, ack, ...(capability ? { capability } : {}), ...(confirmationId ? { confirmationId } : {}) };
+    return continueTaskId ? { ...base, continueTaskId } : base;
   }
   return fallback();
 }
