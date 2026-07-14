@@ -16,6 +16,7 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const fixturePath = resolve(root, 'scripts/fixtures/mi-model-eval-cases.json');
 const outputRoot = resolve(root, '.tmp/mi-model-eval');
 const piGateway = '/home/kyle/bin/pi-gateway';
+export const SAFE_PI_PATH = '/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin';
 export const PROFILES = Object.freeze([
   { id: 'mi-eval-luna-low', label: 'Luna-low' },
   { id: 'mi-eval-sol-low', label: 'Sol-low' },
@@ -109,7 +110,9 @@ export function invokeThroughGateway(profile, prompt, { command = piGateway, tim
   const args = ['--print', '--offline', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-tools', '--model', `vps-gateway/${profile}`, prompt];
   return new Promise((resolveInvocation) => {
     const started = performance.now();
-    const child = spawn(command, args, { cwd: root, env: { PATH: process.env.PATH || '/usr/bin:/bin', HOME: process.env.HOME || '/home/kyle', PI_OFFLINE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    // pi-gateway intentionally resolves `pi` from PATH. Pin it to the NVM Pi
+    // binary rather than inheriting a service/minimal PATH that may select /usr/bin/pi.
+    const child = spawn(command, args, { cwd: root, env: { PATH: SAFE_PI_PATH, HOME: '/home/kyle', LC_ALL: 'C.UTF-8', PI_OFFLINE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     const finish = (failure) => resolveInvocation({ raw: stdout.slice(0, 6_000), latencyMs: Math.round(performance.now() - started), failure });
     const timer = setTimeout(() => { child.kill('SIGTERM'); finish('timeout'); }, timeoutMs);
