@@ -178,7 +178,7 @@ Optional env:
 - `PHOTON_ALLOW_ALL_USERS=true` — dev only; do not use for a terminal-capable assistant.
 - `MI_PHOTON_MAX_WAIT_MS=1800000` — how long the bridge waits for a background-worker result after sending its acknowledgement; defaults to 30 minutes.
 - `MI_IMESSAGE_V2=0` — immediately use the retained legacy V1 iMessage router instead of the default minimal V2 concierge.
-- `MI_IMESSAGE_MODEL` — override V2's default `openai-codex/gpt-5.6-sol` model.
+- `MI_IMESSAGE_MODEL` — override V2's default `vps-gateway/coding-main` local gateway model.
 - `MI_IMESSAGE_ASK_FIRST=1` — legacy V1 opt-in to always asking before iMessage starts tool-backed work.
 - `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint for Mi proactive notices.
 - `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — send Mi proactive notifications to iMessage through the local Photon notify endpoint.
