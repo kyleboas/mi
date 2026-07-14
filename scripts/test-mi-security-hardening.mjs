@@ -22,13 +22,13 @@ assert.match(daemonSource, /chmod\(dirname\(SOCKET_PATH\), 0o700\)/, 'Mi daemon 
 assert.match(flueSource, /const flueConfigured = Boolean\(process\.env\.FLUE_URL \|\| process\.env\.FLUE_CHAT_URL \|\| process\.env\.FLUE_CMD/, 'Mi chat must not try slow Flue CLI unless Flue is configured');
 assert.match(flueSource, /return runPiChat\(message,[\s\S]*'Flue not configured'/, 'Mi chat must default to the pi fallback when Flue is unconfigured');
 assert.match(flueSource, /function directChatReply\(message: string\)/, 'Mi chat must fast-path simple conversational replies');
-assert.match(flueSource, /const chatTools = process\.env\.MI_CHAT_TOOLS \|\| 'read,grep,find,ls'/, 'Mi chat fallback must deny raw bash by default');
+assert.match(flueSource, /process\.env\.MI_CHAT_TOOLS \|\|.*'read,grep,find,ls'/, 'Mi chat fallback must deny raw bash by default');
 assert.match(flueSource, /MI_CAPABILITY_GRANTS_FILE: grantsFile/, 'Mi chat fallback must pass an explicit capability grant file');
 assert.match(flueSource, /env: reducedPiEnv\(/, 'Mi chat fallback must use a reduced env, not process.env');
 assert.match(flueSource, /'--no-extensions', '--extension', guard/, 'Mi chat fallback must disable ambient extensions and load only the capability guard');
 assert.doesNotMatch(flueSource, /env: process\.env/, 'Mi chat fallback must not pass full process.env');
 
-assert.match(webChatSource, /process\.env\.MI_CHAT_TOOLS \|\| 'read,grep,find,ls'/, 'iMessage chat fallback must deny raw bash by default');
+assert.match(webChatSource, /'chat-read':\s*'read,grep,find,ls'/, 'iMessage chat fallback must deny raw bash by default for chat-read profile');
 assert.match(webChatSource, /MI_CAPABILITY_GRANTS_FILE: grantsFile/, 'iMessage chat fallback must pass an explicit capability grant file');
 assert.match(webChatSource, /env: reducedPiEnv\(/, 'iMessage chat fallback must use a reduced env');
 assert.match(notifySource, /MI_PUSHOVER_NOTIFY \|\| process\.env\.MI_PUSHOVER_FALLBACK/, 'Pushover notifications must be opt-in only');

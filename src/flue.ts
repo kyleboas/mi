@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { capabilityGrantExpiresAt } from './capability-gc.js';
+import { CAPABILITY_PROFILES, rightsForProfile } from './capabilities.js';
+import type { CapabilityProfileName } from './capabilities.js';
 
 export type FlueChatResult = {
   reply: string;
@@ -59,21 +61,35 @@ function capabilityGuardPath() {
   return process.env.MI_CAPABILITY_GUARD || path.join(miRoot(), 'pi', 'extensions', 'mi-capability-guard.ts');
 }
 
-async function writeCapabilityGrantsFile(cwd: string, profile = 'chat-read') {
+async function writeCapabilityGrantsFile(cwd: string, profile: CapabilityProfileName = 'chat-read') {
   const dir = path.join(miRuntimeDir(), 'capabilities');
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
   const createdAt = new Date().toISOString();
-  const grant = {
-    id: `${profile}-${Date.now().toString(36)}`,
-    resource: `file://${path.resolve(cwd)}`,
-    rights: ['read'],
-    constraints: { recursive: true, profile },
-    principal: { id: 'mi-chat', type: 'web', displayName: 'Mi chat' },
-    createdAt,
-    expiresAt: capabilityGrantExpiresAt(createdAt),
-  };
-  await writeFile(file, JSON.stringify({ profile, grants: [grant] }, null, 2), { mode: 0o600 });
+  const rights = rightsForProfile(profile);
+  const grants = [
+    {
+      id: `${profile}-${Date.now().toString(36)}`,
+      resource: `file://${path.resolve(cwd)}`,
+      rights,
+      constraints: { recursive: true, profile },
+      principal: { id: 'mi-chat', type: 'web', displayName: 'Mi chat' },
+      createdAt,
+      expiresAt: capabilityGrantExpiresAt(createdAt),
+    },
+  ];
+  if (rights.includes('execute')) {
+    grants.push({
+      id: `${profile}-bash-${Date.now().toString(36)}`,
+      resource: 'tool://bash',
+      rights: ['execute'] as any,
+      constraints: { profile } as any,
+      principal: { id: 'mi-chat', type: 'web', displayName: 'Mi chat' },
+      createdAt,
+      expiresAt: capabilityGrantExpiresAt(createdAt),
+    });
+  }
+  await writeFile(file, JSON.stringify({ profile, grants }, null, 2), { mode: 0o600 });
   return file;
 }
 
@@ -177,23 +193,28 @@ async function runPiChat(message: string, error?: string): Promise<FlueChatResul
   const directAnswer = needsLookup ? await directLookupAnswer(message).catch(() => '') : directChatReply(message);
   if (directAnswer) return { reply: directAnswer, ok: true, source: 'fallback' };
   const lookupContext = needsLookup ? await lookupContextFor(message).catch(() => '') : '';
+  const codingMode = (process.env.MI_CHAT_PROFILE || 'chat-read') === 'chat-coding';
+  const readOnlyInstructions = 'You may use the exposed tools when the current user request explicitly asks you to inspect, check, verify, or monitor local files, logs, state, or service status. Tool use is read-only: use read, grep, find, and ls only. Do not use bash, edit files, write files, deploy, publish, merge, delete, spend money, send external messages, kill processes, restart services, or change settings without explicit approval. Never expose secrets. If you use tools, summarize only safe findings.';
+  const codingInstructions = 'You have full coding-agent tools: bash, read, write, edit, grep, find, ls. You may inspect, edit, and run code when the user asks. Workspace access is scoped to /home/kyle. Do not deploy, publish, merge, delete branches, spend money, or send external messages without explicit approval. Never expose secrets.';
   const prompt = needsLookup
     ? `You are Mi in a private chat. Be concise. Use the lookup context below to answer the current user request. Do not output tool calls, JSON, commands, or code blocks. If the lookup context is insufficient, say you couldn't verify it.\n\nLookup context:\n${lookupContext || 'No lookup results available.'}\n\nUser: ${message}`
-    : `You are Mi in a private chat. Be concise. You may use the exposed tools when the current user request explicitly asks you to inspect, check, verify, or monitor local files, logs, state, or service status. Tool use is read-only: use read, grep, find, and ls only. Do not use bash, edit files, write files, deploy, publish, merge, delete, spend money, send external messages, kill processes, restart services, or change settings without explicit approval. Never expose secrets. If you use tools, summarize only safe findings.\n\nUser: ${message}`;
+    : `You are Mi in a private chat. Be concise. ${codingMode ? codingInstructions : readOnlyInstructions}\n\nUser: ${message}`;
 
   const cwd = process.env.HOME || process.cwd();
-  const grantsFile = await writeCapabilityGrantsFile(cwd, 'chat-read');
+  const chatProfile = (process.env.MI_CHAT_PROFILE || 'chat-read') as CapabilityProfileName;
+  const grantsFile = await writeCapabilityGrantsFile(cwd, chatProfile);
   const auditFile = path.join(miRuntimeDir(), 'capability-audit.jsonl');
   return await new Promise((resolve) => {
     const model = process.env.PI_CHAT_MODEL || process.env.PI_MODEL;
     const guard = capabilityGuardPath();
     const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
     const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes'];
-    const chatTools = process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
+    const profileTools = CAPABILITY_PROFILES[chatProfile]?.tools.join(',');
+    const chatTools = process.env.MI_CHAT_TOOLS || profileTools || 'read,grep,find,ls';
     const args = model ? [...baseArgs, '--model', model, '--tools', chatTools, prompt] : [...baseArgs, '--tools', chatTools, prompt];
     const child = spawn(cmd, args, {
       cwd,
-      env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }),
+      env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: chatProfile }),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

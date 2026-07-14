@@ -89,21 +89,50 @@ function capabilityGuardPath() {
   return process.env.MI_CAPABILITY_GUARD || path.join(root, 'pi', 'extensions', 'mi-capability-guard.ts');
 }
 
+const PROFILE_RIGHTS = {
+  'chat-read': ['read'],
+  'chat-coding': ['read', 'write', 'execute'],
+  'worker-read': ['read'],
+  'worker-write-scoped': ['read', 'write'],
+  'mi-main-orchestrator': ['read', 'write'],
+};
+const PROFILE_TOOLS = {
+  'chat-read': 'read,grep,find,ls',
+  'chat-coding': 'read,grep,find,ls,write,edit,bash',
+  'worker-read': 'read,grep,find,ls',
+  'worker-write-scoped': 'read,grep,find,ls,write,edit',
+  'mi-main-orchestrator': 'read,grep,find,ls,write,edit',
+};
+
 async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }) {
   const dir = path.join(miRuntimeDir, 'capabilities');
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
   const createdAt = new Date().toISOString();
-  const grant = {
-    id: `${profile}-${Date.now().toString(36)}`,
-    resource: `file://${path.resolve(cwd)}`,
-    rights: ['read'],
-    constraints: { recursive: true, profile },
-    principal,
-    createdAt,
-    expiresAt: new Date(Date.parse(createdAt) + capabilityGrantTtlMs).toISOString(),
-  };
-  await writeFile(file, JSON.stringify({ profile, grants: [grant] }, null, 2), { mode: 0o600 });
+  const rights = PROFILE_RIGHTS[profile] || ['read'];
+  const grants = [
+    {
+      id: `${profile}-${Date.now().toString(36)}`,
+      resource: `file://${path.resolve(cwd)}`,
+      rights,
+      constraints: { recursive: true, profile },
+      principal,
+      createdAt,
+      expiresAt: new Date(Date.parse(createdAt) + capabilityGrantTtlMs).toISOString(),
+    },
+  ];
+  if (rights.includes('execute')) {
+    grants.push({
+      id: `${profile}-bash-${Date.now().toString(36)}`,
+      resource: 'tool://bash',
+      rights: ['execute'],
+      constraints: { profile },
+      principal,
+      createdAt,
+      expiresAt: new Date(Date.parse(createdAt) + capabilityGrantTtlMs).toISOString(),
+    });
+  }
+  await writeFile(file, JSON.stringify({ profile, grants }, null, 2), { mode: 0o600 });
   return file;
 }
 
@@ -1904,7 +1933,7 @@ function imessageCleanReply(text) {
 async function runImessageChat(message, threadId) {
   const piCmd = process.env.PI_CMD || 'pi';
   const model = process.env.MI_IMESSAGE_MODEL || 'openai-codex/gpt-5.5:low';
-  const persona = `You are Mi, ${ownerPossessive()} private assistant, texting in iMessage. Be warm, direct, natural, and brief. Do not use em dashes or en dashes in conversational replies. Use real line breaks when showing sectioned templates, examples, agendas, or briefs; put a blank line between major sections instead of flattening them into one paragraph. Do not mention background workers, agents, bridges, polling, thread IDs, prompts, or system messages. You may answer from durable memory, recent context, and general knowledge, but do not claim to have changed files, restarted services, deployed, inspected live state, or used tools unless this request already started tool-backed work. Do not expose secrets. If the user asks a question about real changes or multi-step local work, respond conversationally with the next safe option and ask whether they want you to handle it.`;
+  const persona = `You are Mi, ${ownerPossessive()} private assistant, texting in iMessage. Be warm, direct, natural, and brief. Do not use em dashes or en dashes in conversational replies. Use real line breaks when showing sectioned templates, examples, agendas, or briefs; put a blank line between major sections instead of flattening them into one paragraph. Do not mention background workers, agents, bridges, polling, thread IDs, prompts, or system messages. You may answer from durable memory, recent context, and general knowledge, but do not claim to have changed files, restarted services, deployed, inspected live state, or used tools unless this request already started tool-backed work. Do not expose secrets. If the user clearly asks you to do real local work, assume they want it done; do not ask for repeated confirmation unless the action is destructive, risky, credential-related, or genuinely ambiguous.`;
   const historyLimit = Number(process.env.MI_IMESSAGE_HISTORY || 10);
   const memory = await readImessageMemory();
   let history = '';
@@ -1918,16 +1947,18 @@ async function runImessageChat(message, threadId) {
     console.warn('iMessage history load failed:', redact(error instanceof Error ? error.message : String(error)));
   }
   const prompt = `${persona}${memory}${history}\n\nReply to this iMessage naturally.\n\nUser message:\n${message}`;
-  const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
+  const chatProfile = process.env.MI_CHAT_PROFILE || 'chat-read';
+  const profileToolList = PROFILE_TOOLS[chatProfile] || 'read,grep,find,ls';
+  const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || profileToolList;
   const guard = capabilityGuardPath();
   const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
-  const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage', type: 'imessage', displayName: 'Mi iMessage' });
+  const grantsFile = await writeCapabilityGrantsFile(home, chatProfile, { id: 'mi-imessage', type: 'imessage', displayName: 'Mi iMessage' });
   const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
   const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
   const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
 
   return await new Promise((resolve) => {
-    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: chatProfile }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let text = '';
     let settled = false;

@@ -53,6 +53,14 @@ const MI_WORKING_RENDER_MS = Number(process.env.MI_WORKING_RENDER_MS || PI_LOADE
 const MI_WORKER_HANDOFF_RECENT_MESSAGES = Number(process.env.MI_WORKER_HANDOFF_RECENT_MESSAGES || 25);
 const MI_SESSION_TAIL_BYTES = Number(process.env.MI_SESSION_TAIL_BYTES || 256 * 1024);
 const MI_SESSION_ACTIVITY_REFRESH_MS = Number(process.env.MI_SESSION_ACTIVITY_REFRESH_MS || 1000);
+const MI_PROSE_AND_WORKFLOW_PROMPT = [
+  'Use a direct, practical, calm voice with concise natural prose.',
+  'Treat repositories, files, tests, configs, and runtime output as the source of truth; verify facts with tools instead of guessing.',
+  'Make focused, minimal, reviewable changes that preserve existing architecture and conventions.',
+  'Prefer existing Make/package scripts and run the most relevant validation available.',
+  'Avoid filler, performative narration, robotic status phrasing, emoji, and overexplaining.',
+  'Final updates should state what changed, validation results, and any remaining risks or next steps.',
+].join(' ');
 let resolveModelScopeModule: Promise<any> | undefined;
 let scopedModelsSelectorModule: Promise<any> | undefined;
 
@@ -3635,6 +3643,7 @@ async function miTuiCommand(initial = '') {
       .join('\n');
     return [
       'Background worker handoff from Mi main chat.',
+      MI_PROSE_AND_WORKFLOW_PROMPT,
       `Handoff reason: ${decision.reason}.`,
       `Current user request:\n${redactWorkerHandoffText(text)}`,
       history ? `Relevant Mi main chat context, newest last:\n${history}` : 'Relevant Mi main chat context: none available.',
@@ -4110,6 +4119,7 @@ async function miTuiCommand(initial = '') {
 async function launchPiMain(args: string[]) {
   const prompt = [
     `You are Mi, ${miUserPossessive()} private persistent assistant.`,
+    MI_PROSE_AND_WORKFLOW_PROMPT,
     'Be concise and minimal.',
     'Do not use emoji.',
     'Risky actions require explicit approval.',

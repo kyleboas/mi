@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
@@ -635,6 +636,17 @@ async function readMonitorRegistry(): Promise<MonitorRegistryEntry[]> {
   return parsed.length > 0 ? parsed : [{ id: 'mi-crons:configured', title: 'Mi reminder crons', type: 'mi_crons', source: 'state/crons.json', allowedAutoActions: 'read_triage' }];
 }
 
+function isStepLockHeld(step: string): boolean {
+  const lockFile = join(tacticsJournalRoot, `.${step}.lock`);
+  if (!existsSync(lockFile)) return false;
+  try {
+    execFileSync('flock', ['-n', lockFile, '-c', 'true'], { timeout: 3000, stdio: 'ignore' });
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 async function observeTacticsHealthStep(entryOrStep: MonitorRegistryEntry | string): Promise<MonitorObservation | null> {
   const entry = typeof entryOrStep === 'string' ? defaultTacticsRegistryEntries().find((item) => item.id === `tactics:${entryOrStep}`) : entryOrStep;
   if (!entry) return null;
@@ -650,7 +662,11 @@ async function observeTacticsHealthStep(entryOrStep: MonitorRegistryEntry | stri
     const human = payload.human_action_required === true || humanRequiredReasons.has(reason);
     const ageMs = Date.now() - checkedMs;
     if (human) return { id: entry.id, title, status: 'human-required', reason, detail: checkedAt ? `checked ${checkedAt}` : path, repairable: false };
-    if (ageMs > (entry.freshnessMs || tacticsStaleMs)) return { id: entry.id, title, status: 'stale', reason: 'stale', detail: `last checked ${checkedAt || new Date(checkedMs).toISOString()}`, repairable: entry.allowedAutoActions === 'read_triage' };
+    if (ageMs > (entry.freshnessMs || tacticsStaleMs)) {
+      const step = entry.id.replace(/^tactics:/, '');
+      if (isStepLockHeld(step)) return { id: entry.id, title, status: 'ok', reason: 'in_progress', detail: `running since ${checkedAt || new Date(checkedMs).toISOString()}` };
+      return { id: entry.id, title, status: 'stale', reason: 'stale', detail: `last checked ${checkedAt || new Date(checkedMs).toISOString()}`, repairable: entry.allowedAutoActions === 'read_triage' };
+    }
     if (status === 'ok') return { id: entry.id, title, status: 'ok', reason: 'ok', detail: checkedAt ? `checked ${checkedAt}` : undefined };
     const degradedReason = reason || status || 'degraded';
     return { id: entry.id, title, status: 'degraded', reason: degradedReason, detail: String(payload.log_file || payload.exit_code || path), repairable: entry.allowedAutoActions === 'read_triage' && repairableMonitorReasons.has(degradedReason) };

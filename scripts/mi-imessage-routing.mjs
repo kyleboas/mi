@@ -46,7 +46,7 @@ export function imessageLooksActionable(message) {
   const text = textWithoutUrls(message);
   if (!text || text.startsWith('/')) return false;
   if (imessageLooksLikeQuestion(message) || imessageLooksLikeConfirmation(message)) return false;
-  return /\b(?:fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|install|deploy|wire|hook\s*up|adjust|improve|tighten|route|restart|run|rescore|approve|reject|discard|edit|save|remember|remind|schedule|monitor|look at|look up|show|get|pull)\b/.test(text);
+  return /\b(?:fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|delete|build|set\s*up|install|deploy|wire|hook\s*up|adjust|improve|tighten|route|restart|run|rescore|approve|reject|discard|edit|save|remember|remind|schedule|monitor|look at|look up|show|get|pull)\b/.test(text);
 }
 
 function levenshteinDistance(a, b) {
@@ -180,12 +180,10 @@ export function imessagePriorWorkStatusReply(threadMessages = [], message = '') 
   return '';
 }
 
-function imessageClearDirective(message) {
+function imessageNeedsConfirmation(message) {
   const text = textWithoutUrls(message);
-  if (!text || imessageLooksLikeQuestion(message) || imessageLooksLikeConfirmation(message)) return false;
-  if (/\badd\b[\s\S]{0,120}\b(?:detect\s+)?(?:candidate|canidate)s?\b/.test(text)) return true;
-  if (/\b(?:check|inspect|look up|look at|get|pull|show)\b[\s\S]{0,120}\b(?:status|logs?|current list|candidate list|candidates|research pipeline)\b/.test(text)) return true;
-  return false;
+  if (!text || imessageLooksLikeConfirmation(message)) return false;
+  return /\b(?:deploy|delete|remove|discard|wipe|erase|drop|destroy|shutdown|shut down|power off)\b/.test(text);
 }
 
 export function imessageWorkDecision(message, threadMessages = [], options = {}) {
@@ -207,24 +205,31 @@ export function imessageWorkDecision(message, threadMessages = [], options = {})
 
   if (imessageIsBareUrl(message)) {
     if (pending) {
-      const targetMessage = imessageExtractUrls(pending).length ? pending : `${pending}\n\n${urls[0] || String(message).trim()}`;
-      return { action: 'ask', targetMessage, reason: 'iMessage URL attached to pending work' };
+      const targetMessage = imessageExtractUrls(pending).length ? pending : `${pending}
+
+${urls[0] || String(message).trim()}`;
+      return { action: 'start', targetMessage, reason: 'iMessage URL attached to pending work' };
     }
     return { action: 'chat', reason: 'bare url' };
   }
 
   if (question && !explicitGoAhead) {
-    if (actionable) return { action: 'ask', targetMessage: message, reason: 'iMessage question about work' };
+    if (actionable) {
+      if (imessageNeedsConfirmation(message)) return { action: 'ask', targetMessage: message, reason: 'iMessage risky question asks first' };
+      return { action: 'start', targetMessage: message, reason: 'iMessage actionable question' };
+    }
     return { action: 'chat', reason: 'question' };
   }
 
   if (actionable || explicitGoAhead) {
     const orphanUrl = urls.length ? '' : recentBareUrl(threadMessages);
-    const targetMessage = orphanUrl ? `${message}\n\n${orphanUrl}` : message;
-    if (askFirst && !explicitGoAhead) return { action: 'ask', targetMessage, reason: 'iMessage ask-first' };
+    const targetMessage = orphanUrl ? `${message}
+
+${orphanUrl}` : message;
+    if (askFirst && !explicitGoAhead && imessageNeedsConfirmation(message)) return { action: 'ask', targetMessage, reason: 'iMessage ask-first risky work' };
     if (explicitGoAhead) return { action: 'start', targetMessage: pending || targetMessage, reason: pending ? 'iMessage explicit go-ahead for pending work' : 'iMessage explicit go-ahead' };
-    if (imessageClearDirective(message)) return { action: 'start', targetMessage, reason: 'iMessage clear directive' };
-    return { action: 'ask', targetMessage, reason: 'iMessage confirm before work' };
+    if (imessageNeedsConfirmation(message)) return { action: 'ask', targetMessage, reason: 'iMessage risky work asks first' };
+    return { action: 'start', targetMessage, reason: 'iMessage direct work request' };
   }
 
   return { action: 'chat', reason: 'chat' };
@@ -238,4 +243,4 @@ export function imessageAskFirstReply() {
   return 'Want me to do that now?';
 }
 
-export const _test = { normalizedMessageText, textWithoutUrls, recentBareUrl, lastPendingDirective, assistantOfferAsPendingWork, imessageClearDirective, imessageDetectCandidatesQuery };
+export const _test = { normalizedMessageText, textWithoutUrls, recentBareUrl, lastPendingDirective, assistantOfferAsPendingWork, imessageNeedsConfirmation, imessageDetectCandidatesQuery };

@@ -56,7 +56,7 @@ export type CapabilityAuditEvent = CapabilityAuthorization & {
   request: CapabilityRequest;
 };
 
-export type CapabilityProfileName = 'chat-read' | 'worker-read' | 'worker-write-scoped' | 'mi-main-orchestrator';
+export type CapabilityProfileName = 'chat-read' | 'chat-coding' | 'worker-read' | 'worker-write-scoped' | 'mi-main-orchestrator';
 
 export type CapabilityProfile = {
   name: CapabilityProfileName;
@@ -96,6 +96,13 @@ export const CAPABILITY_PROFILES: Record<CapabilityProfileName, CapabilityProfil
     allowBash: false,
     env: [...SAFE_ENV_ALLOWLIST],
   },
+  'chat-coding': {
+    name: 'chat-coding',
+    tools: ['read', 'grep', 'find', 'ls', 'write', 'edit', 'bash'],
+    description: 'Chat with full coding tools including bash, read, write, and edit.',
+    allowBash: true,
+    env: [...SAFE_ENV_ALLOWLIST],
+  },
   'worker-read': {
     name: 'worker-read',
     tools: ['read', 'grep', 'find', 'ls'],
@@ -118,6 +125,15 @@ export const CAPABILITY_PROFILES: Record<CapabilityProfileName, CapabilityProfil
     env: [...SAFE_ENV_ALLOWLIST],
   },
 };
+
+export function rightsForProfile(profile: CapabilityProfileName): CapabilityRight[] {
+  const p = CAPABILITY_PROFILES[profile];
+  if (!p) return ['read'];
+  const rights: CapabilityRight[] = ['read'];
+  if (p.tools.includes('write') || p.tools.includes('edit')) rights.push('write');
+  if (p.allowBash) rights.push('execute');
+  return rights;
+}
 
 export function principal(id: string, type: PrincipalType = 'human', displayName?: string): Principal {
   return displayName ? { id, type, displayName } : { id, type };
