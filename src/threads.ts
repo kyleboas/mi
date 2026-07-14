@@ -23,6 +23,8 @@ export type ThreadMessage = {
   ts: string;
   unread?: boolean;
   source?: string;
+  taskId?: string;
+  replyToId?: string;
 };
 
 export type CompactResult = {
@@ -121,7 +123,7 @@ export async function appendThreadMessage(
   threadId: string,
   role: ThreadRole,
   text: string,
-  options: { unread?: boolean; source?: string } = {},
+  options: { unread?: boolean; source?: string; taskId?: string; replyToId?: string } = {},
 ) {
   await ensureThreads();
   const threads = await readThreadIndex();
@@ -136,6 +138,8 @@ export async function appendThreadMessage(
     ts: now(),
     unread: options.unread ?? role === 'assistant',
     source: options.source,
+    taskId: options.taskId,
+    replyToId: options.replyToId,
   };
   await appendFile(threadPath(threadId), `${JSON.stringify(message)}\n`);
 

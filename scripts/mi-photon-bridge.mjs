@@ -194,15 +194,18 @@ async function askImessage(message) {
   });
   const reply = cleanReply(data.reply);
   if (!data.handoff) return { reply, followUp: null };
+  const taskId = String(data.taskId || '').trim();
 
-  console.log('imessage handoff - polling for worker result');
+  console.log(`imessage handoff - polling for ${taskId ? 'task result' : 'legacy worker result'}`);
   while (Date.now() - start < maxWaitMs) {
     await sleep(pollMs);
     try {
       const poll = await miJson(`/api/messages?thread=${encodeURIComponent(miThread)}`);
       const workerReplies = (poll.messages || []).filter((m) => {
+        if (m.role !== 'assistant' || !['mi-worker-result', 'mi-worker-error'].includes(m.source)) return false;
+        if (taskId) return String(m.taskId || '') === taskId;
         const ts = Date.parse(m.ts || '') || 0;
-        return m.role === 'assistant' && ts >= start && ['mi-worker-result', 'mi-worker-error'].includes(m.source);
+        return ts >= start;
       });
       if (workerReplies.length) {
         const latest = workerReplies.at(-1);

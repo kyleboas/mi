@@ -11,6 +11,7 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
+import { buildImessageV2Prompt, parseImessageV2Envelope, redactV2Text } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
 import {
   imessageAskFirstReply,
@@ -59,6 +60,7 @@ const imessageMaxReplyChars = Number(process.env.MI_IMESSAGE_MAX_REPLY_CHARS || 
 const imessageChatTimeoutMs = Number(process.env.MI_IMESSAGE_CHAT_TIMEOUT_MS || 30000);
 const imessageMemoryMaxChars = Number(process.env.MI_IMESSAGE_MEMORY_CHARS || 2500);
 const imessageAskFirst = /^(1|true|yes|on)$/i.test(process.env.MI_IMESSAGE_ASK_FIRST || '');
+const imessageV2Enabled = !/^(0|false|no|off)$/i.test(process.env.MI_IMESSAGE_V2 || '1');
 const capabilityGrantTtlMs = Number(process.env.MI_CAPABILITY_GRANT_TTL_MS || 6 * 60 * 60_000);
 const researchRoot = process.env.MI_RESEARCH_ROOT || path.join(home, 'research-pr');
 const detectCandidatesScript = process.env.MI_DETECT_CANDIDATES_SCRIPT || path.join(researchRoot, 'scripts', 'list_detect_candidates.py');
@@ -202,6 +204,8 @@ async function readMessages(threadId = defaultThread, limit = 150) {
         text: redact(message.text || ''),
         ts: message.ts,
         source: message.source,
+        taskId: message.taskId,
+        replyToId: message.replyToId,
       }));
     return messages.slice(-limit);
   } catch {
@@ -1038,7 +1042,7 @@ function isStaleWorkerTaskError(error) {
 
 async function startBackgroundWorker(threadId, message, options = {}) {
   if (options.appendUser !== false) {
-    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'web' });
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: options.userSource || 'web', taskId: options.existingTaskId });
     await logEvent('mi.web.worker.user', { threadId, message });
   }
   const decision = options.decision || workerRoutingDecision(message);
@@ -1056,6 +1060,8 @@ async function startBackgroundWorker(threadId, message, options = {}) {
     name,
     status: 'running',
     text: message,
+    subject: options.subject || '',
+    imessageV2: options.taskId === true,
     createdAt: startedAt,
     updatedAt: startedAt,
     awaitingResultSince: startedAt,
@@ -1063,7 +1069,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   activeWorkers.set(worker.id, worker);
   await saveActiveWorkers();
   const reply = sanitizeMiConversationText(options.ackReply || workerAck(message, 'start', decision));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack' });
+  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack', taskId: options.taskId === true ? worker.taskId || worker.id : undefined });
   return { ok: true, reply, worker };
 }
 
@@ -1117,7 +1123,7 @@ async function buildWorkerFollowupPrompt(threadId, message) {
 
 async function continueBackgroundWorker(threadId, worker, message, options = {}) {
   const workerPrompt = await buildWorkerFollowupPrompt(threadId, message);
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: options.userSource || 'web' });
+  await appendThreadMessage(threadId, 'user', message, { unread: false, source: options.userSource || 'web', taskId: options.taskId === true ? worker.taskId || worker.id : undefined });
   await logEvent('mi.web.worker.followup', { threadId, taskId: worker.taskId || worker.id, message });
   const taskId = worker.taskId || worker.sessionFile || worker.sessionName || worker.name || worker.id;
   const continuedAt = now();
@@ -1132,6 +1138,8 @@ async function continueBackgroundWorker(threadId, worker, message, options = {})
     return startBackgroundWorker(threadId, message, { appendUser: false });
   }
   worker.taskId = result.taskId || worker.taskId;
+  if (options.subject) worker.subject = options.subject;
+  if (options.taskId === true) worker.imessageV2 = true;
   worker.sessionFile = result.sessionFile || worker.sessionFile;
   worker.sessionId = result.sessionId || worker.sessionId;
   worker.sessionName = result.sessionName || worker.sessionName;
@@ -1144,7 +1152,7 @@ async function continueBackgroundWorker(threadId, worker, message, options = {})
   activeWorkers.set(worker.id, worker);
   await saveActiveWorkers();
   const reply = sanitizeMiConversationText(options.ackReply || workerAck(message, 'followup', workerRoutingDecision(message), worker));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack' });
+  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: options.ackSource || 'web-worker-ack', taskId: options.taskId === true ? worker.taskId || worker.id : undefined });
   return { ok: true, reply, worker };
 }
 
@@ -1269,8 +1277,17 @@ async function workerResultSince(worker) {
   const since = Date.parse(worker.awaitingResultSince || worker.continuedAt || worker.createdAt || worker.startedAt || '') || 0;
   const messages = await readMessages(worker.threadId, 50);
   return messages
-    .filter((message) => message.role === 'assistant' && message.source === 'mi-worker-result' && ((Date.parse(message.ts || '') || 0) >= since))
+    .filter((message) => message.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(message.source) && ((Date.parse(message.ts || '') || 0) >= since))
+    .filter((message) => worker.imessageV2 ? message.taskId === (worker.taskId || worker.id) : true)
     .at(-1);
+}
+
+function workerCompletionText(worker, text, isError = false) {
+  const subject = compactAckText(worker.subject || worker.name || worker.text || 'That task', 110).replace(/[.?!]+$/, '') || 'That task';
+  const body = sanitizeMiConversationText(redact(text || '')).trim();
+  if (isError) return `I hit an issue with ${subject}: ${body || 'it needs another pass.'}`;
+  if (!body || /^(?:done|complete|completed|finished)[.!]?$/i.test(body)) return `${subject}: complete.`;
+  return body.toLowerCase().startsWith(subject.toLowerCase()) ? body : `${subject}: ${body}`;
 }
 
 async function monitorBackgroundWorkers() {
@@ -1308,14 +1325,19 @@ async function monitorBackgroundWorkers() {
     changed = true;
     if (taskDone(task)) {
       const text = task.text || task.error || 'Background worker finished.';
-      if (task.error && worker.threadId) {
-        await appendThreadMessage(worker.threadId, 'assistant', sanitizeMiConversationText(`I hit an error finishing that: ${redact(task.error)}`), { unread: false, source: 'mi-worker-error' }).catch(() => undefined);
+      const completion = workerCompletionText(worker, task.error || text, Boolean(task.error));
+      if (worker.threadId) {
+        await appendThreadMessage(worker.threadId, 'assistant', completion, {
+          unread: false,
+          source: task.error ? 'mi-worker-error' : 'mi-worker-result',
+          taskId: worker.taskId || worker.id,
+        }).catch(() => undefined);
+        notifyUser(completion, worker.threadId).catch(() => {});
       }
-      if (text && worker.threadId) notifyUser(text, worker.threadId).catch(() => {});
       worker.status = task.error ? 'error' : 'complete';
       worker.completedAt = task.finishedAt || now();
       worker.updatedAt = now();
-      worker.resultText = text;
+      worker.resultText = completion;
       worker.awaitingResultSince = undefined;
       activeWorkers.set(worker.id, worker);
     } else {
@@ -1960,6 +1982,106 @@ async function runImessageChat(message, threadId) {
   });
 }
 
+async function readV2ContextFile(file, maxChars) {
+  try {
+    const text = redactV2Text(await readFile(file, 'utf8'));
+    const modified = (await stat(file)).mtime.toISOString();
+    return { text: text.length > maxChars ? `${text.slice(0, maxChars - 1).trim()}…` : text, modified };
+  } catch {
+    return { text: '', modified: '' };
+  }
+}
+
+async function buildImessageV2Context(threadId, message) {
+  const [preferences, memory, tick, health, approvals, projects, goals] = await Promise.all([
+    readV2ContextFile(miPreferencesPath, 2400),
+    readV2ContextFile(miMemoryPath, 3000),
+    readV2ContextFile(path.join(root, 'state', 'tick.json'), 900),
+    readV2ContextFile(path.join(root, 'state', 'monitor-health.json'), 1100),
+    readV2ContextFile(path.join(root, 'state', 'approvals.json'), 1100),
+    readV2ContextFile(path.join(home, 'pi-docs', 'PROJECTS.md'), 1400),
+    readV2ContextFile(path.join(home, 'pi-docs', 'GOALS.md'), 1000),
+  ]);
+  const messages = await readMessages(threadId, 30);
+  const workers = Array.from(activeWorkers.values())
+    .filter((worker) => worker.threadId === threadId && (workerIsActive(worker) || workerIsRecent(worker)))
+    .slice(-10)
+    .map((worker) => `${worker.updatedAt || worker.createdAt || 'unknown time'} | ${worker.status || 'unknown'} | ${redactV2Text(worker.subject || worker.name || worker.text || 'work').slice(0, 220)} | task ${worker.taskId || worker.id}`)
+    .join('\n');
+  const snapshot = [
+    ['state/tick.json', tick], ['state/monitor-health.json', health], ['state/approvals.json', approvals],
+    ['~/pi-docs/PROJECTS.md', projects], ['~/pi-docs/GOALS.md', goals],
+  ].map(([label, entry]) => entry.text ? `${label} (modified ${entry.modified || 'unknown'}):\n${entry.text}` : `${label}: unavailable`).join('\n\n');
+  return buildImessageV2Prompt({
+    timestamp: now(), userMessage: message, preferences: preferences.text, preferencesReadAt: preferences.modified,
+    memory: memory.text, memoryReadAt: memory.modified, threadMessages: messages, threadReadAt: now(),
+    workers, workersReadAt: now(), snapshot, snapshotReadAt: now(),
+  });
+}
+
+async function runImessageV2(message, threadId) {
+  const piCmd = process.env.PI_CMD || 'pi';
+  const model = process.env.MI_IMESSAGE_MODEL || 'openai-codex/gpt-5.6-sol';
+  const prompt = await buildImessageV2Context(threadId, message);
+  const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
+  const guard = capabilityGuardPath();
+  const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
+  const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage-v2', type: 'imessage', displayName: 'Mi iMessage V2' });
+  const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
+  const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
+  const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
+  return await new Promise((resolve) => {
+    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let text = '';
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(parseImessageV2Envelope(text));
+    };
+    const consume = () => {
+      const lines = stdout.split('\n');
+      stdout = lines.pop() || '';
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta') text += event.assistantMessageEvent.delta || '';
+        } catch {}
+      }
+    };
+    const timer = setTimeout(() => { child.kill('SIGTERM'); consume(); finish(); }, imessageChatTimeoutMs);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); consume(); });
+    child.stderr.on('data', () => {});
+    child.on('error', finish);
+    child.on('close', () => { consume(); finish(); });
+  });
+}
+
+async function handleImessageV2(threadId, message) {
+  const decision = await runImessageV2(message, threadId);
+  if (decision.kind === 'task') {
+    const active = activeWorkerForThread(threadId);
+    if (active) {
+      const result = await continueBackgroundWorker(threadId, active, decision.objective, { userSource: 'imessage-v2-user', ackReply: decision.ack, ackSource: 'imessage-v2-task-ack', taskId: true, subject: decision.objective });
+      return { ok: true, reply: redact(result.reply), handoff: true, taskId: result.worker.taskId || result.worker.id };
+    }
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    const result = await startBackgroundWorker(threadId, decision.objective, {
+      appendUser: false, ackReply: decision.ack, ackSource: 'imessage-v2-task-ack', taskId: true,
+      userSource: 'imessage-v2-user', subject: decision.objective, allowDuplicate: true,
+      decision: { start: true, reason: 'iMessage V2 assistant judgment' },
+    });
+    return { ok: true, reply: redact(result.reply), handoff: true, taskId: result.worker.taskId || result.worker.id };
+  }
+  const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
+  const reply = sanitizeMiConversationText(imessageCleanReply(decision.reply));
+  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source });
+  return { ok: true, reply: redact(reply), handoff: false };
+}
+
 async function handle(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   try {
@@ -2036,6 +2158,8 @@ async function handle(req, res) {
       const threadId = safeThreadId(body.thread || imessageThread);
 
       return await withImessageThreadQueue(threadId, async () => {
+      // V2 is deliberately first: all legacy iMessage regex routing remains below as an immediate rollback path.
+      if (imessageV2Enabled) return sendJson(res, 200, await handleImessageV2(threadId, message));
       const loopDiscoverySelection = await handleLoopDiscoverySelectionFromImessage(threadId, message);
       if (loopDiscoverySelection) return sendJson(res, 200, loopDiscoverySelection);
       const loopDiscoveryRun = await handleLoopDiscoveryRunFromImessage(threadId, message);

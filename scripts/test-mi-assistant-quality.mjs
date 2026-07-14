@@ -99,6 +99,7 @@ try {
     MI_WEB_CHAT_WEBHOOK_TOKEN: token,
     MI_WEB_WORKER_THRESHOLD_SECONDS: '1',
     MI_IMESSAGE_ASK_FIRST: '0',
+    MI_IMESSAGE_V2: '0', // Status assertions below exercise retained V1 semantics.
   });
   const base = web.baseUrl;
 

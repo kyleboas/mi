@@ -150,9 +150,11 @@ Inside pi, the Mi extension exposes a single slash command: `/mi`.
 
 Mi can be reached from native iMessage through Photon, the same managed iMessage relay used by Hermes Agent when no Mac/BlueBubbles server is available.
 
-The bridge calls Mi web chat's `/api/imessage` endpoint, which handles the iMessage persona inline: greetings and simple chat are answered directly. By default, ask-first mode is off for iMessage, so clear directives like `check cron status` or `fix the deploy` can start tool-backed work and follow up here. Questions like `can you check cron status?` stay conversational and ask before taking action. Set `MI_IMESSAGE_ASK_FIRST=1` to make all iMessage tool-backed work require confirmation first.
+The bridge is only a transport adapter. By default `/api/imessage` uses the minimal V2 concierge: each inbound turn gets one fresh, read-only assistant call with a capped context bundle (recent thread history including results, preferences, durable memory, active/recent work, and a compact safe-state/project snapshot). Cached context is orientation, not live proof. Mi replies naturally, starts existing background work for substantive tasks, and asks one short question before consequential or genuinely ambiguous action. Worker mechanics stay out of the thread; task acknowledgements and completions are correlated by task id.
 
-Minimal memory is backed by the existing `/home/kyle/mi/memory.md` file. iMessage replies can consult a bounded slice of that file as durable context. Explicit leading commands like `remember ...`, `save ...`, or `note ...` append a dated bullet under `## Captured via iMessage`; secret-like content is refused, and writes are allowed only through local or token-authorized `/api/imessage` calls.
+Set `MI_IMESSAGE_V2=0` for an immediate rollback to the complete legacy V1 regex route. V1 remains intact in this release; its `MI_IMESSAGE_ASK_FIRST=1` behavior still applies only when V1 is enabled. V2 does not automatically write preferences or add new proactive messages.
+
+Minimal memory is backed by the existing `/home/kyle/mi/memory.md` file. V2 consults a bounded slice as context. The legacy V1 path also supports explicit leading `remember ...`, `save ...`, or `note ...` writes under `## Captured via iMessage`; secret-like content is refused, and writes are allowed only through local or token-authorized `/api/imessage` calls.
 
 Setup:
 
@@ -175,7 +177,9 @@ Optional env:
 - `MI_PHOTON_MAX_REPLY_CHARS=1200` — soft cap for text-message-sized replies.
 - `PHOTON_ALLOW_ALL_USERS=true` — dev only; do not use for a terminal-capable assistant.
 - `MI_PHOTON_MAX_WAIT_MS=180000` — how long the bridge waits for a background-worker result before giving up.
-- `MI_IMESSAGE_ASK_FIRST=1` — opt in to always asking before iMessage starts tool-backed work.
+- `MI_IMESSAGE_V2=0` — immediately use the retained legacy V1 iMessage router instead of the default minimal V2 concierge.
+- `MI_IMESSAGE_MODEL` — override V2's default `openai-codex/gpt-5.6-sol` model.
+- `MI_IMESSAGE_ASK_FIRST=1` — legacy V1 opt-in to always asking before iMessage starts tool-backed work.
 - `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint for Mi proactive notices.
 - `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — send Mi proactive notifications to iMessage through the local Photon notify endpoint.
 - `MI_IMESSAGE_MONITOR_ENABLED=false` — disable the tick-owned iMessage repair monitor.
