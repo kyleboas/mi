@@ -2035,6 +2035,15 @@ async function buildImessageV2Context(threadId, message) {
   });
 }
 
+const imessageV2UnavailableReply = 'I’m temporarily unable to reach my assistant service. Please try again shortly.';
+
+function imessageV2SafeStderr(stderr, prompt, message) {
+  return redactV2Text(String(stderr || '')
+    .replaceAll(String(prompt || ''), '[prompt redacted]')
+    .replaceAll(String(message || ''), '[message redacted]'))
+    .replace(/\s+/g, ' ').trim().slice(0, 500);
+}
+
 async function runImessageV2(message, threadId) {
   const piCmd = process.env.PI_CMD || 'pi';
   const model = process.env.MI_IMESSAGE_MODEL || 'openai-codex/gpt-5.6-sol';
@@ -2044,18 +2053,27 @@ async function runImessageV2(message, threadId) {
   const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
   const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage-v2', type: 'imessage', displayName: 'Mi iMessage V2' });
   const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
-  const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
+  // --offline is Pi's documented per-run switch for disabling startup package
+  // checks/installs while retaining the configured model/provider and explicit
+  // extension. The --no-* flags keep every discovered resource disabled.
+  const baseArgs = ['--mode', 'json', '--offline', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
   const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
   return await new Promise((resolve) => {
-    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ PI_OFFLINE: '1', MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
+    let stderr = '';
     let text = '';
     let settled = false;
-    const finish = () => {
+    const finish = (category, details = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(parseImessageV2Envelope(text));
+      if (category) {
+        console.error('iMessage V2 invocation failed:', JSON.stringify({ category, ...details, stderr: imessageV2SafeStderr(stderr, prompt, message) }));
+        resolve({ failure: category });
+        return;
+      }
+      resolve({ decision: parseImessageV2Envelope(text) });
     };
     const consume = () => {
       const lines = stdout.split('\n');
@@ -2067,16 +2085,27 @@ async function runImessageV2(message, threadId) {
         } catch {}
       }
     };
-    const timer = setTimeout(() => { child.kill('SIGTERM'); consume(); finish(); }, imessageChatTimeoutMs);
+    const timer = setTimeout(() => { child.kill('SIGTERM'); consume(); finish('timeout'); }, imessageChatTimeoutMs);
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); consume(); });
-    child.stderr.on('data', () => {});
-    child.on('error', finish);
-    child.on('close', () => { consume(); finish(); });
+    child.stderr.on('data', (chunk) => { if (stderr.length < 2000) stderr += chunk.toString().slice(0, 2000 - stderr.length); });
+    child.on('error', (error) => finish('spawn-error', { code: String(error?.code || '') }));
+    child.on('close', (code, signal) => {
+      consume();
+      if (code !== 0) return finish('nonzero-exit', { code, signal: signal || '' });
+      if (!text.trim()) return finish('empty-output', { code: code ?? 0, signal: signal || '' });
+      finish();
+    });
   });
 }
 
 async function handleImessageV2(threadId, message) {
-  const decision = await runImessageV2(message, threadId);
+  const invocation = await runImessageV2(message, threadId);
+  if (invocation.failure) {
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', imessageV2UnavailableReply, { unread: false, source: 'imessage-v2-unavailable' });
+    return { ok: false, reply: imessageV2UnavailableReply, handoff: false, temporary: true };
+  }
+  const decision = invocation.decision;
   if (decision.kind === 'task') {
     const active = decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined;
     if (active) {

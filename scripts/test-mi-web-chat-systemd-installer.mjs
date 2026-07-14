@@ -21,6 +21,11 @@ try {
   const unit = await readFile(path.join(tmp, 'config/systemd/user/mi-web-chat.service'), 'utf8');
   assert.match(unit, /tailscale cert[^\n]+main\.example\.ts\.net\.crt[^\n]+main\.example\.ts\.net\.key main\.example\.ts\.net/);
   assert.doesNotMatch(unit, /hermes/);
+  assert.match(unit, /Wants=llm-gateway\.service/);
+  assert.match(unit, /After=network-online\.target llm-gateway\.service/);
+  const stackInstaller = await readFile(path.resolve(import.meta.dirname, 'install-mi-imessage-stack-root.sh'), 'utf8');
+  assert.match(stackInstaller, /override_lines\[@\][\s\S]*Environment=MI_WEB_URL=/, 'stack installer recognizes the obsolete single-setting override');
+  assert.match(stackInstaller, /override_lines\[1\][\s\S]*127\.0\.0\.1:8787[\s\S]*rm -f/, 'stack installer preserves the canonical loopback value and removes stale values');
   console.log('Mi web chat systemd installer checks passed.');
 } finally {
   await rm(tmp, { recursive: true, force: true });

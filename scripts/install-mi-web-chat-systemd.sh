@@ -31,7 +31,8 @@ install -d -m 700 "$UNIT_DIR" "$TLS_DIR"
 cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=Mi web chat (private Tailscale UI)
-After=network-online.target
+Wants=llm-gateway.service
+After=network-online.target llm-gateway.service
 
 [Service]
 Type=simple

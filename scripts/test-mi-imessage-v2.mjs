@@ -41,7 +41,9 @@ if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', objective: 'Dr
 if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Repair the notebook sync[^\\n]*\\| task ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', objective: 'Correct the notebook sync repair using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
 if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now?' };
 if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
-process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: JSON.stringify(envelope) } }) + '\\n');
+if (prompt.includes('NONZERO_CASE')) { process.stderr.write('provider failed for sk-test-secret and NONZERO_CASE\\n'); process.exit(7); }
+if (prompt.includes('EMPTY_CASE')) process.exit(0);
+if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: JSON.stringify(envelope) } }) + '\\n');
 `, { mode: 0o755 });
   await chmod(fixture.fakePi, 0o755);
   await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
@@ -62,7 +64,7 @@ process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEv
     }
     return { text: 'ok' };
   });
-  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_WEB_WORKER_POLL_MS: '25' });
+  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_IMESSAGE_CHAT_TIMEOUT_MS: '500', MI_WEB_WORKER_POLL_MS: '25' });
 
   let result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'What is the current status?' } })).json;
   assert.equal(result.handoff, false, 'conversational state question starts no worker');
@@ -73,6 +75,8 @@ process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEv
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Can you check it?' } })).json;
   assert.equal(result.handoff, false);
   const piCalls = await readJsonl(piLog);
+  assert.ok(piCalls.every((args) => args.includes('--offline')), 'every V2 spawn disables startup package discovery/install without replacing model settings');
+  assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources beyond its explicit guard');
   assert.ok(piCalls.at(-1).at(-1).includes('We decided on the garden plan.'), 'pronoun follow-up receives prior thread context');
   assert.doesNotMatch(piCalls.at(-1).at(-1), new RegExp(hugeSecret), 'fake Pi receives redacted context only');
 
@@ -113,6 +117,17 @@ process.stdout.write(JSON.stringify({ type: 'message_update', assistantMessageEv
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'INTERNAL_CASE' } })).json;
   assert.equal(result.handoff, false);
   assert.doesNotMatch(result.reply, /Pi|worker|Photon/i, 'internal model output is replaced safely');
+
+  for (const failureCase of ['NONZERO_CASE', 'EMPTY_CASE', 'TIMEOUT_CASE']) {
+    result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: failureCase } })).json;
+    assert.equal(result.ok, false, `${failureCase} reports invocation failure`);
+    assert.equal(result.handoff, false, `${failureCase} starts no worker`);
+    assert.equal(result.temporary, true, `${failureCase} is marked temporary`);
+    assert.match(result.reply, /temporarily unable to reach my assistant service/i, `${failureCase} has a truthful reply`);
+  }
+  assert.equal(runCount, 3, 'invocation failures start no workers');
+  messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
+  assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, 3, 'failure replies are durably categorized');
 
   console.log('Mi iMessage V2 checks passed.');
 } finally {
