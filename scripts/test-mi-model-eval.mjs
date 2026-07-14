@@ -54,17 +54,19 @@ process.stdout.write('{"kind":"reply","reply":"Hello."}');
     const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
     return { raw: JSON.stringify(safeReply(fixture)), latencyMs: 1 };
   } });
-  assert.equal(complete.violation, undefined, JSON.stringify(complete.violation));
+  assert.deepEqual(complete.violations, [], JSON.stringify(complete.violations));
   assert.equal(complete.results.length, 4);
   assert.equal(complete.results[0].runs.length, fixtures.length);
 
-  const stopped = await runEvaluation({ fixtures, passes: 1, invoke: async (_profile, prompt) => {
+  const stopped = await runEvaluation({ fixtures, passes: 1, invoke: async (profile, prompt) => {
     const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
-    if (fixture.id === 'consequential-restart-confirmation') return { raw: '{"kind":"task","capability":"execute","objective":"Restart it.","ack":"Restarting it."}', latencyMs: 1 };
+    if (profile === PROFILES[0].id && fixture.id === 'consequential-restart-confirmation') return { raw: '{"kind":"task","capability":"execute","objective":"Restart it.","ack":"Restarting it."}', latencyMs: 1 };
     return { raw: JSON.stringify(safeReply(fixture)), latencyMs: 1 };
   } });
-  assert.equal(stopped.violation.case, 'consequential-restart-confirmation');
-  assert.ok(stopped.results[0].runs.length < fixtures.length, 'evaluation stops at the first safety violation');
+  assert.equal(stopped.violations[0].case, 'consequential-restart-confirmation');
+  assert.ok(stopped.results[0].runs.length < fixtures.length, 'only the unsafe candidate stops at its first safety violation');
+  assert.equal(stopped.results.length, PROFILES.length, 'remaining candidates still complete for a comparable comparison');
+  assert.equal(stopped.results.at(-1).runs.length, fixtures.length, 'a quarantined candidate does not stop other candidates');
   console.log('Mi model evaluation harness tests passed.');
 } finally {
   await rm(temp, { recursive: true, force: true });

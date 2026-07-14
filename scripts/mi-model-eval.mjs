@@ -158,10 +158,11 @@ function blindedOutputs(results) {
 export async function runEvaluation({ fixtures, passes = 2, invoke = invokeThroughGateway } = {}) {
   const cases = fixtures || JSON.parse(await readFile(fixturePath, 'utf8'));
   const results = [];
-  let violation;
-  outer: for (const profile of PROFILES) {
+  const violations = [];
+  for (const profile of PROFILES) {
     const runs = [];
-    for (const fixture of cases) {
+    let quarantined;
+    candidate: for (const fixture of cases) {
       for (let pass = 1; pass <= passes; pass += 1) {
         const prompt = buildImessageV2Prompt({ preferences: 'Synthetic evaluation preferences: concise and honest.', memory: 'Synthetic evaluation memory only.', workers: '', snapshot: '', threadMessages: [], ...fixture.bundle });
         const invocation = await invoke(profile.id, prompt);
@@ -170,15 +171,15 @@ export async function runEvaluation({ fixtures, passes = 2, invoke = invokeThrou
         const run = { case: fixture.id, pass, latencyMs: invocation.latencyMs, failure: invocation.failure || null, raw: cleanOutput(raw), score };
         runs.push(run);
         if (score.safetyFailures.length) {
-          violation = { profile: profile.label, case: fixture.id, pass, categories: score.safetyFailures };
-          results.push({ profile, runs });
-          break outer;
+          quarantined = { profile: profile.label, case: fixture.id, pass, categories: score.safetyFailures };
+          violations.push(quarantined);
+          break candidate;
         }
       }
     }
-    results.push({ profile, runs });
+    results.push({ profile, runs, quarantined });
   }
-  return { results, violation, passes, caseCount: cases.length };
+  return { results, violations, passes, caseCount: cases.length };
 }
 
 async function main() {
@@ -192,16 +193,16 @@ async function main() {
     passes: evaluation.passes,
     varianceLimitation: evaluation.passes < 2 ? 'One pass only; model output variance is not estimated.' : null,
     dispatches: 0,
-    safetyViolation: evaluation.violation || null,
-    ranked: evaluation.results.map(({ profile, runs }) => aggregate(profile, runs)).sort((a, b) => b.quality - a.quality || b.safety - a.safety || b.validity - a.validity || (a.latencyMs.p50 || Infinity) - (b.latencyMs.p50 || Infinity)),
+    safetyViolations: evaluation.violations,
+    ranked: evaluation.results.map(({ profile, runs, quarantined }) => ({ ...aggregate(profile, runs), complete: !quarantined, quarantinedAt: quarantined ? { case: quarantined.case, pass: quarantined.pass, categories: quarantined.categories } : null })).sort((a, b) => Number(b.complete) - Number(a.complete) || b.quality - a.quality || b.safety - a.safety || b.validity - a.validity || (a.latencyMs.p50 || Infinity) - (b.latencyMs.p50 || Infinity)),
   };
   await writeFile(resolve(options.outputDir, 'summary.json'), JSON.stringify(summary, null, 2), { mode: 0o600 });
   await writeFile(resolve(options.outputDir, 'blinded-outputs.json'), JSON.stringify(blindedOutputs(evaluation.results), null, 2), { mode: 0o600 });
   console.log(JSON.stringify(summary.ranked));
-  if (evaluation.violation) {
-    console.error(`Safety contract violation: ${evaluation.violation.profile}/${evaluation.violation.case}: ${evaluation.violation.categories.join(', ')}`);
-    process.exitCode = 1;
+  for (const violation of evaluation.violations) {
+    console.error(`Safety contract violation; candidate quarantined: ${violation.profile}/${violation.case}: ${violation.categories.join(', ')}`);
   }
+  if (evaluation.violations.length) process.exitCode = 1;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) main();
