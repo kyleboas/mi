@@ -11,7 +11,7 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
-import { buildImessageV2Prompt, parseImessageV2Envelope, redactV2Text } from './mi-imessage-v2.mjs';
+import { buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
 import {
   imessageAskFirstReply,
@@ -2053,16 +2053,15 @@ async function runImessageV2(message, threadId) {
   const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
   const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage-v2', type: 'imessage', displayName: 'Mi iMessage V2' });
   const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
-  // --offline is Pi's documented per-run switch for disabling startup package
-  // checks/installs while retaining the configured model/provider and explicit
-  // extension. The --no-* flags keep every discovered resource disabled.
-  const baseArgs = ['--mode', 'json', '--offline', '--no-session', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
+  // --print gives one plain completion body. V2 already asks for the decision
+  // envelope, so it must not request Pi's JSON event stream. --offline prevents
+  // startup package operations; the --no-* flags retain only the explicit guard.
+  const baseArgs = ['--print', '--offline', '--no-session', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
   const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
   return await new Promise((resolve) => {
     const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ PI_OFFLINE: '1', MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, MI_CAPABILITY_PROFILE: 'chat-read' }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
-    let text = '';
     let settled = false;
     const finish = (category, details = {}) => {
       if (settled) return;
@@ -2073,26 +2072,23 @@ async function runImessageV2(message, threadId) {
         resolve({ failure: category });
         return;
       }
-      resolve({ decision: parseImessageV2Envelope(text) });
+      resolve({ decision: parseImessageV2Envelope(stdout) });
     };
-    const consume = () => {
-      const lines = stdout.split('\n');
-      stdout = lines.pop() || '';
-      for (const line of lines) {
-        try {
-          const event = JSON.parse(line);
-          if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta') text += event.assistantMessageEvent.delta || '';
-        } catch {}
+    const timer = setTimeout(() => { child.kill('SIGTERM'); finish('timeout'); }, imessageChatTimeoutMs);
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      const remaining = IMESSAGE_V2_LIMITS.output - stdout.length;
+      if (remaining > 0) stdout += text.slice(0, remaining);
+      if (text.length > remaining) {
+        child.kill('SIGTERM');
+        finish('output-limit');
       }
-    };
-    const timer = setTimeout(() => { child.kill('SIGTERM'); consume(); finish('timeout'); }, imessageChatTimeoutMs);
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); consume(); });
+    });
     child.stderr.on('data', (chunk) => { if (stderr.length < 2000) stderr += chunk.toString().slice(0, 2000 - stderr.length); });
     child.on('error', (error) => finish('spawn-error', { code: String(error?.code || '') }));
     child.on('close', (code, signal) => {
-      consume();
       if (code !== 0) return finish('nonzero-exit', { code, signal: signal || '' });
-      if (!text.trim()) return finish('empty-output', { code: code ?? 0, signal: signal || '' });
+      if (!stdout.trim()) return finish('empty-output', { code: code ?? 0, signal: signal || '' });
       finish();
     });
   });

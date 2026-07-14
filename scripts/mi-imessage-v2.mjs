@@ -6,6 +6,7 @@ const MAX_PROMPT = 18000;
 
 export const IMESSAGE_V2_LIMITS = Object.freeze({
   prompt: MAX_PROMPT,
+  output: 6000,
   preferences: 2400,
   memory: 3000,
   thread: 6000,
