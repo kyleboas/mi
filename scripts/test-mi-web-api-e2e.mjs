@@ -29,6 +29,7 @@ try {
     MI_WEB_UPLOAD_DIR: join(fixture.miRoot, 'state', 'web-uploads'),
     MI_WEB_WORKER_THRESHOLD_SECONDS: '1',
     MI_IMESSAGE_ASK_FIRST: '0',
+    MI_IMESSAGE_V2: '0', // This fixture asserts the retained legacy regex route.
   });
   const base = web.baseUrl;
 

@@ -30,7 +30,8 @@ function readBody(req) {
   });
 }
 
-function startMiServer({ source, text }) {
+function startMiServer(workerReply) {
+  const { source, text } = workerReply;
   const calls = [];
   let messagesPolls = 0;
   const server = http.createServer(async (req, res) => {
@@ -40,14 +41,19 @@ function startMiServer({ source, text }) {
         const body = await readBody(req);
         calls.push({ method: req.method, path: url.pathname, body });
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, reply: 'On it. I’ll follow up here.', handoff: true }));
+        res.end(JSON.stringify({ ok: true, reply: 'On it. I’ll follow up here.', handoff: true, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}) }));
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/messages') {
         messagesPolls += 1;
         calls.push({ method: req.method, path: url.pathname, thread: url.searchParams.get('thread'), messagesPolls });
         const messages = messagesPolls >= 2
-          ? [{ role: 'assistant', source, text, ts: new Date().toISOString() }]
+          ? (workerReply.interleaved
+            ? [
+              { role: 'assistant', source: 'mi-worker-result', text: workerReply.interleaved, taskId: 'other-task', ts: new Date().toISOString() },
+              { role: 'assistant', source, text, taskId: workerReply.taskId, ts: new Date().toISOString() },
+            ]
+            : [{ role: 'assistant', source, text, ts: new Date().toISOString() }])
           : [];
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ messages }));
@@ -134,7 +140,7 @@ async function runRelayCase(root, name, workerReply) {
       MI_PHOTON_TEST_EVENTS: eventsPath,
       MI_PHOTON_TEST_SENDS: sendsPath,
     });
-    assert.match(result.stdout, /imessage handoff - polling for worker result/, `${name}: bridge should poll after handoff`);
+    assert.match(result.stdout, /imessage handoff - polling for (?:task|legacy worker) result/, `${name}: bridge should poll after handoff`);
 
     const sends = (await readJsonl(sendsPath)).filter((entry) => entry.kind === 'message');
     assert.equal(sends.length, 2, `${name}: bridge should send ack plus worker follow-up`);
@@ -152,8 +158,9 @@ async function runRelayCase(root, name, workerReply) {
 
 const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
 try {
-  await runRelayCase(root, 'result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
-  await runRelayCase(root, 'error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
+  await runRelayCase(root, 'exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
+  await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
   console.log('Mi Photon bridge relay checks passed.');
 } finally {
   await rm(root, { recursive: true, force: true });
