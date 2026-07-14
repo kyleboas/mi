@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+: "${CREDENTIALS_DIRECTORY:?systemd credentials directory is required}"
+if [ ! -r "$CREDENTIALS_DIRECTORY/gateway" ]; then
+  echo "llm-gateway: required local gateway credential is unavailable" >&2
+  exit 1
+fi
+
+# Do not load optional provider credentials. The custom Pi provider uses only Pi's
+# built-in subscription storage; this credential authenticates gateway clients.
+export HOME=/home/kyle
+export LITELLM_MASTER_KEY="$(tr -d '\r\n' < "$CREDENTIALS_DIRECTORY/gateway")"
+unset OPENROUTER_API_KEY CLOUDFLARE_AI_GATEWAY_TOKEN CLOUDFLARE_API_TOKEN \
+  CLOUDFLARE_TOKEN CF_API_TOKEN OPENAI_API_KEY OPENAI_BASE_URL LOCAL_LLM_GATEWAY_TOKEN
+
+exec /opt/litellm/bin/litellm \
+  --config /etc/litellm/config.yaml \
+  --host 127.0.0.1 \
+  --port 4000

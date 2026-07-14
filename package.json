@@ -8,6 +8,7 @@
     "test:agents": "npm run build && node scripts/test-mi-agent-view.mjs && node scripts/test-mi-agent-extension-parity.mjs && node scripts/test-mi-agent-perf.mjs && node scripts/test-mi-agent-render-snapshot.mjs && node scripts/test-mi-agent-dedupe.mjs && node scripts/test-mi-daemon-singleton.mjs && node scripts/test-mi-daemon-pi-session-e2e.mjs && node scripts/test-mi-agent-e2e.mjs && node scripts/test-mi-task-notifications.mjs",
     "test:quality": "npm run build && node scripts/test-mi-assistant-quality.mjs",
     "test:live": "node scripts/test-mi-live-smoke.mjs",
+    "test:subscription-gateway": "node scripts/test-mi-subscription-gateway-installer.mjs && /opt/litellm/bin/python gateway/test_pi_subscription_handler.py",
     "test:mi-surfaces": "npm run build && node scripts/test-mi-capability-matrix.mjs && node scripts/test-mi-cli-surfaces.mjs && node scripts/test-mi-web-api-e2e.mjs && node scripts/test-mi-assistant-quality.mjs && node scripts/test-mi-photon-bridge-relay.mjs",
     "build": "tsc",
     "proactive": "tsx scripts/proactive.ts",
