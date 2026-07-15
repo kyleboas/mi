@@ -21,6 +21,7 @@ export const PROFILES = Object.freeze([
   { id: 'mi-eval-luna-low', label: 'Luna-low' },
   { id: 'mi-eval-sol-low', label: 'Sol-low' },
   { id: 'mi-eval-terra-low', label: 'Terra-low' },
+  { id: 'mi-eval-sol-medium', label: 'Sol-medium' },
   { id: 'mi-eval-sol-high', label: 'Sol-high' },
 ]);
 const INTERNAL_TERMS = /\b(?:photon|pi|worker|routing|handoff|prompt|json|tools?|internal files?|system message|commands?)\b/i;
@@ -28,22 +29,29 @@ const SECRET_PATTERN = /(?:\b(?:api[_ -]?key|secret|password|token)\b\s*(?:=|:)\
 
 function usage(message = '') {
   if (message) console.error(message);
-  console.error('Usage: /home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs [--passes 1|2] [--max-concurrency 1|2] [--case fixture-id] [--output-dir .tmp/mi-model-eval/<name>]');
+  console.error('Usage: /home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs [--passes 1|2] [--max-concurrency 1|2] [--candidate profile-id]... [--case fixture-id] [--output-dir .tmp/mi-model-eval/<name>]');
 }
 
 export function parseArgs(args) {
-  const options = { passes: 2, maxConcurrency: 1, outputDir: resolve(outputRoot, 'latest'), caseId: undefined };
+  const options = { passes: 2, maxConcurrency: 1, outputDir: resolve(outputRoot, 'latest'), caseId: undefined, candidateIds: [] };
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index];
     if (value === '--passes') options.passes = Number(args[++index]);
     else if (value === '--max-concurrency') options.maxConcurrency = Number(args[++index]);
     else if (value === '--output-dir') options.outputDir = resolve(root, args[++index] || '');
     else if (value === '--case') options.caseId = String(args[++index] || '').trim() || undefined;
-    else throw new Error(`unknown argument: ${value}`);
+    else if (value === '--candidate') {
+      const candidate = String(args[++index] || '').trim();
+      if (!candidate) throw new Error('--candidate requires a profile id');
+      options.candidateIds.push(candidate);
+    } else throw new Error(`unknown argument: ${value}`);
   }
   if (![1, 2].includes(options.passes)) throw new Error('--passes must be 1 or 2');
   if (![1, 2].includes(options.maxConcurrency)) throw new Error('--max-concurrency must be 1 or 2');
   if (!(options.outputDir === outputRoot || options.outputDir.startsWith(`${outputRoot}${sep}`))) throw new Error('output directory must remain under .tmp/mi-model-eval');
+  const known = new Set(PROFILES.map((profile) => profile.id));
+  if (options.candidateIds.some((candidate) => !known.has(candidate))) throw new Error('unknown candidate profile');
+  if (new Set(options.candidateIds).size !== options.candidateIds.length) throw new Error('duplicate candidate profile');
   return options;
 }
 
@@ -162,11 +170,11 @@ function blindedOutputs(results) {
   };
 }
 
-export async function runEvaluation({ fixtures, passes = 2, invoke = invokeThroughGateway } = {}) {
+export async function runEvaluation({ fixtures, passes = 2, profiles = PROFILES, maxConcurrency = 1, invoke = invokeThroughGateway } = {}) {
   const cases = fixtures || JSON.parse(await readFile(fixturePath, 'utf8'));
-  const results = [];
+  if (![1, 2].includes(maxConcurrency)) throw new Error('maxConcurrency must be 1 or 2');
   const violations = [];
-  for (const profile of PROFILES) {
+  const runProfile = async (profile) => {
     const runs = [];
     let quarantined;
     candidate: for (const fixture of cases) {
@@ -184,8 +192,16 @@ export async function runEvaluation({ fixtures, passes = 2, invoke = invokeThrou
         }
       }
     }
-    results.push({ profile, runs, quarantined });
-  }
+    return { profile, runs, quarantined };
+  };
+  const results = new Array(profiles.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(maxConcurrency, profiles.length) }, async () => {
+    while (next < profiles.length) {
+      const index = next++;
+      results[index] = await runProfile(profiles[index]);
+    }
+  }));
   return { results, violations, passes, caseCount: cases.length };
 }
 
@@ -196,9 +212,11 @@ async function main() {
   const allFixtures = JSON.parse(await readFile(fixturePath, 'utf8'));
   const fixtures = options.caseId ? allFixtures.filter((fixture) => fixture.id === options.caseId) : allFixtures;
   if (fixtures.length === 0) { usage(`unknown fixture: ${options.caseId}`); process.exitCode = 2; return; }
-  const evaluation = await runEvaluation({ fixtures, passes: options.passes });
+  const profiles = options.candidateIds.length ? options.candidateIds.map((id) => PROFILES.find((profile) => profile.id === id)) : PROFILES;
+  const evaluation = await runEvaluation({ fixtures, passes: options.passes, profiles, maxConcurrency: options.maxConcurrency });
   const summary = {
     suite: 'synthetic-mi-v2-decision-only-v1',
+    candidates: profiles.map((profile) => profile.id),
     casesPerPass: evaluation.caseCount,
     passes: evaluation.passes,
     varianceLimitation: evaluation.passes < 2 ? 'One pass only; model output variance is not estimated.' : null,

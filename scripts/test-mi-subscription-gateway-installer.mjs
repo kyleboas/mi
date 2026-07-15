@@ -16,7 +16,7 @@ const entrypoint = '/home/kyle/install-mi-subscription-gateway.sh';
 
 assert.match(config, /model_name: coding-main/);
 assert.match(config, /model: pi-subscription\/coding-main/);
-for (const alias of ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-high']) {
+for (const alias of ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-medium', 'mi-eval-sol-high']) {
   assert.match(config, new RegExp(`model_name: ${alias}\\n\\s+litellm_params:\\n\\s+model: pi-subscription/${alias}`), `${alias} must be an explicit gateway alias`);
 }
 assert.match(config, /custom_handler: pi_subscription_handler\.pi_subscription_llm/);

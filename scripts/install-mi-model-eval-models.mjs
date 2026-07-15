@@ -4,7 +4,7 @@ import { rename, stat, writeFile, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const aliases = ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-high'];
+const aliases = ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-medium', 'mi-eval-sol-high'];
 const configDir = resolve(process.env.MI_MODEL_EVAL_CONFIG_DIR || '/home/kyle/.pi/agent');
 const settingsPath = join(configDir, 'settings.json');
 const modelsPath = join(configDir, 'models.json');
