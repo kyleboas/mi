@@ -170,7 +170,7 @@ Optional env:
 - `MI_IMESSAGE_MONITOR_INTERVAL_MS=900000` — monitor cadence; default is 15 minutes.
 - `MI_IMESSAGE_REPAIR_USER_SERVICES=mi-web-chat.service,mi-daemon.service` — user services restarted during safe iMessage repair attempts.
 
-The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify` by default. `mi tick` uses that endpoint for opt-in proactive iMessage notifications; it does not expose Photon credentials to the tick process. For V2 work, generic daemon reports are retained only in daemon task state; the bridge polls solely for the single correlation-bound formatted completion.
+The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify` by default. `mi tick` uses that endpoint for opt-in proactive iMessage notifications; it does not expose Photon credentials to the tick process. For V2 work, generic daemon reports are retained only in daemon task state; the bridge polls solely for one correlation-bound user-visible completion per acknowledgement/generation. Workers may optionally end with the versioned structured completion envelope (`version`, `status`, `userSummary`, optional internal details). Only a validated summary can skip the formatter; internal details never enter threads, context, or Photon. Sanitized lifecycle metadata is bounded in `state/mi-turn-events.jsonl` and contains no message text or identifiers.
 
 ### Local Codex subscription gateway
 
