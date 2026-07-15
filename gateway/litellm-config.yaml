@@ -19,6 +19,10 @@ model_list:
     litellm_params:
       model: pi-subscription/mi-eval-terra-low
       api_key: ""
+  - model_name: mi-eval-sol-medium
+    litellm_params:
+      model: pi-subscription/mi-eval-sol-medium
+      api_key: ""
   - model_name: mi-eval-sol-high
     litellm_params:
       model: pi-subscription/mi-eval-sol-high

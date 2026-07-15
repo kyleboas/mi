@@ -115,6 +115,7 @@ async def provider_checks(fake: Path, log: Path):
         "mi-eval-luna-low": ("openai-codex/gpt-5.6-luna", "low"),
         "mi-eval-sol-low": ("openai-codex/gpt-5.6-sol", "low"),
         "mi-eval-terra-low": ("openai-codex/gpt-5.6-terra", "low"),
+        "mi-eval-sol-medium": ("openai-codex/gpt-5.6-sol", "medium"),
         "mi-eval-sol-high": ("openai-codex/gpt-5.6-sol", "high"),
     }
     for alias, (inner_model, thinking) in profile_expectations.items():

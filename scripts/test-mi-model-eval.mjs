@@ -8,7 +8,7 @@ import { installEvalModels } from './install-mi-model-eval-models.mjs';
 
 const fixtures = JSON.parse(await readFile(new URL('./fixtures/mi-model-eval-cases.json', import.meta.url), 'utf8'));
 assert.ok(fixtures.length >= 16, 'the fixed suite must remain representative');
-assert.equal(PROFILES.length, 4, 'exactly four immutable profiles are compared');
+assert.equal(PROFILES.length, 5, 'exactly five immutable profiles are registered');
 assert.equal(SAFE_PI_PATH, '/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin', 'gateway wrapper must never inherit a caller PATH');
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 assert.match(packageJson.scripts['eval:mi-models'], /run-heavy --class eval -- node/, 'the live evaluator must be throttled through run-heavy');
@@ -16,6 +16,9 @@ assert.throws(() => parseArgs(['--output-dir', '/tmp/not-allowed']), /must remai
 assert.throws(() => parseArgs(['--passes', '3']), /must be 1 or 2/);
 assert.equal(parseArgs(['--passes', '2', '--max-concurrency', '2']).maxConcurrency, 2);
 assert.equal(parseArgs(['--case', 'natural-chat']).caseId, 'natural-chat');
+assert.deepEqual(parseArgs(['--candidate', 'mi-eval-sol-medium', '--candidate', 'mi-eval-sol-high']).candidateIds, ['mi-eval-sol-medium', 'mi-eval-sol-high']);
+assert.throws(() => parseArgs(['--candidate', 'mi-eval-unknown']), /unknown candidate profile/);
+assert.throws(() => parseArgs(['--candidate', 'mi-eval-sol-medium', '--candidate', 'mi-eval-sol-medium']), /duplicate candidate profile/);
 
 const restart = fixtures.find((item) => item.id === 'consequential-restart-confirmation');
 let score = scoreDecision('{"kind":"confirm","reply":"Should I restart the synthetic garden service?"}', restart);
@@ -79,8 +82,27 @@ printf '%s' '{"kind":"reply","reply":"Hello."}'
     return { raw: JSON.stringify(safeReply(fixture)), latencyMs: 1 };
   } });
   assert.deepEqual(complete.violations, [], JSON.stringify(complete.violations));
-  assert.equal(complete.results.length, 4);
+  assert.equal(complete.results.length, 5);
   assert.equal(complete.results[0].runs.length, fixtures.length);
+
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const selected = await runEvaluation({
+    fixtures: fixtures.slice(0, 1),
+    passes: 1,
+    profiles: PROFILES.filter((profile) => ['mi-eval-sol-medium', 'mi-eval-sol-high'].includes(profile.id)),
+    maxConcurrency: 2,
+    invoke: async (_profile, prompt) => {
+      const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return { raw: JSON.stringify(safeReply(fixture)), latencyMs: 1 };
+    },
+  });
+  assert.deepEqual(selected.results.map(({ profile }) => profile.id), ['mi-eval-sol-medium', 'mi-eval-sol-high']);
+  assert.equal(peakInFlight, 2, 'selected candidates must honor the two-call concurrency bound');
 
   const stopped = await runEvaluation({ fixtures, passes: 1, invoke: async (profile, prompt) => {
     const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
