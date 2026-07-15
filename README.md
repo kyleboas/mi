@@ -127,11 +127,7 @@ mi loop-discovery --select 2
 
 Arbitrary command crons are legacy/deprecated; prefer reminder-only crons plus configured monitors and scoped repair workers.
 
-Install the user timer with:
-
-```bash
-sudo scripts/install-mi-tick-systemd.sh
-```
+The timer is installed with the complete Mi stack; use the single production command in **Mi stack installation** below.
 
 ## Mi pi extension
 
@@ -156,20 +152,7 @@ Set `MI_IMESSAGE_V2=0` for an immediate rollback to the complete legacy V1 regex
 
 Minimal memory is backed by the existing `/home/kyle/mi/memory.md` file. V2 consults a bounded slice as context. The legacy V1 path also supports explicit leading `remember ...`, `save ...`, or `note ...` writes under `## Captured via iMessage`; secret-like content is refused, and writes are allowed only through local or token-authorized `/api/imessage` calls.
 
-Setup:
-
-1. Create/login to Photon at https://photon.codes/ / https://app.photon.codes/.
-2. Create a Spectrum/iMessage project and get the project id/secret.
-3. Start Mi web chat locally or over Tailscale. For the user service, run `./scripts/install-mi-web-chat-systemd.sh`; it derives the machine's current Tailscale DNS name when issuing its certificate, then run `systemctl --user restart mi-web-chat.service`.
-4. Run the bridge with only your phone number allowlisted:
-
-```bash
-PHOTON_PROJECT_ID=... \
-PHOTON_PROJECT_SECRET=... \
-PHOTON_ALLOWED_USERS=+15551234567 \
-MI_WEB_URL=http://127.0.0.1:8787 \
-npm run photon
-```
+Setup uses the complete Mi stack installer below. It derives the current Tailscale DNS name for TLS and configures Photon to reach Mi only through `http://127.0.0.1:8787`; no provider credential is placed in the repository or Pi configuration.
 
 Optional env:
 
@@ -193,17 +176,7 @@ The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:
 
 `vps-gateway/mi-concierge` is Mi V2's production-only foreground route. The authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical implicit-high route for every other gateway client. These are the only durable production aliases; tracked production callers do not require `coding-fast`. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
 
-The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`. Its prepared root entrypoint is `/home/kyle/install-mi-subscription-gateway.sh`; it installs only the tracked LiteLLM config/handler/wrapper/drop-in, reloads and restarts `llm-gateway`, then performs the authenticated local health check. It does not configure provider secrets:
-
-```bash
-sudo /home/kyle/install-mi-subscription-gateway.sh
-```
-
-Install/check only the non-secret production Pi registry entry with:
-
-```bash
-npm run setup:mi-gateway-models
-```
+The gateway and non-secret production Pi registry are installed as stages of the canonical stack operation. The tracked modular scripts remain internal implementation and test units.
 
 #### Decision-only model evaluation
 
@@ -217,15 +190,15 @@ sudo /home/kyle/uninstall-mi-model-eval-gateway.sh
 
 The uninstall is idempotent: it restores the canonical production config/handler, removes only eval-only registry entries, preserves unrelated settings/models and production defaults, restarts the gateway, and waits for the existing authenticated readiness check. The harness uses `/home/kyle/bin/run-heavy`, invokes only `/home/kyle/bin/pi-gateway`, writes sanitized synthetic summaries and blinded outputs under ignored `.tmp/mi-model-eval/`, and never dispatches a task.
 
-For always-on use, store the Photon values once, then install/restart:
+### Mi stack installation
+
+Normal installation and repair has one user-facing command (run normally; it requests sudo at most once):
 
 ```bash
-sudo secret assistant photon
-# paste PHOTON_PROJECT_ID=..., PHOTON_PROJECT_SECRET=..., PHOTON_ALLOWED_USERS=...
-
-sudo ./scripts/install-mi-imessage-stack-root.sh
-sudo journalctl -u mi-photon-bridge -f
+/home/kyle/install-mi-stack.sh
 ```
+
+Use `/home/kyle/install-mi-stack.sh --check` for a non-secret health/configuration summary or `--dry-run` to list stages without mutation. The operation installs the production gateway and registry, brokered client helper, dynamic Tailscale TLS/web service, loopback Photon bridge, daemon, timer, and user/system units. It also removes temporary eval aliases and restores production while preserving eval harness files. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
 
 The installer creates/enables:
 
