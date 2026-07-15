@@ -13,6 +13,8 @@ import { appendThreadMessage, getThread, threadContext } from '../dist/src/threa
 import { runFlueChat } from '../dist/src/flue.js';
 import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { createApproval, logEvent, readApprovals, resolveApproval, writeApprovals } from '../dist/src/state.js';
+import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
+import { emitTurnEvent } from './mi-turn-observability.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
@@ -1073,7 +1075,8 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   }
   const decision = options.decision || workerRoutingDecision(message);
   const name = options.name || `${taskNameFromPrompt(message)}-${Date.now().toString(36).slice(-6)}`;
-  const workerPrompt = await buildBackgroundWorkerPrompt(threadId, message, decision);
+  let workerPrompt = await buildBackgroundWorkerPrompt(threadId, message, decision);
+  if (options.taskId === true) workerPrompt = `${workerPrompt}\n\n${workerCompletionInstruction()}`;
   const startedAt = now();
   const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: options.taskId !== true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
   const worker = {
@@ -1150,7 +1153,8 @@ async function buildWorkerFollowupPrompt(threadId, message) {
 
 async function continueBackgroundWorker(threadId, worker, objective, options = {}) {
   const userMessage = options.threadMessage || objective;
-  const workerPrompt = await buildWorkerFollowupPrompt(threadId, objective);
+  let workerPrompt = await buildWorkerFollowupPrompt(threadId, objective);
+  if (options.taskId === true || worker.imessageV2) workerPrompt = `${workerPrompt}\n\n${workerCompletionInstruction()}`;
   await appendThreadMessage(threadId, 'user', userMessage, { unread: false, source: options.userSource || 'web', taskId: options.taskId === true ? workerCorrelationId(worker) : undefined });
   await logEvent('mi.web.worker.followup', { threadId, taskId: worker.taskId || worker.id, message: userMessage });
   const taskId = worker.taskId || worker.sessionFile || worker.sessionName || worker.name || worker.id;
@@ -1442,16 +1446,28 @@ async function monitorBackgroundWorkers() {
       worker.formatting = true;
       activeWorkers.set(worker.id, worker);
       const text = task.text || task.error || 'Background worker finished.';
-      const completion = worker.imessageV2
-        ? await formatImessageV2Completion(worker, task.error || text, Boolean(task.error))
-        : workerCompletionText(worker, task.error || text, Boolean(task.error));
+      if (worker.imessageV2) await emitTurnEvent(root, { stage: 'task-terminal', outcome: task.error ? 'error' : 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(worker) }).catch(() => undefined);
+      const structured = worker.imessageV2 ? parseWorkerCompletion(text) : undefined;
+      const isError = Boolean(task.error) || structured?.status === 'error';
+      const completion = structured?.userSummary
+        ? structured.userSummary
+        : worker.imessageV2
+          ? await formatImessageV2Completion(worker, task.error || text, isError)
+          : workerCompletionText(worker, task.error || text, isError);
+      // A structured envelope is retained only in worker state. Its internalDetails
+      // never enter a thread, V2 context, or Photon polling surface.
+      if (structured?.internalDetails) worker.internalCompletionDetails = structured.internalDetails;
+      worker.resultGeneration = Number(worker.resultGeneration || 0) + 1;
       if (worker.threadId) {
         await appendThreadMessage(worker.threadId, 'assistant', completion, {
           unread: false,
-          source: task.error ? 'mi-worker-error' : 'mi-worker-result',
+          source: isError ? 'mi-worker-error' : 'mi-worker-result',
           taskId: worker.imessageV2 ? workerCorrelationId(worker) : worker.taskId || worker.id,
+          generation: worker.imessageV2 ? worker.resultGeneration : undefined,
         }).catch(() => undefined);
+        if (worker.imessageV2) await emitTurnEvent(root, { stage: 'result-formatted', outcome: structured ? 'ok' : 'fallback', route: 'v2', modelProfile: structured ? 'none' : 'mi-concierge', turn: workerCorrelationId(worker) }).catch(() => undefined);
         notifyUser(completion, worker.threadId).catch(() => {});
+        if (worker.imessageV2) await emitTurnEvent(root, { stage: 'terminal', outcome: isError ? 'error' : structured?.status === 'blocked' ? 'blocked' : 'ok', route: 'v2', modelProfile: structured ? 'none' : 'mi-concierge', turn: workerCorrelationId(worker) }).catch(() => undefined);
       }
       delete worker.formatting;
       worker.status = task.error ? 'error' : 'complete';
@@ -2266,6 +2282,8 @@ async function runImessageV2(message, threadId) {
 }
 
 async function handleImessageV2(threadId, message) {
+  const turnStartedAt = Date.now();
+  await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message }).catch(() => undefined);
   if (v2Cancellation(message)) {
     await v2ClearPendingAction(threadId);
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
@@ -2279,6 +2297,7 @@ async function handleImessageV2(threadId, message) {
     return { ok: false, reply: imessageV2UnavailableReply, handoff: false, temporary: true };
   }
   const decision = invocation.decision;
+  await emitTurnEvent(root, { stage: 'decision', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message, durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
   if (decision.kind === 'task') {
     const objective = v2CanonicalObjective(decision.objective);
     const capability = v2TaskCapabilities.has(decision.capability) ? decision.capability : undefined;
@@ -2314,6 +2333,7 @@ async function handleImessageV2(threadId, message) {
         threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
         ackSource: 'imessage-v2-task-ack', taskId: true, subject: objective,
       });
+      await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(result.worker), durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
       return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
     }
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
@@ -2322,6 +2342,7 @@ async function handleImessageV2(threadId, message) {
       userSource: 'imessage-v2-user', subject: objective, capabilityProfile: 'worker-read', allowDuplicate: true,
       decision: { start: true, reason: 'iMessage V2 read-only task gate' },
     });
+    await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(result.worker), durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
     return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
   }
   const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
