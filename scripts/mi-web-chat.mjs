@@ -13,16 +13,6 @@ import { appendThreadMessage, getThread, threadContext } from '../dist/src/threa
 import { runFlueChat } from '../dist/src/flue.js';
 import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { createApproval, logEvent, readApprovals, resolveApproval, writeApprovals } from '../dist/src/state.js';
-import {
-  imessageAskFirstReply,
-  imessageDetectCandidatesQuery,
-  imessageIsBareUrl,
-  imessageLooksLikePriorWorkStatusQuestion,
-  imessageNormalizeDisplayText,
-  imessagePriorWorkStatusReply,
-  imessageWorkAck,
-  imessageWorkDecision,
-} from './mi-imessage-routing.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
@@ -60,10 +50,14 @@ const imessageThread = process.env.MI_IMESSAGE_THREAD || process.env.MI_PHOTON_T
 const imessageMaxReplyChars = Number(process.env.MI_IMESSAGE_MAX_REPLY_CHARS || 1200);
 const imessageChatTimeoutMs = Number(process.env.MI_IMESSAGE_CHAT_TIMEOUT_MS || 30000);
 const imessageCompletionTimeoutMs = Number(process.env.MI_IMESSAGE_COMPLETION_TIMEOUT_MS || 15000);
-const imessageCompletionGateway = process.env.MI_IMESSAGE_COMPLETION_GATEWAY || '/home/kyle/bin/pi-gateway';
-const imessageCompletionModel = process.env.MI_IMESSAGE_COMPLETION_MODEL || 'vps-gateway/mi-concierge';
-const imessageCompletionHome = process.env.MI_IMESSAGE_COMPLETION_HOME || home;
-const pinnedPiPath = '/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin';
+const miGatewayClient = process.env.MI_GATEWAY_CLIENT || path.join(root, 'scripts', 'mi-gateway-client.py');
+let legacyImessageRouting;
+
+async function loadLegacyImessageRouting() {
+  // Preserve V1 as an immediate rollback path without loading its regex router in V2.
+  legacyImessageRouting ||= import('./mi-imessage-routing.mjs');
+  return legacyImessageRouting;
+}
 const imessageMemoryMaxChars = Number(process.env.MI_IMESSAGE_MEMORY_CHARS || 2500);
 const imessageAskFirst = /^(1|true|yes|on)$/i.test(process.env.MI_IMESSAGE_ASK_FIRST || '');
 const imessageV2Enabled = !/^(0|false|no|off)$/i.test(process.env.MI_IMESSAGE_V2 || '1');
@@ -82,6 +76,7 @@ const imessageThreadQueues = new Map();
 const activeJobs = new Map();
 const activeWorkers = new Map();
 const recentNotificationKeys = new Map();
+let backgroundWorkerMonitorInFlight = false;
 const notificationDedupeMs = Number(process.env.MI_WEB_NOTIFICATION_DEDUPE_MS || 2 * 60 * 1000);
 const safePiEnvKeys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'HOSTNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'TMP', 'TEMP', 'PI_PROVIDER', 'PI_MODEL', 'PI_CONFIG_DIR', 'PI_GATEWAY_URL', 'AGENT_GATEWAY_URL'];
 
@@ -1325,68 +1320,89 @@ function workerCompletionText(worker, text, isError = false) {
 
 const imessageCompletionFallback = 'I finished checking that, but I couldn’t prepare a concise result. Ask me to summarize it again.';
 
-async function formatImessageV2Completion(worker, findings, isError = false) {
-  const objective = compactAckText(worker.subject || worker.text || 'the requested check', 700);
-  const prompt = buildImessageCompletionPrompt({ objective, findings: isError ? `The check ended with an error: ${findings || ''}` : findings });
-  const args = ['--print', '--offline', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-tools', '--model', imessageCompletionModel, prompt];
+function imessageGatewayModel() {
+  const configured = String(process.env.MI_IMESSAGE_MODEL || 'mi-concierge').trim();
+  const aliases = new Map([['mi-concierge', 'mi-concierge'], ['vps-gateway/mi-concierge', 'mi-concierge']]);
+  if (process.env.MI_GATEWAY_EVAL === '1') {
+    for (const alias of ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-medium', 'mi-eval-sol-high']) {
+      aliases.set(alias, alias);
+      aliases.set(`vps-gateway/${alias}`, alias);
+    }
+  }
+  return aliases.get(configured) || '';
+}
+
+/** Invoke the deliberately narrow local client. Prompts are stdin, never argv. */
+async function invokeMiGateway(messages, { timeoutMs, outputCap, model = imessageGatewayModel() } = {}) {
+  if (!model) return { failure: 'invalid-model' };
+  const payload = JSON.stringify({
+    model, messages, timeoutSeconds: Math.max(1, Math.min(30, Math.ceil(timeoutMs / 1000))), outputCap,
+    ...(model.startsWith('mi-eval-') ? { eval: true } : {}),
+  });
+  if (payload.length > 24000) return { failure: 'input-limit' };
   return await new Promise((resolve) => {
     let child;
     let stdout = '';
     let settled = false;
-    let timer;
     let killTimer;
-    const finish = (category) => {
+    let timer;
+    const finish = (failure) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (category) {
-        console.error('iMessage completion formatter failed:', JSON.stringify({ category }));
-        resolve(imessageCompletionFallback);
-        return;
-      }
-      const completion = sanitizeImessageCompletion(stdout, objective);
-      resolve(completion || imessageCompletionFallback);
+      clearTimeout(killTimer);
+      resolve(failure ? { failure } : { content: stdout });
     };
-    const terminate = (category) => {
+    const terminate = (failure) => {
       if (child && child.exitCode === null && !child.killed) {
         child.kill('SIGTERM');
         killTimer = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 1000);
         killTimer.unref?.();
       }
-      finish(category);
+      finish(failure);
     };
     try {
-      child = spawn(imessageCompletionGateway, args, {
-        cwd: home,
-        // pi-gateway resolves `pi` from PATH; never inherit a service's arbitrary PATH.
-        env: { PATH: pinnedPiPath, HOME: imessageCompletionHome, LC_ALL: 'C.UTF-8', PI_OFFLINE: '1' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-    } catch {
-      finish('spawn-error');
-      return;
-    }
-    timer = setTimeout(() => terminate('timeout'), imessageCompletionTimeoutMs);
+      child = spawn(miGatewayClient, [], { cwd: home, env: { HOME: home, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(process.env.MI_GATEWAY_URL ? { MI_GATEWAY_URL: process.env.MI_GATEWAY_URL } : {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch { finish('spawn-error'); return; }
+    timer = setTimeout(() => terminate('timeout'), timeoutMs);
     child.stdout.on('data', (chunk) => {
       const text = chunk.toString();
-      const remaining = IMESSAGE_V2_LIMITS.completionProcessOutput - stdout.length;
+      const remaining = outputCap - stdout.length;
       if (remaining > 0) stdout += text.slice(0, remaining);
       if (text.length > remaining) terminate('output-limit');
     });
     child.stderr.on('data', () => {});
-    child.on('error', () => terminate('spawn-error'));
+    child.on('error', () => finish('spawn-error'));
     child.on('close', (code, signal) => {
-      clearTimeout(killTimer);
       if (settled) return;
       if (code !== 0) return finish(signal ? 'signal' : 'nonzero-exit');
       if (!stdout.trim()) return finish('empty-output');
       finish();
     });
+    child.stdin.on('error', () => terminate('stdin-error'));
+    child.stdin.end(payload);
   });
 }
 
+async function formatImessageV2Completion(worker, findings, isError = false) {
+  const objective = compactAckText(worker.subject || worker.text || 'the requested check', 700);
+  const prompt = buildImessageCompletionPrompt({ objective, findings: isError ? `The check ended with an error: ${findings || ''}` : findings });
+  const result = await invokeMiGateway([{ role: 'user', content: prompt }], {
+    timeoutMs: imessageCompletionTimeoutMs, outputCap: IMESSAGE_V2_LIMITS.completionProcessOutput,
+    // Completion presentation is always production concierge, independent of a decision eval override.
+    model: 'mi-concierge',
+  });
+  if (result.failure) {
+    console.error('iMessage completion formatter failed:', JSON.stringify({ category: result.failure }));
+    return imessageCompletionFallback;
+  }
+  return sanitizeImessageCompletion(result.content, objective) || imessageCompletionFallback;
+}
+
 async function monitorBackgroundWorkers() {
-  if (activeWorkers.size === 0) return;
+  if (activeWorkers.size === 0 || backgroundWorkerMonitorInFlight) return;
+  backgroundWorkerMonitorInFlight = true;
+  try {
   let tasks = [];
   try {
     const result = await sendTaskSocketRequest({ type: 'list_tasks' }, 10000);
@@ -1396,7 +1412,7 @@ async function monitorBackgroundWorkers() {
   }
   let changed = false;
   for (const worker of Array.from(activeWorkers.values())) {
-    if (!workerIsActive(worker)) continue;
+    if (!workerIsActive(worker) || worker.formatting) continue;
     const existingResult = await workerResultSince(worker).catch(() => undefined);
     if (existingResult) {
       // A V2 result with this stable correlation was already formatted and persisted.
@@ -1421,6 +1437,10 @@ async function monitorBackgroundWorkers() {
     worker.sessionName = task.sessionName || worker.sessionName;
     changed = true;
     if (taskDone(task)) {
+      // Formatting is asynchronous; reserve this correlation before awaiting it so
+      // a fast monitor interval cannot emit the same completion twice.
+      worker.formatting = true;
+      activeWorkers.set(worker.id, worker);
       const text = task.text || task.error || 'Background worker finished.';
       const completion = worker.imessageV2
         ? await formatImessageV2Completion(worker, task.error || text, Boolean(task.error))
@@ -1433,6 +1453,7 @@ async function monitorBackgroundWorkers() {
         }).catch(() => undefined);
         notifyUser(completion, worker.threadId).catch(() => {});
       }
+      delete worker.formatting;
       worker.status = task.error ? 'error' : 'complete';
       worker.completedAt = task.finishedAt || now();
       worker.updatedAt = now();
@@ -1444,6 +1465,9 @@ async function monitorBackgroundWorkers() {
     }
   }
   if (changed) await saveActiveWorkers().catch(() => undefined);
+  } finally {
+    backgroundWorkerMonitorInFlight = false;
+  }
 }
 
 const html = String.raw`<!doctype html>
@@ -1932,10 +1956,6 @@ function formatDetectCandidatesReply(payload) {
   return sanitizeMiConversationText(lines.join('\n'));
 }
 
-function imessageShouldStartWork(message) {
-  return imessageWorkDecision(message, [], { askFirst: imessageAskFirst }).action === 'start';
-}
-
 function imessageRememberPayload(message, recentMessages = []) {
   const text = String(message || '').trim();
   const match = text.match(/^(?:please\s+)?(?:remember|save|note)\s+(?:that\s+)?(.+)$/is);
@@ -2010,6 +2030,12 @@ async function saveImessageMemory(payload, threadId) {
   return { ok: true, reply: `Got it, I’ll remember that.` };
 }
 
+function imessageNormalizeDisplayText(text) {
+  return String(text || '').replace(/\r\n?/g, '\n').split('\n')
+    .map((line) => line.replace(/[ \t\f\v]{2,}/g, ' ').trimEnd()).join('\n')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function imessageCleanReply(text) {
   const initial = sanitizeMiConversationText(String(text || ''));
   if (/\b(?:send|pass|route|handoff|hand\s*off)\b[\s\S]{0,80}\b(?:mi\s+)?agents?\b/i.test(initial) || /\bcan(?:not|'t|’t)\s+make\s+that\s+change\s+from\s+here\b/i.test(initial)) {
@@ -2081,45 +2107,99 @@ async function runImessageChat(message, threadId) {
   });
 }
 
+function safeV2ContextText(value, maxChars) {
+  const text = redactV2Text(value)
+    .replace(/(?:~|\/)(?:home|Users|tmp)\/[A-Za-z0-9_.@/:-]+/g, '[private location]')
+    .split('\n')
+    .filter((line) => !/\b(?:authorization|bearer|token|secret|password|api[_ -]?key)\b/i.test(line))
+    .join('\n')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .trim();
+  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1)).trim()}…` : text;
+}
+
 async function readV2ContextFile(file, maxChars) {
   try {
-    const text = redactV2Text(await readFile(file, 'utf8'));
+    const text = safeV2ContextText(await readFile(file, 'utf8'), maxChars);
     const modified = (await stat(file)).mtime.toISOString();
-    return { text: text.length > maxChars ? `${text.slice(0, maxChars - 1).trim()}…` : text, modified };
+    return { text, modified };
   } catch {
     return { text: '', modified: '' };
   }
 }
 
+function safeV2Snapshot(label, entry) {
+  if (!entry.text) return '';
+  try {
+    const value = JSON.parse(entry.text);
+    const source = Array.isArray(value) ? value : [value];
+    const summaries = source.slice(-4).map((item) => {
+      if (!item || typeof item !== 'object') return '';
+      const fields = ['status', 'state', 'ok', 'healthy', 'updatedAt', 'lastRunAt', 'nextRunAt', 'summary']
+        .filter((key) => ['string', 'number', 'boolean'].includes(typeof item[key]))
+        .map((key) => `${key}=${safeV2ContextText(String(item[key]), 140)}`);
+      return fields.join(', ');
+    }).filter(Boolean);
+    return summaries.length ? `${label} (${entry.modified || 'time unknown'}): ${summaries.join(' | ')}` : '';
+  } catch {
+    return `${label} (${entry.modified || 'time unknown'}): ${safeV2ContextText(entry.text, 320)}`;
+  }
+}
+
+function safeV2Approvals(entry) {
+  if (!entry.text) return '';
+  try {
+    const parsed = JSON.parse(entry.text);
+    const approvals = Array.isArray(parsed) ? parsed : Array.isArray(parsed.approvals) ? parsed.approvals : [];
+    const pending = approvals.filter((item) => item?.status === 'pending').slice(-3).map((item) => {
+      const pendingAction = item.v2PendingAction || {};
+      const id = String(pendingAction.confirmationId || item.id || '').replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80);
+      const capability = safeV2ContextText(pendingAction.capability || '', 30);
+      const objective = safeV2ContextText(pendingAction.objective || item.summary || '', 220);
+      return [id && `confirmationId=${id}`, capability && `capability=${capability}`, objective && `request=${objective}`].filter(Boolean).join(', ');
+    }).filter(Boolean);
+    return pending.length ? `Pending confirmations (${entry.modified || 'time unknown'}): ${pending.join(' | ')}` : 'Pending confirmations: none recorded';
+  } catch { return 'Pending confirmations: unavailable'; }
+}
+
+async function v2RelevantProjectExcerpt(message) {
+  const text = String(message || '').toLowerCase();
+  const projectScore = /\b(?:project|repo|branch|pull request|\bpr\b|implementation)\b/.test(text) ? 1 : 0;
+  const goalScore = /\b(?:goal|priority|priorities)\b/.test(text) ? 1 : 0;
+  if (!projectScore && !goalScore) return { text: '', modified: '' };
+  // A tie is ambiguous: do not dump both orientation documents into a foreground turn.
+  if (projectScore === goalScore) return { text: '', modified: '' };
+  return readV2ContextFile(path.join(home, 'pi-docs', projectScore ? 'PROJECTS.md' : 'GOALS.md'), 700);
+}
+
 async function buildImessageV2Context(threadId, message) {
-  const [preferences, memory, tick, health, approvals, projects, goals] = await Promise.all([
-    readV2ContextFile(miPreferencesPath, 2400),
-    readV2ContextFile(miMemoryPath, 3000),
-    readV2ContextFile(path.join(root, 'state', 'tick.json'), 900),
-    readV2ContextFile(path.join(root, 'state', 'monitor-health.json'), 1100),
-    readV2ContextFile(path.join(root, 'state', 'approvals.json'), 1100),
-    readV2ContextFile(path.join(home, 'pi-docs', 'PROJECTS.md'), 1400),
-    readV2ContextFile(path.join(home, 'pi-docs', 'GOALS.md'), 1000),
+  const [preferences, memory, tick, health, approvals, project] = await Promise.all([
+    readV2ContextFile(miPreferencesPath, IMESSAGE_V2_LIMITS.preferences),
+    readV2ContextFile(miMemoryPath, IMESSAGE_V2_LIMITS.memory),
+    readV2ContextFile(path.join(root, 'state', 'tick.json'), 500),
+    readV2ContextFile(path.join(root, 'state', 'monitor-health.json'), 500),
+    readV2ContextFile(path.join(root, 'state', 'approvals.json'), 900),
+    v2RelevantProjectExcerpt(message),
   ]);
-  const messages = (await readMessages(threadId, 30)).filter((message) => {
-    // Daemon result reports have no stable V2 correlation. They remain in daemon
-    // task state for audit, but must never become assistant context in this channel.
-    if (message.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(message.source) && !message.taskId) return false;
-    return true;
+  const messages = (await readMessages(threadId, 12)).filter((entry) => {
+    // Generic daemon reports do not have a stable V2 correlation and are never context.
+    return !(entry.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(entry.source) && !entry.taskId);
   });
   const workers = Array.from(activeWorkers.values())
     .filter((worker) => worker.threadId === threadId && (workerIsActive(worker) || workerIsRecent(worker)))
-    .slice(-10)
-    .map((worker) => `${worker.updatedAt || worker.createdAt || 'unknown time'} | ${worker.status || 'unknown'} | ${redactV2Text(worker.subject || worker.name || worker.text || 'work').slice(0, 220)} | task ${workerCorrelationId(worker)}`)
+    .slice(-5)
+    .map((worker) => `${worker.updatedAt || worker.createdAt || 'time unknown'} | ${safeV2ContextText(worker.status || 'unknown', 40)} | ${safeV2ContextText(worker.subject || worker.name || worker.text || 'work', 160)} | continuation ${workerCorrelationId(worker)}`)
     .join('\n');
   const snapshot = [
-    ['state/tick.json', tick], ['state/monitor-health.json', health], ['state/approvals.json', approvals],
-    ['~/pi-docs/PROJECTS.md', projects], ['~/pi-docs/GOALS.md', goals],
-  ].map(([label, entry]) => entry.text ? `${label} (modified ${entry.modified || 'unknown'}):\n${entry.text}` : `${label}: unavailable`).join('\n\n');
+    safeV2Snapshot('Recent scheduler health', tick), safeV2Snapshot('Recent monitor health', health),
+    safeV2Approvals(approvals),
+    project.text ? `One relevant orientation excerpt (${project.modified || 'time unknown'}): ${project.text}` : '',
+  ].filter(Boolean).join('\n\n');
   return buildImessageV2Prompt({
-    timestamp: now(), userMessage: message, preferences: preferences.text, preferencesReadAt: preferences.modified,
-    memory: memory.text, memoryReadAt: memory.modified, threadMessages: messages, threadReadAt: now(),
-    workers, workersReadAt: now(), snapshot, snapshotReadAt: now(),
+    timestamp: now(), userMessage: message, preferences: preferences.text, preferencesProvenance: 'bounded preferences', preferencesReadAt: preferences.modified,
+    memory: memory.text, memoryProvenance: 'bounded durable memory', memoryReadAt: memory.modified,
+    threadMessages: messages, threadProvenance: 'recent iMessage records', threadReadAt: now(),
+    workers, workersProvenance: 'active/recent correlated work', workersReadAt: now(), snapshot, snapshotProvenance: 'safe current snapshots', snapshotReadAt: now(),
   });
 }
 
@@ -2171,57 +2251,18 @@ async function v2ClearPendingAction(threadId) {
 }
 
 
-function imessageV2SafeStderr(stderr, prompt, message) {
-  return redactV2Text(String(stderr || '')
-    .replaceAll(String(prompt || ''), '[prompt redacted]')
-    .replaceAll(String(message || ''), '[message redacted]'))
-    .replace(/\s+/g, ' ').trim().slice(0, 500);
-}
-
 async function runImessageV2(message, threadId) {
-  const piCmd = process.env.PI_CMD || 'pi';
-  // The foreground concierge is deliberately Mi-specific: shared coding-main
-  // retains its high-effort behavior for every other gateway client.
-  const model = process.env.MI_IMESSAGE_MODEL || 'vps-gateway/mi-concierge';
   const prompt = await buildImessageV2Context(threadId, message);
-  // The foreground decision is context-only. It has no tools or capability grant,
-  // so live verification is delegated through the existing controlled worker path.
-  const baseArgs = ['--print', '--offline', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-tools'];
-  const args = model ? [...baseArgs, '--model', model, prompt] : [...baseArgs, prompt];
-  return await new Promise((resolve) => {
-    const child = spawn(piCmd, args, { cwd: home, env: reducedPiEnv({ PI_OFFLINE: '1' }), stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    const finish = (category, details = {}) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (category) {
-        console.error('iMessage V2 invocation failed:', JSON.stringify({ category, ...details, stderr: imessageV2SafeStderr(stderr, prompt, message) }));
-        resolve({ failure: category });
-        return;
-      }
-      resolve({ decision: parseImessageV2Envelope(stdout) });
-    };
-    const timer = setTimeout(() => { child.kill('SIGTERM'); finish('timeout'); }, imessageChatTimeoutMs);
-    child.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      const remaining = IMESSAGE_V2_LIMITS.output - stdout.length;
-      if (remaining > 0) stdout += text.slice(0, remaining);
-      if (text.length > remaining) {
-        child.kill('SIGTERM');
-        finish('output-limit');
-      }
-    });
-    child.stderr.on('data', (chunk) => { if (stderr.length < 2000) stderr += chunk.toString().slice(0, 2000 - stderr.length); });
-    child.on('error', (error) => finish('spawn-error', { code: String(error?.code || '') }));
-    child.on('close', (code, signal) => {
-      if (code !== 0) return finish('nonzero-exit', { code, signal: signal || '' });
-      if (!stdout.trim()) return finish('empty-output', { code: code ?? 0, signal: signal || '' });
-      finish();
-    });
+  // This foreground request is context-only. The local client fixes the loopback
+  // endpoint and immutable concierge profile; it never starts an outer Pi process.
+  const result = await invokeMiGateway([{ role: 'user', content: prompt }], {
+    timeoutMs: imessageChatTimeoutMs, outputCap: IMESSAGE_V2_LIMITS.output,
   });
+  if (result.failure) {
+    console.error('iMessage V2 invocation failed:', JSON.stringify({ category: result.failure }));
+    return { failure: result.failure };
+  }
+  return { decision: parseImessageV2Envelope(result.content) };
 }
 
 async function handleImessageV2(threadId, message) {
@@ -2370,6 +2411,10 @@ async function handle(req, res) {
       return await withImessageThreadQueue(threadId, async () => {
       // V2 is deliberately first: all legacy iMessage regex routing remains below as an immediate rollback path.
       if (imessageV2Enabled) return sendJson(res, 200, await handleImessageV2(threadId, message));
+      const {
+        imessageAskFirstReply, imessageIsBareUrl, imessageLooksLikePriorWorkStatusQuestion,
+        imessagePriorWorkStatusReply, imessageWorkAck, imessageWorkDecision,
+      } = await loadLegacyImessageRouting();
       const loopDiscoverySelection = await handleLoopDiscoverySelectionFromImessage(threadId, message);
       if (loopDiscoverySelection) return sendJson(res, 200, loopDiscoverySelection);
       const loopDiscoveryRun = await handleLoopDiscoveryRunFromImessage(threadId, message);

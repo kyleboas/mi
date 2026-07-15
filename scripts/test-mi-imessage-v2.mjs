@@ -8,13 +8,13 @@ import { createHermeticMiEnv, httpJson, readJsonl, startFakeDaemon, startWebChat
 
 const hugeSecret = `sk-${'x'.repeat(40)}`;
 const webSource = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
-assert.match(webSource, /process\.env\.MI_IMESSAGE_MODEL \|\| 'vps-gateway\/mi-concierge'/, 'V2 defaults to the Mi-only canonical local gateway model');
+assert.match(webSource, /const miGatewayClient = process\.env\.MI_GATEWAY_CLIENT/, 'V2 uses the fixed local gateway client');
 const v2InvocationSource = webSource.slice(webSource.indexOf('async function runImessageV2'), webSource.indexOf('async function handleImessageV2'));
-assert.doesNotMatch(v2InvocationSource, /--mode', 'json'|--no-context-files|openai-codex\/gpt-5\.6-sol/, 'V2 uses bounded plain print output without stale flags or models');
-assert.match(v2InvocationSource, /'--print', '--offline'/, 'V2 explicitly requests Pi plain print output');
-assert.match(v2InvocationSource, /'--no-tools'/, 'V2 foreground decisions have no tools');
-assert.doesNotMatch(v2InvocationSource, /--extension|MI_CAPABILITY_|writeCapabilityGrantsFile|capabilityGuardPath/, 'V2 creates no guard or capability artifacts');
-assert.match(v2InvocationSource, /IMESSAGE_V2_LIMITS\.output/, 'V2 bounds plain stdout');
+assert.doesNotMatch(v2InvocationSource, /PI_CMD|--print|--model|spawn\(pi/, 'V2 never starts an outer Pi CLI');
+assert.match(v2InvocationSource, /invokeMiGateway/, 'V2 sends bounded role messages through the local client');
+assert.match(webSource, /aliases\.get\(configured\) \|\| ''/, 'unsupported model overrides fail closed');
+assert.match(webSource, /IMESSAGE_V2_LIMITS\.output/, 'V2 bounds local-client output');
+assert.match(webSource, /loadLegacyImessageRouting\(\)/, 'V1 routing is lazy-loaded only after the V2 gate');
 const prompt = buildImessageV2Prompt({
   timestamp: '2026-07-14T12:00:00.000Z',
   userMessage: 'Can you check it?',
@@ -42,25 +42,32 @@ let daemon;
 let web;
 try {
   const piLog = join(fixture.root, 'pi.jsonl');
-  await writeFile(fixture.fakePi, `#!/usr/bin/env node
+  await writeFile(fixture.fakePi, String.raw`#!/usr/bin/node
 import { appendFileSync } from 'node:fs';
-const prompt = process.argv.at(-1) || '';
-appendFileSync(${JSON.stringify(piLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');
-let envelope = { kind: 'reply', reply: 'The current status looks good.' };
-if (prompt.includes('CORRELATION_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Check the garden plan status and report a concise update.', ack: 'I’ll check the garden plan.' };
-if (prompt.includes('ACTIVE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status and report the result.', ack: 'I’ll repair notebook sync.' };
-if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the quarterly travel plan and report it.', ack: 'I’ll draft the travel plan.' };
-if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Read the notebook sync[^\\n]*\\| task ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
-if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now.?' };
-if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
-if (prompt.includes('CURRENT_STATE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read-only verify the current status and report the result.', ack: 'I’ll check the current status.' };
-if (prompt.includes('MALICIOUS_RESTART_READ')) envelope = { kind: 'task', capability: 'read', objective: 'Restart mi-web-chat.service now.', ack: 'I’ll restart it.' };
-if (prompt.includes('MISSING_CAP_DEPLOY')) envelope = { kind: 'task', objective: 'Deploy the service now.', ack: 'I’ll deploy it.' };
-if (prompt.includes('NONZERO_CASE')) { process.stderr.write('provider failed for sk-test-secret and NONZERO_CASE\\n'); process.exit(7); }
-if (prompt.includes('EMPTY_CASE')) process.exit(0);
-if (prompt.includes('HUGE_OUTPUT_CASE')) process.stdout.write('x'.repeat(IMESSAGE_V2_LIMITS.output + 1));
-if (prompt.includes('MALFORMED_PLAIN_CASE')) process.stdout.write('not an envelope\\n');
-if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!prompt.includes('HUGE_OUTPUT_CASE') && !prompt.includes('MALFORMED_PLAIN_CASE')) process.stdout.write(JSON.stringify(envelope) + '\\n');
+let input = '';
+process.stdin.on('data', (chunk) => { input += chunk; });
+process.stdin.on('end', () => {
+  let request; try { request = JSON.parse(input); } catch { process.exit(8); }
+  const prompt = request.messages.map((message) => message.content).join('\n');
+  appendFileSync(${JSON.stringify(piLog)}, JSON.stringify({ argv: process.argv.slice(2), request }) + '\n');
+  if (prompt.includes('NONZERO_CASE')) { process.stderr.write('gateway failed\n'); process.exit(7); }
+  if (prompt.includes('EMPTY_CASE')) return;
+  if (prompt.includes('HUGE_OUTPUT_CASE')) return process.stdout.write('x'.repeat(IMESSAGE_V2_LIMITS.output + 1));
+  if (prompt.includes('TIMEOUT_CASE')) return setTimeout(() => {}, 2000);
+  if (prompt.includes('MALFORMED_PLAIN_CASE')) return process.stdout.write('not an envelope\n');
+  if (prompt.includes('You format one completed')) return process.stdout.write('The check is complete.');
+  let envelope = { kind: 'reply', reply: 'The current status looks good.' };
+  if (prompt.includes('CORRELATION_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Check the garden plan status and report a concise update.', ack: 'I’ll check the garden plan.' };
+  if (prompt.includes('ACTIVE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status and report the result.', ack: 'I’ll repair notebook sync.' };
+  if (prompt.includes('UNRELATED_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read the quarterly travel plan and report it.', ack: 'I’ll draft the travel plan.' };
+  if (prompt.includes('FOLLOWUP_TASK')) { const match = prompt.match(/Read the notebook sync[^\n]*\| continuation ([A-Za-z0-9._:-]{1,200})/); envelope = { kind: 'task', capability: 'read', objective: 'Read the notebook sync status using the latest feedback.', ack: 'I’ll correct the notebook sync repair.', continueTaskId: match && match[1] }; }
+  if (prompt.includes('CONFIRM_CASE')) envelope = { kind: 'confirm', reply: 'Should I deploy the garden-plan change now.?' };
+  if (prompt.includes('INTERNAL_CASE')) envelope = { kind: 'reply', reply: 'I will ask a Pi worker through Photon.' };
+  if (prompt.includes('CURRENT_STATE_TASK')) envelope = { kind: 'task', capability: 'read', objective: 'Read-only verify the current status and report the result.', ack: 'I’ll check the current status.' };
+  if (prompt.includes('MALICIOUS_RESTART_READ')) envelope = { kind: 'task', capability: 'read', objective: 'Restart mi-web-chat.service now.', ack: 'I’ll restart it.' };
+  if (prompt.includes('MISSING_CAP_DEPLOY')) envelope = { kind: 'task', objective: 'Deploy the service now.', ack: 'I’ll deploy it.' };
+  process.stdout.write(JSON.stringify(envelope) + '\n');
+});
 `, { mode: 0o755 });
   await chmod(fixture.fakePi, 0o755);
   await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
@@ -81,7 +88,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
     }
     return { text: 'ok' };
   });
-  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_IMESSAGE_COMPLETION_GATEWAY: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' });
+  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'mi-concierge', MI_GATEWAY_CLIENT: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' });
 
   let result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'What is the current status?' } })).json;
   assert.equal(result.handoff, false, 'conversational state question starts no worker');
@@ -93,15 +100,13 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Can you check it?' } })).json;
   assert.equal(result.handoff, false);
   const piCalls = await readJsonl(piLog);
-  assert.ok(piCalls.every((args) => args.includes('--offline')), 'every V2 spawn disables startup package discovery/install without replacing model settings');
-  assert.ok(piCalls.every((args) => args.includes('--print') && !args.includes('--mode') && !args.includes('json')), 'V2 consumes plain print stdout rather than a JSON event stream');
-  assert.ok(piCalls.every((args) => args.includes('--no-tools') && !args.includes('--extension') && !args.includes('--tools')), 'V2 exact foreground argv is extension-free and tool-free');
-  assert.ok(piCalls.every((args) => !args.includes('--no-context-files')), 'V2 never passes unsupported Pi CLI options');
+  assert.ok(piCalls.every((call) => call.argv.length === 0), 'prompts and configuration are never passed in argv');
+  assert.ok(piCalls.every((call) => call.request.model === 'mi-concierge'), 'only the immutable concierge alias reaches the helper');
+  assert.ok(piCalls.every((call) => call.request.messages.length === 1), 'V2 uses one bounded role message');
   assert.equal(existsSync(join(fixture.runtime, 'capabilities')), false, 'V2 creates no capability grant directory');
-  assert.ok(piCalls.filter((args) => args.includes('fake-model')).every((args) => !args.some((arg) => /openai-codex|gpt-5\.6-sol/.test(arg))), 'V2 foreground decisions preserve the configured model override and never inject the stale model');
-  assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources');
-  assert.ok(piCalls.at(-1).at(-1).includes('We decided on the garden plan.'), 'pronoun follow-up receives prior thread context');
-  assert.doesNotMatch(piCalls.at(-1).at(-1), new RegExp(hugeSecret), 'fake Pi receives redacted context only');
+  assert.ok(piCalls.every((call) => !/openai-codex|gpt-5\.6-sol/.test(JSON.stringify(call.request))), 'V2 never injects stale external models');
+  assert.ok(piCalls.at(-1).request.messages[0].content.includes('We decided on the garden plan.'), 'pronoun follow-up receives prior thread context');
+  assert.doesNotMatch(piCalls.at(-1).request.messages[0].content, new RegExp(hugeSecret), 'local client receives redacted context only');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CORRELATION_TASK' } })).json;
   assert.equal(result.handoff, true);
@@ -118,7 +123,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
   assert.ok(messages.some((item) => item.source === 'mi-worker-result' && item.taskId === correlationId), 'completion retains the original correlation id after daemon id changes');
   const completionCalls = await readJsonl(piLog);
-  assert.ok(completionCalls.some((args) => args.includes('vps-gateway/mi-concierge')), 'V2 completion presentation uses the authenticated concierge route independently of the decision override');
+  assert.ok(completionCalls.some((call) => call.request.model === 'mi-concierge' && call.request.messages[0].content.includes('You format one completed')), 'V2 completion presentation uses the same immutable concierge helper route');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'ACTIVE_TASK' } })).json;
   const activeCorrelationId = result.taskId;
@@ -184,13 +189,13 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   web = undefined;
   await rm(join(fixture.miRoot, 'state'), { recursive: true, force: true });
   await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
-  const defaultEnv = { ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_COMPLETION_GATEWAY: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' };
+  const defaultEnv = { ...fixture.env, MI_IMESSAGE_V2: '1', MI_GATEWAY_CLIENT: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' };
   delete defaultEnv.MI_IMESSAGE_MODEL;
   web = await startWebChat(defaultEnv);
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Default concierge route check.' } })).json;
   assert.equal(result.ok, true, 'default V2 API request succeeds through the local route');
   const defaultCall = (await readJsonl(piLog)).at(-1);
-  assert.ok(defaultCall.includes('--model') && defaultCall.includes('vps-gateway/mi-concierge'), 'V2 API default selects the Mi-only concierge alias');
+  assert.equal(defaultCall.request.model, 'mi-concierge', 'V2 API default selects the immutable Mi-only concierge alias');
 
   console.log('Mi iMessage V2 checks passed.');
 } finally {
