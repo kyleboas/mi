@@ -2,18 +2,18 @@ const DEFAULT_REPLY = "I'm here. Could you say that another way?";
 const MAX_REPLY = 1200;
 const MAX_OBJECTIVE = 4000;
 const MAX_ACK = 240;
-const MAX_PROMPT = 18000;
+const MAX_PROMPT = 10000;
 const MAX_COMPLETION_PROMPT = 6000;
 const MAX_COMPLETION_OUTPUT = 480;
 
 export const IMESSAGE_V2_LIMITS = Object.freeze({
   prompt: MAX_PROMPT,
   output: 6000,
-  preferences: 2400,
-  memory: 3000,
-  thread: 6000,
-  workers: 2600,
-  snapshot: 3600,
+  preferences: 1000,
+  memory: 1400,
+  thread: 3000,
+  workers: 1200,
+  snapshot: 1600,
   completionPrompt: MAX_COMPLETION_PROMPT,
   completionFindings: 4200,
   completionOutput: MAX_COMPLETION_OUTPUT,
@@ -83,11 +83,12 @@ function section(label, value, max, provenance = 'local cache', timestamp = '') 
 }
 
 function recentThread(messages = []) {
-  return messages.slice(-30).map((message) => {
+  // Continuity needs a small real window, not a stale transcript dump.
+  return messages.slice(-12).map((message) => {
     const role = message.role === 'user' ? 'User' : message.role === 'assistant' ? 'Mi' : 'System';
-    const source = clean(message.source || 'unknown', 80);
-    const ts = clean(message.ts || 'unknown time', 80);
-    return `${ts} | ${role} | ${source}: ${clean(message.text, 420)}`;
+    const source = clean(message.source || 'unknown', 48);
+    const ts = clean(message.ts || 'unknown time', 48);
+    return `${ts} | ${role} | ${source}: ${clean(message.text, 220)}`;
   }).join('\n');
 }
 
