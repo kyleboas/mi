@@ -1,0 +1,5 @@
+# path<TAB>sha256<TAB>disposition
+fix-mi-gateway.sh	d6598521df6acc0e99bb661d03c691bb10506da04d00789ca8f1697dcbf6b4d2	archive-obsolete
+install-mi-subscription-gateway.sh	3632f7e1f8ed058c5ce54657757b562da7f4c4930a77fd7b25e95398e5ad1b22	archive-superseded
+install-mi-model-eval-gateway.sh	8a3e1a2f896b8bef34ed4c0c6100e501115713df81240030157d6974fdf15e77	replace-generated
+uninstall-mi-model-eval-gateway.sh	04328eb3d7c58407528fae8f9b452050c4de59946e53c3e1e4e98381ea7e81c2	replace-generated

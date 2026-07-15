@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${EUID} -ne 0 ]]; then
+SYSTEM_ROOT="${MI_SYSTEM_ROOT:-}"
+if [[ -z "$SYSTEM_ROOT" && ${EUID} -ne 0 ]]; then
   echo "Run with sudo: sudo ./scripts/install-mi-photon-service-root.sh" >&2
   exit 1
 fi
 
 APP_DIR="${MI_APP_DIR:-/home/kyle/assistant}"
 USER_NAME="${MI_SERVICE_USER:-kyle}"
-SECRET_ENV="${MI_PHOTON_SECRET_ENV:-/etc/agent-secrets/projects/assistant/photon.secret}"
-UNIT_PATH="/etc/systemd/system/mi-photon-bridge.service"
+SECRET_ENV="${MI_PHOTON_SECRET_ENV:-$SYSTEM_ROOT/etc/agent-secrets/projects/assistant/photon.secret}"
+UNIT_PATH="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service"
 NODE_BIN="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
 MI_WEB_URL_VALUE="${MI_WEB_URL:-http://127.0.0.1:8787}"
 MI_PHOTON_THREAD_VALUE="${MI_PHOTON_THREAD:-main}"
@@ -25,7 +26,7 @@ if ! grep -q '^PHOTON_PROJECT_ID=' "$SECRET_ENV" || ! grep -q '^PHOTON_PROJECT_S
   exit 1
 fi
 
-install -d -m 0755 /etc/systemd/system
+install -d -m 0755 "$SYSTEM_ROOT/etc/systemd/system"
 cat > "$UNIT_PATH" <<EOF_UNIT
 [Unit]
 Description=Mi Photon iMessage bridge
@@ -55,8 +56,10 @@ WantedBy=multi-user.target
 EOF_UNIT
 
 chmod 0644 "$UNIT_PATH"
-systemctl daemon-reload
-systemctl enable mi-photon-bridge.service
+if [[ ${MI_PHOTON_NO_SYSTEMD:-0} != 1 ]]; then
+  systemctl daemon-reload
+  systemctl enable mi-photon-bridge.service
+fi
 
 echo "Installed $UNIT_PATH"
 echo "Start with: sudo systemctl start mi-photon-bridge"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${EUID} -ne 0 ]]; then
+SYSTEM_ROOT="${MI_SYSTEM_ROOT:-}"
+if [[ -z "$SYSTEM_ROOT" && ${EUID} -ne 0 ]]; then
   echo "Run with sudo: sudo ./scripts/install-mi-imessage-stack-root.sh" >&2
   exit 1
 fi
@@ -15,21 +16,24 @@ cd "$APP_DIR"
 # A legacy one-setting drop-in can silently override the canonical loopback URL.
 # Remove only that obsolete shape; preserve every operator drop-in containing
 # any other setting.
-PHOTON_OVERRIDE=/etc/systemd/system/mi-photon-bridge.service.d/override.conf
+PHOTON_OVERRIDE="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service.d/override.conf"
 if [[ -f "$PHOTON_OVERRIDE" ]]; then
-  mapfile -t override_lines < <(grep -Ev '^[[:space:]]*(#|$)' "$PHOTON_OVERRIDE")
-  if [[ ${#override_lines[@]} -eq 2 \
-    && "${override_lines[0]}" == '[Service]' \
-    && "${override_lines[1]}" == Environment=MI_WEB_URL=* \
-    && "${override_lines[1]}" != 'Environment=MI_WEB_URL=http://127.0.0.1:8787' ]]; then
+  # This is the sole obsolete address shape Mi owns. Never remove an arbitrary
+  # administrator override merely because it contains MI_WEB_URL.
+  known_obsolete=$'[Service]\nEnvironment=MI_WEB_URL=http://localhost:8787'
+  if [[ "$(cat "$PHOTON_OVERRIDE")" == "$known_obsolete" ]]; then
     rm -f "$PHOTON_OVERRIDE"
     rmdir --ignore-fail-on-non-empty "$(dirname "$PHOTON_OVERRIDE")"
-    echo "Removed obsolete Photon MI_WEB_URL override."
+    echo "Removed known obsolete Photon loopback spelling."
+  else
+    echo "Preserved unknown or modified Photon override." >&2
   fi
 fi
 
-systemctl daemon-reload
-systemctl restart mi-photon-bridge.service
+if [[ ${MI_PHOTON_NO_SYSTEMD:-0} != 1 ]]; then
+  systemctl daemon-reload
+  systemctl restart mi-photon-bridge.service
+fi
 
 echo "Installed and restarted Mi iMessage bridge."
 echo "Status: sudo systemctl status mi-photon-bridge"

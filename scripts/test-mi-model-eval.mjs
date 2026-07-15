@@ -80,6 +80,9 @@ printf '%s' '{"kind":"reply","reply":"Hello."}'
     assert.ok(installedSettings.enabledModels.includes(`vps-gateway/${alias}`));
     assert.ok(installedModels.providers['vps-gateway'].models.some((model) => model.id === alias));
   }
+  assert.equal((await installProductionModels({ directory: config })).changed, true, 'canonical production setup cleans an installed eval overlay');
+  assert.deepEqual(await readFile(join(config, 'settings.json')), productionSettingsBytes, 'production setup restores registry snapshot');
+  assert.equal((await installEvalModels({ directory: config })).changed, true);
   assert.equal((await uninstallEvalModels({ directory: config })).restoredExact, true);
   assert.deepEqual(await readFile(join(config, 'settings.json')), productionSettingsBytes, 'registry settings restore byte-equivalently');
   assert.deepEqual(await readFile(join(config, 'models.json')), productionModelsBytes, 'model registry restores byte-equivalently');
