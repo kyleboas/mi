@@ -16,6 +16,7 @@ const entrypoint = '/home/kyle/install-mi-subscription-gateway.sh';
 
 assert.match(config, /model_name: coding-main/);
 assert.match(config, /model: pi-subscription\/coding-main/);
+assert.match(config, /model_name: mi-concierge\n\s+litellm_params:\n\s+model: pi-subscription\/mi-concierge/, 'Mi concierge must have its own authenticated local alias');
 for (const alias of ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-medium', 'mi-eval-sol-high']) {
   assert.match(config, new RegExp(`model_name: ${alias}\\n\\s+litellm_params:\\n\\s+model: pi-subscription/${alias}`), `${alias} must be an explicit gateway alias`);
 }
@@ -37,6 +38,8 @@ assert.match(dropin, /LoadCredential=gateway:\/etc\/agent-secrets\/local-agent-g
 assert.match(dropin, /ProtectHome=read-only/);
 assert.match(handler, /--no-tools/);
 assert.match(handler, /openai-codex\/gpt-5\.6-sol/);
+assert.match(handler, /"mi-concierge": \(PI_MODEL, "medium"\)/, 'Mi concierge must pin Sol medium');
+assert.match(handler, /"coding-main": \(PI_MODEL, None\)/, 'shared coding-main must remain implicit high');
 assert.match(handler, /mi-eval-luna-low/);
 assert.match(handler, /subscription profile does not accept effort overrides/);
 assert.match(handler, /env=PI_ENV/);

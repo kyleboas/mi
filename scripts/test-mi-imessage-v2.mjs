@@ -8,7 +8,7 @@ import { createHermeticMiEnv, httpJson, readJsonl, startFakeDaemon, startWebChat
 
 const hugeSecret = `sk-${'x'.repeat(40)}`;
 const webSource = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
-assert.match(webSource, /process\.env\.MI_IMESSAGE_MODEL \|\| 'vps-gateway\/coding-main'/, 'V2 defaults to the canonical local gateway model');
+assert.match(webSource, /process\.env\.MI_IMESSAGE_MODEL \|\| 'vps-gateway\/mi-concierge'/, 'V2 defaults to the Mi-only canonical local gateway model');
 const v2InvocationSource = webSource.slice(webSource.indexOf('async function runImessageV2'), webSource.indexOf('async function handleImessageV2'));
 assert.doesNotMatch(v2InvocationSource, /--mode', 'json'|--no-context-files|openai-codex\/gpt-5\.6-sol/, 'V2 uses bounded plain print output without stale flags or models');
 assert.match(v2InvocationSource, /'--print', '--offline'/, 'V2 explicitly requests Pi plain print output');
@@ -81,7 +81,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
     }
     return { text: 'ok' };
   });
-  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_IMESSAGE_CHAT_TIMEOUT_MS: '500', MI_WEB_WORKER_POLL_MS: '25' });
+  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' });
 
   let result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'What is the current status?' } })).json;
   assert.equal(result.handoff, false, 'conversational state question starts no worker');
@@ -175,6 +175,20 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   assert.equal(runCount, 4, 'invocation failures start no workers');
   messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
   assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, unavailableBefore + 4, 'failure replies are durably categorized');
+
+  // Exercise the API default with no model override. This remains hermetic: the
+  // disposable fake Pi only records argv and no message is sent through Photon.
+  await web.close();
+  web = undefined;
+  await rm(join(fixture.miRoot, 'state'), { recursive: true, force: true });
+  await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
+  const defaultEnv = { ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' };
+  delete defaultEnv.MI_IMESSAGE_MODEL;
+  web = await startWebChat(defaultEnv);
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Default concierge route check.' } })).json;
+  assert.equal(result.ok, true, 'default V2 API request succeeds through the local route');
+  const defaultCall = (await readJsonl(piLog)).at(-1);
+  assert.ok(defaultCall.includes('--model') && defaultCall.includes('vps-gateway/mi-concierge'), 'V2 API default selects the Mi-only concierge alias');
 
   console.log('Mi iMessage V2 checks passed.');
 } finally {

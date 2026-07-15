@@ -178,7 +178,7 @@ Optional env:
 - `PHOTON_ALLOW_ALL_USERS=true` — dev only; do not use for a terminal-capable assistant.
 - `MI_PHOTON_MAX_WAIT_MS=1800000` — how long the bridge waits for a background-worker result after sending its acknowledgement; defaults to 30 minutes.
 - `MI_IMESSAGE_V2=0` — immediately use the retained legacy V1 iMessage router instead of the default minimal V2 concierge.
-- `MI_IMESSAGE_MODEL` — override V2's default `vps-gateway/coding-main` local gateway model. The default is an authenticated request to the sole local LiteLLM listener (`127.0.0.1:4000`); it is not a direct provider bypass.
+- `MI_IMESSAGE_MODEL` — override V2's default `vps-gateway/mi-concierge` local gateway model. The default is an authenticated request to the sole local LiteLLM listener (`127.0.0.1:4000`); it is not a direct provider bypass.
 - `MI_IMESSAGE_ASK_FIRST=1` — legacy V1 opt-in to always asking before iMessage starts tool-backed work.
 - `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint for Mi proactive notices.
 - `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — send Mi proactive notifications to iMessage through the local Photon notify endpoint.
@@ -190,7 +190,7 @@ The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:
 
 ### Local Codex subscription gateway
 
-`vps-gateway/coding-main` is backed by the existing authenticated LiteLLM listener and a tightly scoped local Pi subprocess using the Codex subscription model `openai-codex/gpt-5.6-sol`. It has no OpenRouter, Cloudflare, or OpenAI API-key route; `coding-fast` is intentionally not exposed. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
+`vps-gateway/mi-concierge` is Mi V2's production-only foreground route. The existing authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical high-effort route for every other gateway client. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path; `coding-fast` is intentionally not exposed. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
 
 The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`. Its prepared root entrypoint is `/home/kyle/install-mi-subscription-gateway.sh`; it installs only the tracked LiteLLM config/handler/wrapper/drop-in, reloads and restarts `llm-gateway`, then performs the authenticated local health check. It does not configure provider secrets:
 
@@ -198,13 +198,15 @@ The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`.
 sudo /home/kyle/install-mi-subscription-gateway.sh
 ```
 
-#### Decision-only model evaluation
-
-The immutable authenticated aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-terra-low`, and `mi-eval-sol-high` exist only for the synthetic Mi V2 decision evaluation. They keep `coding-main` unchanged. Install the non-secret, user-level Pi registry entries first, then install the authenticated aliases with `sudo /home/kyle/install-mi-model-eval-gateway.sh`:
+Install the non-secret, user-level Pi registry entries before using the production concierge or evaluation aliases:
 
 ```bash
-npm run setup:mi-model-eval-models
+npm run setup:mi-gateway-models
 ```
+
+#### Decision-only model evaluation
+
+The immutable authenticated aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-terra-low`, `mi-eval-sol-medium`, and `mi-eval-sol-high` exist only for the synthetic Mi V2 decision evaluation. They are separate from `mi-concierge` and keep `coding-main` unchanged. The root gateway installer above installs their authenticated local mappings.
 
 Then run the two-pass, sequential (maximum concurrency two) comparison with:
 

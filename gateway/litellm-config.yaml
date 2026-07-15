@@ -5,6 +5,12 @@ model_list:
     litellm_params:
       model: pi-subscription/coding-main
       api_key: ""
+  # Mi's production foreground route. This immutable profile is Sol medium;
+  # shared coding-main above deliberately remains its historical high route.
+  - model_name: mi-concierge
+    litellm_params:
+      model: pi-subscription/mi-concierge
+      api_key: ""
   # Authenticated local-only aliases for the offline Mi decision evaluation.
   # They are immutable profiles in pi_subscription_handler.py, not user inputs.
   - model_name: mi-eval-luna-low

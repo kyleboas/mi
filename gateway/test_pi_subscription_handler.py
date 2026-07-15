@@ -106,12 +106,15 @@ async def provider_checks(fake: Path, log: Path):
         "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-tools",
         "--model", M.PI_MODEL, "--print",
     ]
+    # coding-main stays byte-for-byte on its historical implicit-high argv.
+    assert M.SUBSCRIPTION_PROFILES["coding-main"] == (M.PI_MODEL, None)
     assert records[0]["args"][:-1] == expected_prefix
     assert records[0]["env"] == sorted(M.PI_ENV), records[0]["env"]
     assert "OPENAI_BASE_URL" not in records[0]["env"]
     assert "LITELLM_MASTER_KEY" not in records[0]["env"]
 
     profile_expectations = {
+        "mi-concierge": ("openai-codex/gpt-5.6-sol", "medium"),
         "mi-eval-luna-low": ("openai-codex/gpt-5.6-luna", "low"),
         "mi-eval-sol-low": ("openai-codex/gpt-5.6-sol", "low"),
         "mi-eval-terra-low": ("openai-codex/gpt-5.6-terra", "low"),
@@ -121,6 +124,8 @@ async def provider_checks(fake: Path, log: Path):
     for alias, (inner_model, thinking) in profile_expectations.items():
         await handler.acompletion(alias, messages(alias), response())
     records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    expected_concierge_prefix = [*expected_prefix[:-1], "--thinking", "medium", "--print"]
+    assert records[2]["args"][:-1] == expected_concierge_prefix
     for record, (inner_model, thinking) in zip(records[2:], profile_expectations.values()):
         args = record["args"][:-1]
         assert args[-5:] == ["--model", inner_model, "--thinking", thinking, "--print"], args
@@ -172,7 +177,7 @@ async def assert_async_error(coro, status):
 
 
 async def _unknown_profile(handler):
-    await handler.acompletion("mi-eval-arbitrary", messages(), response())
+    await handler.acompletion("mi-concierge-arbitrary", messages(), response())
 
 
 async def _effort_override(handler):
@@ -212,6 +217,10 @@ def test_proxy_authentication(fake: Path, log: Path):
                     litellm_params:
                       model: pi-subscription/coding-main
                       api_key: ""
+                  - model_name: mi-concierge
+                    litellm_params:
+                      model: pi-subscription/mi-concierge
+                      api_key: ""
                 litellm_settings:
                   telemetry: false
                   custom_provider_map:
@@ -233,7 +242,7 @@ def test_proxy_authentication(fake: Path, log: Path):
         try:
             deadline = time.monotonic() + 40
             url = f"http://127.0.0.1:{port}/v1/chat/completions"
-            payload = json.dumps({"model": "coding-main", "messages": messages()}).encode()
+            payload = json.dumps({"model": "mi-concierge", "messages": messages()}).encode()
             fake_calls_before = len(log.read_text(encoding="utf-8").splitlines())
             last_status = None
             while True:
@@ -264,8 +273,10 @@ def test_proxy_authentication(fake: Path, log: Path):
             with urllib.request.urlopen(request, timeout=10) as reply:
                 body = json.loads(reply.read())
             assert body["choices"][0]["message"]["content"] == "fake subscription response"
+            records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            assert records[-1]["args"][:-1][-5:] == ["--model", "openai-codex/gpt-5.6-sol", "--thinking", "medium", "--print"]
 
-            stream_payload = json.dumps({"model": "coding-main", "messages": messages(), "stream": True}).encode()
+            stream_payload = json.dumps({"model": "mi-concierge", "messages": messages(), "stream": True}).encode()
             stream_request = urllib.request.Request(
                 url,
                 data=stream_payload,
