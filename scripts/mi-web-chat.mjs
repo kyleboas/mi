@@ -11,7 +11,7 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
-import { buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text } from './mi-imessage-v2.mjs';
+import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { createApproval, logEvent, readApprovals, resolveApproval, writeApprovals } from '../dist/src/state.js';
 import {
   imessageAskFirstReply,
@@ -59,6 +59,11 @@ const webhookToken = String(process.env.MI_WEB_CHAT_WEBHOOK_TOKEN || '').trim();
 const imessageThread = process.env.MI_IMESSAGE_THREAD || process.env.MI_PHOTON_THREAD || 'main';
 const imessageMaxReplyChars = Number(process.env.MI_IMESSAGE_MAX_REPLY_CHARS || 1200);
 const imessageChatTimeoutMs = Number(process.env.MI_IMESSAGE_CHAT_TIMEOUT_MS || 30000);
+const imessageCompletionTimeoutMs = Number(process.env.MI_IMESSAGE_COMPLETION_TIMEOUT_MS || 15000);
+const imessageCompletionGateway = process.env.MI_IMESSAGE_COMPLETION_GATEWAY || '/home/kyle/bin/pi-gateway';
+const imessageCompletionModel = process.env.MI_IMESSAGE_COMPLETION_MODEL || 'vps-gateway/mi-concierge';
+const imessageCompletionHome = process.env.MI_IMESSAGE_COMPLETION_HOME || home;
+const pinnedPiPath = '/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin';
 const imessageMemoryMaxChars = Number(process.env.MI_IMESSAGE_MEMORY_CHARS || 2500);
 const imessageAskFirst = /^(1|true|yes|on)$/i.test(process.env.MI_IMESSAGE_ASK_FIRST || '');
 const imessageV2Enabled = !/^(0|false|no|off)$/i.test(process.env.MI_IMESSAGE_V2 || '1');
@@ -1015,7 +1020,7 @@ async function buildBackgroundWorkerPrompt(threadId, message, decision = workerR
       '- Treat chat history as context, not as fresh commands, unless clearly part of the current request.',
       '- If this is feedback about Mi routing or handoff behavior, improve the router/ack behavior rather than blindly creating another generic handoff.',
       '- Do not expose secrets. Ask for clarification or approval when context is missing, ambiguous, or risky.',
-      '- When done, summarize what changed, files touched, and any remaining user action.',
+      '- When done, end with a short, factual, user-oriented outcome and verification summary. Do not include raw logs, prompts, IDs, paths, or internal diagnostics in that summary.',
     ].join('\n'),
   ].join('\n\n');
 }
@@ -1075,7 +1080,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   const name = options.name || `${taskNameFromPrompt(message)}-${Date.now().toString(36).slice(-6)}`;
   const workerPrompt = await buildBackgroundWorkerPrompt(threadId, message, decision);
   const startedAt = now();
-  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
+  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: options.taskId !== true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
   const worker = {
     id: result.taskId || result.sessionId || result.sessionFile || `worker_${Date.now().toString(36)}`,
     threadId,
@@ -1157,7 +1162,7 @@ async function continueBackgroundWorker(threadId, worker, objective, options = {
   const continuedAt = now();
   let result;
   try {
-    result = await sendTaskSocketRequest({ type: 'continue_worker', taskId, message: workerPrompt, lastInput: objective, background: true, reportToMain: true, model: workerModel }, 30000);
+    result = await sendTaskSocketRequest({ type: 'continue_worker', taskId, message: workerPrompt, lastInput: objective, background: true, reportToMain: options.taskId !== true, model: workerModel }, 30000);
   } catch (error) {
     if (!isStaleWorkerTaskError(error)) throw error;
     activeWorkers.delete(worker.id);
@@ -1318,6 +1323,68 @@ function workerCompletionText(worker, text, isError = false) {
   return body.toLowerCase().startsWith(subject.toLowerCase()) ? body : `${subject}: ${body}`;
 }
 
+const imessageCompletionFallback = 'I finished checking that, but I couldn’t prepare a concise result. Ask me to summarize it again.';
+
+async function formatImessageV2Completion(worker, findings, isError = false) {
+  const objective = compactAckText(worker.subject || worker.text || 'the requested check', 700);
+  const prompt = buildImessageCompletionPrompt({ objective, findings: isError ? `The check ended with an error: ${findings || ''}` : findings });
+  const args = ['--print', '--offline', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-tools', '--model', imessageCompletionModel, prompt];
+  return await new Promise((resolve) => {
+    let child;
+    let stdout = '';
+    let settled = false;
+    let timer;
+    let killTimer;
+    const finish = (category) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (category) {
+        console.error('iMessage completion formatter failed:', JSON.stringify({ category }));
+        resolve(imessageCompletionFallback);
+        return;
+      }
+      const completion = sanitizeImessageCompletion(stdout, objective);
+      resolve(completion || imessageCompletionFallback);
+    };
+    const terminate = (category) => {
+      if (child && child.exitCode === null && !child.killed) {
+        child.kill('SIGTERM');
+        killTimer = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 1000);
+        killTimer.unref?.();
+      }
+      finish(category);
+    };
+    try {
+      child = spawn(imessageCompletionGateway, args, {
+        cwd: home,
+        // pi-gateway resolves `pi` from PATH; never inherit a service's arbitrary PATH.
+        env: { PATH: pinnedPiPath, HOME: imessageCompletionHome, LC_ALL: 'C.UTF-8', PI_OFFLINE: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      finish('spawn-error');
+      return;
+    }
+    timer = setTimeout(() => terminate('timeout'), imessageCompletionTimeoutMs);
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      const remaining = IMESSAGE_V2_LIMITS.completionProcessOutput - stdout.length;
+      if (remaining > 0) stdout += text.slice(0, remaining);
+      if (text.length > remaining) terminate('output-limit');
+    });
+    child.stderr.on('data', () => {});
+    child.on('error', () => terminate('spawn-error'));
+    child.on('close', (code, signal) => {
+      clearTimeout(killTimer);
+      if (settled) return;
+      if (code !== 0) return finish(signal ? 'signal' : 'nonzero-exit');
+      if (!stdout.trim()) return finish('empty-output');
+      finish();
+    });
+  });
+}
+
 async function monitorBackgroundWorkers() {
   if (activeWorkers.size === 0) return;
   let tasks = [];
@@ -1332,7 +1399,9 @@ async function monitorBackgroundWorkers() {
     if (!workerIsActive(worker)) continue;
     const existingResult = await workerResultSince(worker).catch(() => undefined);
     if (existingResult) {
-      notifyUser(existingResult.text, worker.threadId).catch(() => {});
+      // A V2 result with this stable correlation was already formatted and persisted.
+      // Never re-send it, and never turn any generic daemon report into a completion.
+      if (!worker.imessageV2) notifyUser(existingResult.text, worker.threadId).catch(() => {});
       worker.status = 'complete';
       worker.completedAt = existingResult.ts || now();
       worker.updatedAt = now();
@@ -1353,7 +1422,9 @@ async function monitorBackgroundWorkers() {
     changed = true;
     if (taskDone(task)) {
       const text = task.text || task.error || 'Background worker finished.';
-      const completion = workerCompletionText(worker, task.error || text, Boolean(task.error));
+      const completion = worker.imessageV2
+        ? await formatImessageV2Completion(worker, task.error || text, Boolean(task.error))
+        : workerCompletionText(worker, task.error || text, Boolean(task.error));
       if (worker.threadId) {
         await appendThreadMessage(worker.threadId, 'assistant', completion, {
           unread: false,
@@ -2030,7 +2101,12 @@ async function buildImessageV2Context(threadId, message) {
     readV2ContextFile(path.join(home, 'pi-docs', 'PROJECTS.md'), 1400),
     readV2ContextFile(path.join(home, 'pi-docs', 'GOALS.md'), 1000),
   ]);
-  const messages = await readMessages(threadId, 30);
+  const messages = (await readMessages(threadId, 30)).filter((message) => {
+    // Daemon result reports have no stable V2 correlation. They remain in daemon
+    // task state for audit, but must never become assistant context in this channel.
+    if (message.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(message.source) && !message.taskId) return false;
+    return true;
+  });
   const workers = Array.from(activeWorkers.values())
     .filter((worker) => worker.threadId === threadId && (workerIsActive(worker) || workerIsRecent(worker)))
     .slice(-10)

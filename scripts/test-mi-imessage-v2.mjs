@@ -81,7 +81,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
     }
     return { text: 'ok' };
   });
-  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' });
+  web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'fake-model', MI_IMESSAGE_COMPLETION_GATEWAY: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' });
 
   let result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'What is the current status?' } })).json;
   assert.equal(result.handoff, false, 'conversational state question starts no worker');
@@ -98,7 +98,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   assert.ok(piCalls.every((args) => args.includes('--no-tools') && !args.includes('--extension') && !args.includes('--tools')), 'V2 exact foreground argv is extension-free and tool-free');
   assert.ok(piCalls.every((args) => !args.includes('--no-context-files')), 'V2 never passes unsupported Pi CLI options');
   assert.equal(existsSync(join(fixture.runtime, 'capabilities')), false, 'V2 creates no capability grant directory');
-  assert.ok(piCalls.every((args) => args.includes('fake-model') && !args.some((arg) => /openai-codex|gpt-5\.6-sol/.test(arg))), 'V2 preserves the configured model override and never injects the stale model');
+  assert.ok(piCalls.filter((args) => args.includes('fake-model')).every((args) => !args.some((arg) => /openai-codex|gpt-5\.6-sol/.test(arg))), 'V2 foreground decisions preserve the configured model override and never inject the stale model');
   assert.ok(piCalls.every((args) => args.includes('--no-extensions') && args.includes('--no-skills') && args.includes('--no-prompt-templates') && args.includes('--no-themes')), 'V2 loads no configured resources');
   assert.ok(piCalls.at(-1).at(-1).includes('We decided on the garden plan.'), 'pronoun follow-up receives prior thread context');
   assert.doesNotMatch(piCalls.at(-1).at(-1), new RegExp(hugeSecret), 'fake Pi receives redacted context only');
@@ -117,6 +117,8 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   }, { timeoutMs: 3000, message: 'correlated completion' });
   messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
   assert.ok(messages.some((item) => item.source === 'mi-worker-result' && item.taskId === correlationId), 'completion retains the original correlation id after daemon id changes');
+  const completionCalls = await readJsonl(piLog);
+  assert.ok(completionCalls.some((args) => args.includes('vps-gateway/mi-concierge')), 'V2 completion presentation uses the authenticated concierge route independently of the decision override');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'ACTIVE_TASK' } })).json;
   const activeCorrelationId = result.taskId;
@@ -182,7 +184,7 @@ if (prompt.includes('TIMEOUT_CASE')) { setTimeout(() => {}, 2000); } else if (!p
   web = undefined;
   await rm(join(fixture.miRoot, 'state'), { recursive: true, force: true });
   await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
-  const defaultEnv = { ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' };
+  const defaultEnv = { ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_COMPLETION_GATEWAY: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' };
   delete defaultEnv.MI_IMESSAGE_MODEL;
   web = await startWebChat(defaultEnv);
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Default concierge route check.' } })).json;

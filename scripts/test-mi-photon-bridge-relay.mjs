@@ -50,12 +50,11 @@ function startMiServer(workerReply) {
         messagesPolls += 1;
         calls.push({ method: req.method, path: url.pathname, thread: url.searchParams.get('thread'), messagesPolls, at: Date.now() });
         const messages = messagesPolls >= 2 && Date.now() >= resultAvailableAt
-          ? (workerReply.interleaved
-            ? [
-              { role: 'assistant', source: 'mi-worker-result', text: workerReply.interleaved, taskId: 'other-task', ts: new Date().toISOString() },
-              { role: 'assistant', source, text, taskId: workerReply.taskId, ts: new Date().toISOString() },
-            ]
-            : [{ role: 'assistant', source, text, ts: new Date().toISOString() }])
+          ? ([
+            ...(workerReply.raw ? [{ role: 'assistant', source: 'mi-worker-result', text: workerReply.raw, ts: new Date().toISOString() }] : []),
+            ...(workerReply.interleaved ? [{ role: 'assistant', source: 'mi-worker-result', text: workerReply.interleaved, taskId: 'other-task', ts: new Date().toISOString() }] : []),
+            { role: 'assistant', source, text, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}), ts: new Date().toISOString() },
+          ])
           : [];
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ messages }));
@@ -166,7 +165,7 @@ async function runRelayCase(root, name, workerReply) {
 
 const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
 try {
-  await runRelayCase(root, 'delayed-exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', delayMs: 160, interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  await runRelayCase(root, 'delayed-exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
   console.log('Mi Photon bridge relay checks passed.');
