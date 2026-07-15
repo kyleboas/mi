@@ -22,10 +22,12 @@ LOGGER = logging.getLogger("litellm.proxy.pi_subscription")
 PI_BINARY = "/home/kyle/.nvm/versions/node/v24.15.0/bin/pi"
 PI_MODEL = "openai-codex/gpt-5.6-sol"
 # These public aliases are the only subscription profiles this handler can run.
-# `coding-main` deliberately retains its historical implicit high effort behavior;
-# evaluation aliases pin both model and effort for controlled comparisons.
+# `coding-main` deliberately retains its historical implicit high effort behavior.
+# `mi-concierge` is the production Mi-only foreground route; evaluation aliases
+# remain separately named and pin both model and effort for comparisons.
 SUBSCRIPTION_PROFILES = {
     "coding-main": (PI_MODEL, None),
+    "mi-concierge": (PI_MODEL, "medium"),
     "mi-eval-luna-low": ("openai-codex/gpt-5.6-luna", "low"),
     "mi-eval-sol-low": ("openai-codex/gpt-5.6-sol", "low"),
     "mi-eval-terra-low": ("openai-codex/gpt-5.6-terra", "low"),

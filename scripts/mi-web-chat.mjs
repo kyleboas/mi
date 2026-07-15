@@ -2104,7 +2104,9 @@ function imessageV2SafeStderr(stderr, prompt, message) {
 
 async function runImessageV2(message, threadId) {
   const piCmd = process.env.PI_CMD || 'pi';
-  const model = process.env.MI_IMESSAGE_MODEL || 'vps-gateway/coding-main';
+  // The foreground concierge is deliberately Mi-specific: shared coding-main
+  // retains its high-effort behavior for every other gateway client.
+  const model = process.env.MI_IMESSAGE_MODEL || 'vps-gateway/mi-concierge';
   const prompt = await buildImessageV2Context(threadId, message);
   // The foreground decision is context-only. It has no tools or capability grant,
   // so live verification is delegated through the existing controlled worker path.

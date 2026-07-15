@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-/** Install only user-level, non-secret Pi registry entries for Mi eval aliases. */
+/** Install only user-level, non-secret Pi registry entries for Mi gateway aliases. */
 import { rename, stat, writeFile, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const aliases = ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-medium', 'mi-eval-sol-high'];
+export const MI_CONCIERGE_ALIAS = 'mi-concierge';
+export const EVAL_ALIASES = ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-terra-low', 'mi-eval-sol-medium', 'mi-eval-sol-high'];
+export const GATEWAY_ALIASES = [MI_CONCIERGE_ALIAS, ...EVAL_ALIASES];
 const configDir = resolve(process.env.MI_MODEL_EVAL_CONFIG_DIR || '/home/kyle/.pi/agent');
 const settingsPath = join(configDir, 'settings.json');
 const modelsPath = join(configDir, 'models.json');
@@ -20,14 +22,14 @@ async function writeJsonPreservingMode(path, value) {
   await rename(temporary, path);
 }
 
-function missingEntries(settings, models) {
+function missingEntries(settings, models, aliases) {
   const enabled = new Set(Array.isArray(settings.enabledModels) ? settings.enabledModels : []);
   const provider = models.providers?.['vps-gateway'];
   const registered = new Set(Array.isArray(provider?.models) ? provider.models.map((model) => model?.id) : []);
   return aliases.filter((alias) => !enabled.has(`vps-gateway/${alias}`) || !registered.has(alias));
 }
 
-export async function installEvalModels({ directory = configDir, checkOnly = false } = {}) {
+export async function installGatewayModels({ directory = configDir, checkOnly = false, aliases = EVAL_ALIASES } = {}) {
   const settings = await readJson(join(directory, 'settings.json'));
   const models = await readJson(join(directory, 'models.json'));
   const provider = models.providers?.['vps-gateway'];
@@ -35,7 +37,7 @@ export async function installEvalModels({ directory = configDir, checkOnly = fal
   const baseline = provider.models.find((model) => model?.id === 'coding-main');
   if (!baseline) throw new Error('vps-gateway/coding-main registry entry is missing');
   if (!Array.isArray(settings.enabledModels)) throw new Error('enabledModels is missing');
-  const missing = missingEntries(settings, models);
+  const missing = missingEntries(settings, models, aliases);
   if (checkOnly || missing.length === 0) return { changed: false, missing };
   for (const alias of aliases) {
     if (!provider.models.some((model) => model?.id === alias)) {
@@ -50,11 +52,15 @@ export async function installEvalModels({ directory = configDir, checkOnly = fal
   return { changed: true, missing };
 }
 
+export async function installEvalModels(options = {}) {
+  return installGatewayModels({ ...options, aliases: EVAL_ALIASES });
+}
+
 async function main() {
   const checkOnly = process.argv.slice(2).includes('--check');
   if (process.argv.slice(2).some((arg) => arg !== '--check')) throw new Error('usage: install-mi-model-eval-models.mjs [--check]');
   const result = await installEvalModels({ checkOnly });
-  console.log(result.changed ? `installed user-level eval aliases: ${aliases.join(', ')}` : 'user-level eval aliases already present');
+  console.log(result.changed ? `installed user-level eval aliases: ${EVAL_ALIASES.join(', ')}` : 'user-level eval aliases already present');
 }
 
 if (import.meta.main) main().catch((error) => { console.error(`eval model registry: ${error.message}`); process.exitCode = 1; });

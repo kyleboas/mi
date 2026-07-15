@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { invokeThroughGateway, parseArgs, PROFILES, runEvaluation, SAFE_PI_PATH, scoreDecision } from './mi-model-eval.mjs';
-import { installEvalModels } from './install-mi-model-eval-models.mjs';
+import { GATEWAY_ALIASES, installEvalModels, installGatewayModels } from './install-mi-model-eval-models.mjs';
 
 const fixtures = JSON.parse(await readFile(new URL('./fixtures/mi-model-eval-cases.json', import.meta.url), 'utf8'));
 assert.ok(fixtures.length >= 16, 'the fixed suite must remain representative');
@@ -12,6 +12,7 @@ assert.equal(PROFILES.length, 5, 'exactly five immutable profiles are registered
 assert.equal(SAFE_PI_PATH, '/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin', 'gateway wrapper must never inherit a caller PATH');
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 assert.match(packageJson.scripts['eval:mi-models'], /run-heavy --class eval -- node/, 'the live evaluator must be throttled through run-heavy');
+assert.equal(packageJson.scripts['setup:mi-gateway-models'], 'node scripts/install-mi-gateway-models.mjs', 'the canonical registry setup includes the production concierge alias');
 assert.throws(() => parseArgs(['--output-dir', '/tmp/not-allowed']), /must remain under/);
 assert.throws(() => parseArgs(['--passes', '3']), /--passes above 2 requires --case/);
 assert.equal(parseArgs(['--case', 'stable-continuation', '--passes', '10', '--continue-on-contract-failure', '--classify-case', 'stable-continuation']).continueOnContractFailure, true);
@@ -57,15 +58,17 @@ printf '%s' '{"kind":"reply","reply":"Hello."}'
   await mkdir(config);
   await writeFile(join(config, 'settings.json'), JSON.stringify({ defaultModel: 'vps-gateway/coding-main', enabledModels: ['vps-gateway/coding-main'] }));
   await writeFile(join(config, 'models.json'), JSON.stringify({ providers: { 'vps-gateway': { models: [{ id: 'coding-main', name: 'VPS Gateway coding-main', contextWindow: 1, maxTokens: 1, input: ['text'], reasoning: false }] } } }));
-  const installed = await installEvalModels({ directory: config });
+  const installed = await installGatewayModels({ directory: config, aliases: GATEWAY_ALIASES });
   assert.equal(installed.changed, true);
   const installedSettings = JSON.parse(await readFile(join(config, 'settings.json'), 'utf8'));
   const installedModels = JSON.parse(await readFile(join(config, 'models.json'), 'utf8'));
   assert.equal(installedSettings.defaultModel, 'vps-gateway/coding-main', 'registry installation never changes production default');
-  for (const profile of PROFILES) {
-    assert.ok(installedSettings.enabledModels.includes(`vps-gateway/${profile.id}`));
-    assert.ok(installedModels.providers['vps-gateway'].models.some((model) => model.id === profile.id));
+  for (const alias of GATEWAY_ALIASES) {
+    assert.ok(installedSettings.enabledModels.includes(`vps-gateway/${alias}`));
+    assert.ok(installedModels.providers['vps-gateway'].models.some((model) => model.id === alias));
   }
+  const evalAlreadyInstalled = await installEvalModels({ directory: config, checkOnly: true });
+  assert.deepEqual(evalAlreadyInstalled.missing, [], 'legacy eval-only setup remains compatible after canonical gateway setup');
 
   const safeReply = (fixture) => {
     if (fixture.expected.kind === 'confirm') return { kind: 'confirm', reply: 'Which synthetic target should I use?' };
