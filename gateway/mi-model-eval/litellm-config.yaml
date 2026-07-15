@@ -1,0 +1,38 @@
+# Temporary overlay installed only for the synthetic Mi model evaluation.
+model_list:
+  - model_name: coding-main
+    litellm_params:
+      model: pi-subscription/coding-main
+      api_key: ""
+  - model_name: mi-concierge
+    litellm_params:
+      model: pi-subscription/mi-concierge
+      api_key: ""
+  - model_name: mi-eval-luna-low
+    litellm_params:
+      model: pi-subscription/mi-eval-luna-low
+      api_key: ""
+  - model_name: mi-eval-sol-low
+    litellm_params:
+      model: pi-subscription/mi-eval-sol-low
+      api_key: ""
+  - model_name: mi-eval-sol-medium
+    litellm_params:
+      model: pi-subscription/mi-eval-sol-medium
+      api_key: ""
+  - model_name: mi-eval-terra-low
+    litellm_params:
+      model: pi-subscription/mi-eval-terra-low
+      api_key: ""
+  - model_name: mi-eval-sol-high
+    litellm_params:
+      model: pi-subscription/mi-eval-sol-high
+      api_key: ""
+litellm_settings:
+  drop_params: true
+  telemetry: false
+  custom_provider_map:
+    - provider: pi-subscription
+      custom_handler: pi_subscription_eval_handler.pi_subscription_llm
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

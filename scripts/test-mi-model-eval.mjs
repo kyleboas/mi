@@ -4,7 +4,8 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { invokeThroughGateway, parseArgs, PROFILES, runEvaluation, SAFE_PI_PATH, scoreDecision } from './mi-model-eval.mjs';
-import { GATEWAY_ALIASES, installEvalModels, installGatewayModels } from './install-mi-model-eval-models.mjs';
+import { EVAL_ALIASES, installEvalModels, uninstallEvalModels } from './install-mi-model-eval-models.mjs';
+import { installProductionModels, PRODUCTION_ALIASES } from './install-mi-gateway-models.mjs';
 
 const fixtures = JSON.parse(await readFile(new URL('./fixtures/mi-model-eval-cases.json', import.meta.url), 'utf8'));
 assert.ok(fixtures.length >= 16, 'the fixed suite must remain representative');
@@ -56,19 +57,48 @@ printf '%s' '{"kind":"reply","reply":"Hello."}'
 
   const config = join(temp, 'config');
   await mkdir(config);
-  await writeFile(join(config, 'settings.json'), JSON.stringify({ defaultModel: 'vps-gateway/coding-main', enabledModels: ['vps-gateway/coding-main'] }));
-  await writeFile(join(config, 'models.json'), JSON.stringify({ providers: { 'vps-gateway': { models: [{ id: 'coding-main', name: 'VPS Gateway coding-main', contextWindow: 1, maxTokens: 1, input: ['text'], reasoning: false }] } } }));
-  const installed = await installGatewayModels({ directory: config, aliases: GATEWAY_ALIASES });
-  assert.equal(installed.changed, true);
+  await writeFile(join(config, 'settings.json'), JSON.stringify({ defaultModel: 'vps-gateway/coding-main', defaultThinkingLevel: 'high', enabledModels: ['vps-gateway/coding-main', 'other/provider-model'], unrelated: { keep: true } }));
+  await writeFile(join(config, 'models.json'), JSON.stringify({ unrelated: ['keep'], providers: { other: { models: [{ id: 'provider-model' }] }, 'vps-gateway': { models: [{ id: 'coding-main', name: 'VPS Gateway coding-main', contextWindow: 1, maxTokens: 1, input: ['text'], reasoning: false }] } } }));
+  const production = await installProductionModels({ directory: config });
+  assert.equal(production.changed, true);
+  const productionSettingsBytes = await readFile(join(config, 'settings.json'));
+  const productionModelsBytes = await readFile(join(config, 'models.json'));
+  const productionSettings = JSON.parse(productionSettingsBytes);
+  const productionModels = JSON.parse(productionModelsBytes);
+  assert.equal(productionSettings.defaultModel, 'vps-gateway/coding-main');
+  assert.equal(productionSettings.defaultThinkingLevel, 'high', 'production effort never drifts');
+  assert.deepEqual(PRODUCTION_ALIASES, ['mi-concierge']);
+  assert.ok(productionSettings.enabledModels.includes('other/provider-model'));
+  assert.ok(productionModels.providers.other, 'unrelated providers are preserved');
+  assert.ok(!productionSettings.enabledModels.some((model) => model.includes('mi-eval-')), 'production setup installs no eval aliases');
+
+  assert.equal((await installEvalModels({ directory: config })).changed, true);
+  assert.equal((await installEvalModels({ directory: config })).changed, false, 'repeated eval install is idempotent');
   const installedSettings = JSON.parse(await readFile(join(config, 'settings.json'), 'utf8'));
   const installedModels = JSON.parse(await readFile(join(config, 'models.json'), 'utf8'));
-  assert.equal(installedSettings.defaultModel, 'vps-gateway/coding-main', 'registry installation never changes production default');
-  for (const alias of GATEWAY_ALIASES) {
+  for (const alias of EVAL_ALIASES) {
     assert.ok(installedSettings.enabledModels.includes(`vps-gateway/${alias}`));
     assert.ok(installedModels.providers['vps-gateway'].models.some((model) => model.id === alias));
   }
-  const evalAlreadyInstalled = await installEvalModels({ directory: config, checkOnly: true });
-  assert.deepEqual(evalAlreadyInstalled.missing, [], 'legacy eval-only setup remains compatible after canonical gateway setup');
+  assert.equal((await uninstallEvalModels({ directory: config })).restoredExact, true);
+  assert.deepEqual(await readFile(join(config, 'settings.json')), productionSettingsBytes, 'registry settings restore byte-equivalently');
+  assert.deepEqual(await readFile(join(config, 'models.json')), productionModelsBytes, 'model registry restores byte-equivalently');
+
+  await installEvalModels({ directory: config });
+  const changedSettings = JSON.parse(await readFile(join(config, 'settings.json'), 'utf8'));
+  const changedModels = JSON.parse(await readFile(join(config, 'models.json'), 'utf8'));
+  changedSettings.unrelated.duringEval = 'preserve';
+  changedModels.providers.other.models.push({ id: 'added-during-eval' });
+  await writeFile(join(config, 'settings.json'), `${JSON.stringify(changedSettings, null, 2)}\n`);
+  await writeFile(join(config, 'models.json'), `${JSON.stringify(changedModels, null, 2)}\n`);
+  assert.equal((await uninstallEvalModels({ directory: config })).restoredExact, false);
+  const preservedSettings = JSON.parse(await readFile(join(config, 'settings.json'), 'utf8'));
+  const preservedModels = JSON.parse(await readFile(join(config, 'models.json'), 'utf8'));
+  assert.equal(preservedSettings.unrelated.duringEval, 'preserve');
+  assert.ok(preservedModels.providers.other.models.some((model) => model.id === 'added-during-eval'));
+  assert.ok(!JSON.stringify(preservedSettings).includes('mi-eval-'));
+  assert.ok(!JSON.stringify(preservedModels).includes('mi-eval-'));
+  assert.equal((await uninstallEvalModels({ directory: config })).changed, false, 'repeated eval uninstall is idempotent');
 
   const safeReply = (fixture) => {
     if (fixture.expected.kind === 'confirm') return { kind: 'confirm', reply: 'Which synthetic target should I use?' };

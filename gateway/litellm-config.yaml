@@ -1,5 +1,5 @@
-# Installed as /etc/litellm/config.yaml by the tracked root installer.
-# The sole coding route is Pi's local Codex subscription custom provider.
+# Installed as /etc/litellm/config.yaml by the tracked production installer.
+# Only durable production aliases belong in this canonical configuration.
 model_list:
   - model_name: coding-main
     litellm_params:
@@ -10,28 +10,6 @@ model_list:
   - model_name: mi-concierge
     litellm_params:
       model: pi-subscription/mi-concierge
-      api_key: ""
-  # Authenticated local-only aliases for the offline Mi decision evaluation.
-  # They are immutable profiles in pi_subscription_handler.py, not user inputs.
-  - model_name: mi-eval-luna-low
-    litellm_params:
-      model: pi-subscription/mi-eval-luna-low
-      api_key: ""
-  - model_name: mi-eval-sol-low
-    litellm_params:
-      model: pi-subscription/mi-eval-sol-low
-      api_key: ""
-  - model_name: mi-eval-terra-low
-    litellm_params:
-      model: pi-subscription/mi-eval-terra-low
-      api_key: ""
-  - model_name: mi-eval-sol-medium
-    litellm_params:
-      model: pi-subscription/mi-eval-sol-medium
-      api_key: ""
-  - model_name: mi-eval-sol-high
-    litellm_params:
-      model: pi-subscription/mi-eval-sol-high
       api_key: ""
 litellm_settings:
   drop_params: true
