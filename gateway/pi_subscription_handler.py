@@ -21,18 +21,11 @@ LOGGER = logging.getLogger("litellm.proxy.pi_subscription")
 
 PI_BINARY = "/home/kyle/.nvm/versions/node/v24.15.0/bin/pi"
 PI_MODEL = "openai-codex/gpt-5.6-sol"
-# These public aliases are the only subscription profiles this handler can run.
+# These durable public aliases are the only profiles in the production handler.
 # `coding-main` deliberately retains its historical implicit high effort behavior.
-# `mi-concierge` is the production Mi-only foreground route; evaluation aliases
-# remain separately named and pin both model and effort for comparisons.
 SUBSCRIPTION_PROFILES = {
     "coding-main": (PI_MODEL, None),
     "mi-concierge": (PI_MODEL, "medium"),
-    "mi-eval-luna-low": ("openai-codex/gpt-5.6-luna", "low"),
-    "mi-eval-sol-low": ("openai-codex/gpt-5.6-sol", "low"),
-    "mi-eval-terra-low": ("openai-codex/gpt-5.6-terra", "low"),
-    "mi-eval-sol-medium": ("openai-codex/gpt-5.6-sol", "medium"),
-    "mi-eval-sol-high": ("openai-codex/gpt-5.6-sol", "high"),
 }
 PI_HOME = "/home/kyle"
 PI_AGENT_DIR = "/home/kyle/.pi/agent"
@@ -102,12 +95,16 @@ def serialize_messages(messages: Any) -> str:
     return prompt
 
 
-def resolve_profile(model: Any, request_kwargs: dict[str, Any] | None = None) -> tuple[str, str | None]:
+def resolve_profile(
+    model: Any,
+    request_kwargs: dict[str, Any] | None = None,
+    profiles: dict[str, tuple[str, str | None]] | None = None,
+) -> tuple[str, str | None]:
     """Resolve an immutable local alias; never accept caller-selected model/effort."""
     name = str(model or "")
     if name.startswith("pi-subscription/"):
         name = name.removeprefix("pi-subscription/")
-    profile = SUBSCRIPTION_PROFILES.get(name)
+    profile = (profiles or SUBSCRIPTION_PROFILES).get(name)
     if profile is None:
         raise PiSubscriptionError(400, "unknown subscription profile")
     for key in ("thinking", "reasoning_effort", "effort"):
@@ -166,15 +163,17 @@ class PiSubscriptionLLM(CustomLLM):
         pi_path: str = PI_BINARY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_concurrency: int = DEFAULT_CONCURRENCY,
+        profiles: dict[str, tuple[str, str | None]] | None = None,
     ) -> None:
         super().__init__()
         self._pi_path = pi_path
         self._timeout_seconds = timeout_seconds
+        self._profiles = dict(profiles or SUBSCRIPTION_PROFILES)
         self._semaphore = asyncio.Semaphore(max_concurrency)
 
     async def _run(self, model: Any, messages: Any, request_kwargs: dict[str, Any] | None = None) -> str:
         prompt = serialize_messages(messages)
-        inner_model, thinking = resolve_profile(model, request_kwargs)
+        inner_model, thinking = resolve_profile(model, request_kwargs, self._profiles)
         args = [
             self._pi_path,
             "--offline",

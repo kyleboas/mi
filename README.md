@@ -191,7 +191,7 @@ The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:
 
 ### Local Codex subscription gateway
 
-`vps-gateway/mi-concierge` is Mi V2's production-only foreground route. The existing authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical high-effort route for every other gateway client. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path; `coding-fast` is intentionally not exposed. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
+`vps-gateway/mi-concierge` is Mi V2's production-only foreground route. The authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical implicit-high route for every other gateway client. These are the only durable production aliases; tracked production callers do not require `coding-fast`. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
 
 The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`. Its prepared root entrypoint is `/home/kyle/install-mi-subscription-gateway.sh`; it installs only the tracked LiteLLM config/handler/wrapper/drop-in, reloads and restarts `llm-gateway`, then performs the authenticated local health check. It does not configure provider secrets:
 
@@ -199,7 +199,7 @@ The tracked root installer is `scripts/install-mi-subscription-gateway-root.sh`.
 sudo /home/kyle/install-mi-subscription-gateway.sh
 ```
 
-Install the non-secret, user-level Pi registry entries before using the production concierge or evaluation aliases:
+Install/check only the non-secret production Pi registry entry with:
 
 ```bash
 npm run setup:mi-gateway-models
@@ -207,15 +207,15 @@ npm run setup:mi-gateway-models
 
 #### Decision-only model evaluation
 
-The immutable authenticated aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-terra-low`, `mi-eval-sol-medium`, and `mi-eval-sol-high` exist only for the synthetic Mi V2 decision evaluation. They are separate from `mi-concierge` and keep `coding-main` unchanged. The root gateway installer above installs their authenticated local mappings.
-
-Then run the two-pass, sequential (maximum concurrency two) comparison with:
+The immutable aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-sol-medium`, `mi-eval-terra-low`, and `mi-eval-sol-high` live only in a temporary overlay. The normal production installer and registry setup never install them. An evaluation is always install → evaluate → uninstall:
 
 ```bash
+sudo /home/kyle/install-mi-model-eval-gateway.sh
 npm run eval:mi-models
+sudo /home/kyle/uninstall-mi-model-eval-gateway.sh
 ```
 
-It uses `/home/kyle/bin/run-heavy`, invokes only `/home/kyle/bin/pi-gateway`, writes sanitized synthetic summaries and blinded outputs under ignored `.tmp/mi-model-eval/`, and never dispatches a task.
+The uninstall is idempotent: it restores the canonical production config/handler, removes only eval-only registry entries, preserves unrelated settings/models and production defaults, restarts the gateway, and waits for the existing authenticated readiness check. The harness uses `/home/kyle/bin/run-heavy`, invokes only `/home/kyle/bin/pi-gateway`, writes sanitized synthetic summaries and blinded outputs under ignored `.tmp/mi-model-eval/`, and never dispatches a task.
 
 For always-on use, store the Photon values once, then install/restart:
 
