@@ -5,7 +5,7 @@
  * dispatch, thread, persistence, worker, or iMessage/Photon integration.
  */
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomInt } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -29,24 +29,29 @@ const SECRET_PATTERN = /(?:\b(?:api[_ -]?key|secret|password|token)\b\s*(?:=|:)\
 
 function usage(message = '') {
   if (message) console.error(message);
-  console.error('Usage: /home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs [--passes 1|2] [--max-concurrency 1|2] [--candidate profile-id]... [--case fixture-id] [--output-dir .tmp/mi-model-eval/<name>]');
+  console.error('Usage: /home/kyle/bin/run-heavy node scripts/mi-model-eval.mjs [--passes 1|2; 1..20 with --case] [--max-concurrency 1|2] [--candidate profile-id]... [--case fixture-id] [--continue-on-contract-failure] [--classify-case fixture-id] [--output-dir .tmp/mi-model-eval/<name>]');
 }
 
 export function parseArgs(args) {
-  const options = { passes: 2, maxConcurrency: 1, outputDir: resolve(outputRoot, 'latest'), caseId: undefined, candidateIds: [] };
+  const options = { passes: 2, maxConcurrency: 1, outputDir: resolve(outputRoot, 'latest'), caseId: undefined, candidateIds: [], continueOnContractFailure: false, classifyCaseId: undefined };
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index];
     if (value === '--passes') options.passes = Number(args[++index]);
     else if (value === '--max-concurrency') options.maxConcurrency = Number(args[++index]);
     else if (value === '--output-dir') options.outputDir = resolve(root, args[++index] || '');
     else if (value === '--case') options.caseId = String(args[++index] || '').trim() || undefined;
-    else if (value === '--candidate') {
+    else if (value === '--continue-on-contract-failure') options.continueOnContractFailure = true;
+    else if (value === '--classify-case') {
+      options.classifyCaseId = String(args[++index] || '').trim() || undefined;
+      if (!options.classifyCaseId) throw new Error('--classify-case requires a fixture id');
+    } else if (value === '--candidate') {
       const candidate = String(args[++index] || '').trim();
       if (!candidate) throw new Error('--candidate requires a profile id');
       options.candidateIds.push(candidate);
     } else throw new Error(`unknown argument: ${value}`);
   }
-  if (![1, 2].includes(options.passes)) throw new Error('--passes must be 1 or 2');
+  if (!Number.isInteger(options.passes) || options.passes < 1 || options.passes > 20) throw new Error('--passes must be an integer from 1 to 20');
+  if (options.passes > 2 && !options.caseId) throw new Error('--passes above 2 requires --case');
   if (![1, 2].includes(options.maxConcurrency)) throw new Error('--max-concurrency must be 1 or 2');
   if (!(options.outputDir === outputRoot || options.outputDir.startsWith(`${outputRoot}${sep}`))) throw new Error('output directory must remain under .tmp/mi-model-eval');
   const known = new Set(PROFILES.map((profile) => profile.id));
@@ -77,6 +82,25 @@ function percentile(values, fraction) {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
   return Math.round(sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)]);
+}
+
+function shuffled(items) {
+  const ordered = [...items];
+  for (let index = ordered.length - 1; index > 0; index -= 1) {
+    const swap = randomInt(index + 1);
+    [ordered[index], ordered[swap]] = [ordered[swap], ordered[index]];
+  }
+  return ordered;
+}
+
+async function boundedMap(items, maxConcurrency, operation) {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(maxConcurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      await operation(items[index]);
+    }
+  }));
 }
 
 /** Score only the parsed decision. It never turns a decision into an action. */
@@ -170,39 +194,50 @@ function blindedOutputs(results) {
   };
 }
 
-export async function runEvaluation({ fixtures, passes = 2, profiles = PROFILES, maxConcurrency = 1, invoke = invokeThroughGateway } = {}) {
+function envelopeClassifications(results, caseId) {
+  return results.flatMap(({ profile, runs }) => runs
+    .filter((run) => run.case === caseId)
+    .map((run) => {
+      const continuation = run.score.checks.find((check) => check.name === 'continuation-id');
+      return {
+        profile: profile.id,
+        case: run.case,
+        pass: run.pass,
+        kind: run.score.decision.kind,
+        capability: run.score.decision.capability || null,
+        continuationIdCorrect: continuation ? continuation.pass : null,
+      };
+    }));
+}
+
+export async function runEvaluation({ fixtures, passes = 2, profiles = PROFILES, maxConcurrency = 1, continueOnContractFailure = false, shuffleCandidates = shuffled, invoke = invokeThroughGateway } = {}) {
   const cases = fixtures || JSON.parse(await readFile(fixturePath, 'utf8'));
   if (![1, 2].includes(maxConcurrency)) throw new Error('maxConcurrency must be 1 or 2');
   const violations = [];
-  const runProfile = async (profile) => {
-    const runs = [];
-    let quarantined;
-    candidate: for (const fixture of cases) {
-      for (let pass = 1; pass <= passes; pass += 1) {
+  const states = new Map(profiles.map((profile) => [profile.id, { profile, runs: [], quarantined: undefined }]));
+  // Each case/pass is a randomized, interleaved round across active candidates.
+  // This harness only invokes the offline gateway and scores returned envelopes;
+  // it has no dispatch, persistence, worker, or action path.
+  for (const fixture of cases) {
+    for (let pass = 1; pass <= passes; pass += 1) {
+      const active = shuffleCandidates(profiles.filter((profile) => !states.get(profile.id).quarantined));
+      await boundedMap(active, maxConcurrency, async (profile) => {
         const prompt = buildImessageV2Prompt({ preferences: 'Synthetic evaluation preferences: concise and honest.', memory: 'Synthetic evaluation memory only.', workers: '', snapshot: '', threadMessages: [], ...fixture.bundle });
         const invocation = await invoke(profile.id, prompt);
         const raw = invocation.failure ? '' : invocation.raw;
         const score = scoreDecision(raw, fixture);
         const run = { case: fixture.id, pass, latencyMs: invocation.latencyMs, failure: invocation.failure || null, raw: cleanOutput(raw), score };
-        runs.push(run);
+        const state = states.get(profile.id);
+        state.runs.push(run);
         if (score.safetyFailures.length) {
-          quarantined = { profile: profile.label, case: fixture.id, pass, categories: score.safetyFailures };
-          violations.push(quarantined);
-          break candidate;
+          const violation = { profile: profile.label, case: fixture.id, pass, categories: score.safetyFailures };
+          violations.push(violation);
+          if (!continueOnContractFailure) state.quarantined = violation;
         }
-      }
+      });
     }
-    return { profile, runs, quarantined };
-  };
-  const results = new Array(profiles.length);
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(maxConcurrency, profiles.length) }, async () => {
-    while (next < profiles.length) {
-      const index = next++;
-      results[index] = await runProfile(profiles[index]);
-    }
-  }));
-  return { results, violations, passes, caseCount: cases.length };
+  }
+  return { results: profiles.map((profile) => states.get(profile.id)), violations, passes, caseCount: cases.length };
 }
 
 async function main() {
@@ -212,23 +247,27 @@ async function main() {
   const allFixtures = JSON.parse(await readFile(fixturePath, 'utf8'));
   const fixtures = options.caseId ? allFixtures.filter((fixture) => fixture.id === options.caseId) : allFixtures;
   if (fixtures.length === 0) { usage(`unknown fixture: ${options.caseId}`); process.exitCode = 2; return; }
+  if (options.classifyCaseId && !allFixtures.some((fixture) => fixture.id === options.classifyCaseId)) { usage(`unknown fixture: ${options.classifyCaseId}`); process.exitCode = 2; return; }
   const profiles = options.candidateIds.length ? options.candidateIds.map((id) => PROFILES.find((profile) => profile.id === id)) : PROFILES;
-  const evaluation = await runEvaluation({ fixtures, passes: options.passes, profiles, maxConcurrency: options.maxConcurrency });
+  const evaluation = await runEvaluation({ fixtures, passes: options.passes, profiles, maxConcurrency: options.maxConcurrency, continueOnContractFailure: options.continueOnContractFailure });
   const summary = {
     suite: 'synthetic-mi-v2-decision-only-v1',
     candidates: profiles.map((profile) => profile.id),
+    candidateOrder: 'randomized-interleaved-per-case-pass',
+    continueOnContractFailure: options.continueOnContractFailure,
     casesPerPass: evaluation.caseCount,
     passes: evaluation.passes,
     varianceLimitation: evaluation.passes < 2 ? 'One pass only; model output variance is not estimated.' : null,
     dispatches: 0,
     safetyViolations: evaluation.violations,
-    ranked: evaluation.results.map(({ profile, runs, quarantined }) => ({ ...aggregate(profile, runs), complete: !quarantined, quarantinedAt: quarantined ? { case: quarantined.case, pass: quarantined.pass, categories: quarantined.categories } : null })).sort((a, b) => Number(b.complete) - Number(a.complete) || b.quality - a.quality || b.safety - a.safety || b.validity - a.validity || (a.latencyMs.p50 || Infinity) - (b.latencyMs.p50 || Infinity)),
+    ...(options.classifyCaseId ? { envelopeClassifications: envelopeClassifications(evaluation.results, options.classifyCaseId) } : {}),
+    ranked: evaluation.results.map(({ profile, runs, quarantined }) => ({ ...aggregate(profile, runs), complete: !quarantined, contractCompliant: !runs.some((run) => run.score.safetyFailures.length), quarantinedAt: quarantined ? { case: quarantined.case, pass: quarantined.pass, categories: quarantined.categories } : null })).sort((a, b) => Number(b.complete) - Number(a.complete) || Number(b.contractCompliant) - Number(a.contractCompliant) || b.quality - a.quality || b.safety - a.safety || b.validity - a.validity || (a.latencyMs.p50 || Infinity) - (b.latencyMs.p50 || Infinity)),
   };
   await writeFile(resolve(options.outputDir, 'summary.json'), JSON.stringify(summary, null, 2), { mode: 0o600 });
   await writeFile(resolve(options.outputDir, 'blinded-outputs.json'), JSON.stringify(blindedOutputs(evaluation.results), null, 2), { mode: 0o600 });
   console.log(JSON.stringify(summary.ranked));
   for (const violation of evaluation.violations) {
-    console.error(`Safety contract violation; candidate quarantined: ${violation.profile}/${violation.case}: ${violation.categories.join(', ')}`);
+    console.error(`Safety contract violation recorded: ${violation.profile}/${violation.case}: ${violation.categories.join(', ')}`);
   }
   if (evaluation.violations.length) process.exitCode = 1;
 }
