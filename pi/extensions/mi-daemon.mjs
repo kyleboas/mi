@@ -6,6 +6,7 @@ import { appendFile, chmod, mkdir, open, readFile, readdir, readlink, rename, rm
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { parseWorkerCompletion } from "../../scripts/mi-worker-completion.mjs";
 
 const HOME = homedir();
 const RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, ".pi", "agent", "mi");
@@ -1674,7 +1675,8 @@ async function finishTask({ task, worker, before, sessionFile, name, done, kind,
     if (!text) throw new Error("Worker settled without final assistant response text.");
     if (worker.expectedStop) return await log(`worker_expected_stop ${name}`);
     const visibleSessionFile = await mirrorSessionToHome(after.sessionFile || sessionFile || before.sessionFile);
-    const completed = await upsertTask({ ...task, status: "complete", finishedAt: new Date().toISOString(), text, error: undefined, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), resultDeliveryKey: workerResultDeliveryKey(task), autoContinueAttempts: undefined, transportRetries: undefined });
+    const completionEnvelope = parseWorkerCompletion(text);
+    const completed = await upsertTask({ ...task, status: completionEnvelope?.status === 'blocked' ? "blocked" : completionEnvelope?.status === 'error' ? "error" : "complete", finishedAt: new Date().toISOString(), text, completionEnvelope: completionEnvelope ? { version: completionEnvelope.version, status: completionEnvelope.status, userSummary: completionEnvelope.userSummary, ...(completionEnvelope.internalDetails ? { internalDetails: completionEnvelope.internalDetails } : {}) } : undefined, error: undefined, actualSessionFile: after.sessionFile || sessionFile || before.sessionFile, sessionFile: visibleSessionFile, sessionId: after.sessionId || task.sessionId, sessionName: after.sessionName || name, model: after.model || before.model, modelSpec: task.modelSpec || workerModelSpec(task), resultDeliveryKey: workerResultDeliveryKey(task), autoContinueAttempts: undefined, transportRetries: undefined });
     // stop_task sets this synchronously before it waits for its state write.
     // Never let a late settlement revive or report a stopped task.
     if (worker.expectedStop) {

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import http from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { emitTurnEvent } from './mi-turn-observability.mjs';
 
+const root = process.env.MI_ROOT || '/home/kyle/assistant';
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
 const allowedUsers = splitList(process.env.PHOTON_ALLOWED_USERS || '');
@@ -192,6 +194,7 @@ async function askImessage(message) {
     method: 'POST',
     body: JSON.stringify({ thread: miThread, message }),
   });
+  await emitTurnEvent(root, { stage: 'ack', outcome: data.handoff ? 'ok' : 'skipped', route: 'photon', modelProfile: 'none', turn: String(data.taskId || message), durationMs: Date.now() - startedAt }).catch(() => undefined);
   return { reply: cleanReply(data.reply), handoff: Boolean(data.handoff), taskId: String(data.taskId || '').trim(), startedAt };
 }
 
