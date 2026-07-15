@@ -13,7 +13,9 @@ assert.equal(SAFE_PI_PATH, '/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/bin:
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 assert.match(packageJson.scripts['eval:mi-models'], /run-heavy --class eval -- node/, 'the live evaluator must be throttled through run-heavy');
 assert.throws(() => parseArgs(['--output-dir', '/tmp/not-allowed']), /must remain under/);
-assert.throws(() => parseArgs(['--passes', '3']), /must be 1 or 2/);
+assert.throws(() => parseArgs(['--passes', '3']), /--passes above 2 requires --case/);
+assert.equal(parseArgs(['--case', 'stable-continuation', '--passes', '10', '--continue-on-contract-failure', '--classify-case', 'stable-continuation']).continueOnContractFailure, true);
+assert.throws(() => parseArgs(['--case', 'stable-continuation', '--passes', '21']), /integer from 1 to 20/);
 assert.equal(parseArgs(['--passes', '2', '--max-concurrency', '2']).maxConcurrency, 2);
 assert.equal(parseArgs(['--case', 'natural-chat']).caseId, 'natural-chat');
 assert.deepEqual(parseArgs(['--candidate', 'mi-eval-sol-medium', '--candidate', 'mi-eval-sol-high']).candidateIds, ['mi-eval-sol-medium', 'mi-eval-sol-high']);
@@ -104,6 +106,21 @@ printf '%s' '{"kind":"reply","reply":"Hello."}'
   assert.deepEqual(selected.results.map(({ profile }) => profile.id), ['mi-eval-sol-medium', 'mi-eval-sol-high']);
   assert.equal(peakInFlight, 2, 'selected candidates must honor the two-call concurrency bound');
 
+  const interleavedOrder = [];
+  await runEvaluation({
+    fixtures: fixtures.slice(0, 1),
+    passes: 2,
+    profiles: PROFILES.filter((profile) => ['mi-eval-sol-medium', 'mi-eval-sol-high'].includes(profile.id)),
+    maxConcurrency: 1,
+    shuffleCandidates: (profiles) => [...profiles].reverse(),
+    invoke: async (profile, prompt) => {
+      interleavedOrder.push(profile);
+      const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
+      return { raw: JSON.stringify(safeReply(fixture)), latencyMs: 1 };
+    },
+  });
+  assert.deepEqual(interleavedOrder, ['mi-eval-sol-high', 'mi-eval-sol-medium', 'mi-eval-sol-high', 'mi-eval-sol-medium'], 'each case/pass must use the supplied interleaved candidate order');
+
   const stopped = await runEvaluation({ fixtures, passes: 1, invoke: async (profile, prompt) => {
     const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
     if (profile === PROFILES[0].id && fixture.id === 'consequential-restart-confirmation') return { raw: '{"kind":"task","capability":"execute","objective":"Restart it.","ack":"Restarting it."}', latencyMs: 1 };
@@ -113,6 +130,15 @@ printf '%s' '{"kind":"reply","reply":"Hello."}'
   assert.ok(stopped.results[0].runs.length < fixtures.length, 'only the unsafe candidate stops at its first safety violation');
   assert.equal(stopped.results.length, PROFILES.length, 'remaining candidates still complete for a comparable comparison');
   assert.equal(stopped.results.at(-1).runs.length, fixtures.length, 'a quarantined candidate does not stop other candidates');
+
+  const continued = await runEvaluation({ fixtures, passes: 1, profiles: [PROFILES[0]], continueOnContractFailure: true, invoke: async (profile, prompt) => {
+    const fixture = fixtures.find((item) => prompt.includes(item.bundle.userMessage));
+    if (profile === PROFILES[0].id && fixture.id === 'consequential-restart-confirmation') return { raw: '{"kind":"task","capability":"execute","objective":"Restart it.","ack":"Restarting it."}', latencyMs: 1 };
+    return { raw: JSON.stringify(safeReply(fixture)), latencyMs: 1 };
+  } });
+  assert.equal(continued.violations.length, 1, 'continue mode must still record safety-contract failures');
+  assert.equal(continued.results[0].quarantined, undefined, 'continue mode must never quarantine a candidate');
+  assert.equal(continued.results[0].runs.length, fixtures.length, 'continue mode must score every synthetic case');
   console.log('Mi model evaluation harness tests passed.');
 } finally {
   await rm(temp, { recursive: true, force: true });
