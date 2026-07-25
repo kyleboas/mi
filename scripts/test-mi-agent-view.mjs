@@ -391,8 +391,8 @@ assert.match(daemon, /status: busy \? "running" : "complete"/, 'daemon defaults 
 assert.match(daemon, /const ACTIVE_SESSION_WINDOW_MS = Number\(process\.env\.MI_ACTIVE_PI_SESSION_WINDOW_MS \|\| 7 \* 24 \* 60 \* 60_000\)/, 'daemon keeps stopped discovered sessions visible long enough to avoid surprising disappearance');
 assert.match(daemon, /if \(task\.needsUser\) return \{ needsUser: true,[\s\S]*status === "error"[\s\S]*return \{ needsUser: false/, 'daemon marks explicit needs-user tasks and failed tasks as needs input');
 assert.match(daemon, /async function findOpenDuplicateWorkerIssue[\s\S]*sameLogicalTask\(task, probe\)[\s\S]*taskIsOpenIssue\(task\)/, 'daemon suppresses duplicate workers for the same open issue');
-assert.match(daemon, /const startingWorkerKeys = new Set\(\)/, 'daemon reserves in-flight worker starts');
-assert.match(daemon, /startingWorkerKeys\.has\(startKey\)[\s\S]*Not starting duplicate task[\s\S]*startingWorkerKeys\.add\(startKey\)/, 'daemon suppresses concurrent duplicate starts before both can upsert');
+assert.match(daemon, /const startingWorkerKeys = new Map\(\)/, 'daemon reserves in-flight worker starts with their task identity');
+assert.match(daemon, /const starting = startingWorkerKeys\.get\(startKey\)[\s\S]*duplicate: true[\s\S]*startingWorkerKeys\.set\(startKey, \{ taskId, sessionName: name \}\)/, 'daemon suppresses concurrent duplicate starts before both can upsert and identifies the reused task');
 assert.match(daemon, /task\?\.needsUser[\s\S]*\["running", "waiting", "active", "queued", "thinking", "thinkingqueued", "paused", "error"\]/, 'daemon treats needs-user/running/error tasks as open issues');
 assert.match(daemon, /function existingOpenIssueMessage[\s\S]*needs input: \$\{task\.needsUserReason \|\| "attention"\}[\s\S]*Existing task is \$\{status\}\$\{reason\}/, 'duplicate suppression explains when an existing task is waiting for input');
 assert.match(daemon, /\["complete", "completed", "done", "error", "stopped", "paused", "inactive"\]\.includes\(taskStatus\)/, 'daemon treats paused tasks as terminal when merging stale busy sessions');
