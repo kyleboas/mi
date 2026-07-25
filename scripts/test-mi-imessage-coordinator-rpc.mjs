@@ -10,6 +10,10 @@ const record = path.join(root, 'record.jsonl');
 const good = path.join(root, 'good.mjs');
 const stalled = path.join(root, 'stalled.mjs');
 const exited = path.join(root, 'exited.mjs');
+const stdoutLimit = path.join(root, 'stdout-limit.mjs');
+const malformed = path.join(root, 'malformed.mjs');
+const rejected = path.join(root, 'rejected.mjs');
+const noAssistant = path.join(root, 'no-assistant.mjs');
 
 function launch(command) {
   return { command, args: [], cwd: root, env: { ...process.env, RECORD: record } };
@@ -36,7 +40,19 @@ setInterval(() => {}, 1000);
   await writeFile(exited, String.raw`#!/usr/bin/env node
 process.stdin.on('data', () => process.exit(3));
 `, { mode: 0o755 });
-  await Promise.all([chmod(good, 0o755), chmod(stalled, 0o755), chmod(exited, 0o755)]);
+  await writeFile(stdoutLimit, String.raw`#!/usr/bin/env node
+process.stdin.on('data', () => process.stdout.write('x'.repeat(4096)));
+`, { mode: 0o755 });
+  await writeFile(malformed, String.raw`#!/usr/bin/env node
+process.stdin.on('data', () => process.stdout.write('x'.repeat(4096)));
+`, { mode: 0o755 });
+  await writeFile(rejected, String.raw`#!/usr/bin/env node
+process.stdin.on('data', (chunk) => { const request = JSON.parse(chunk.toString()); process.stdout.write(JSON.stringify({ type: 'response', id: request.id, success: false, error: 'no' }) + '\n'); });
+`, { mode: 0o755 });
+  await writeFile(noAssistant, String.raw`#!/usr/bin/env node
+process.stdin.on('data', () => process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\n'));
+`, { mode: 0o755 });
+  await Promise.all([good, stalled, exited, stdoutLimit, malformed, rejected, noAssistant].map((file) => chmod(file, 0o755)));
 
   const result = await runMiCoordinatorRpc({
     launch: launch(good), requestId: 'turn-1', prompt: 'safe request', stderrCap: 64, timeoutMs: 3000,
@@ -56,6 +72,15 @@ process.stdin.on('data', () => process.exit(3));
   const failed = await runMiCoordinatorRpc({ launch: launch(exited), requestId: 'turn-3', prompt: 'exit', timeoutMs: 3000 });
   assert.equal(failed.ok, false, 'child exit before settlement is a failure');
   assert.match(failed.reason, /^exited-/, 'exit failure is correlated to the current turn');
+
+  const capped = await runMiCoordinatorRpc({ launch: launch(stdoutLimit), requestId: 'turn-4', prompt: 'cap', stdoutCap: 1024, timeoutMs: 3000 });
+  assert.equal(capped.reason, 'stdout-limit', 'oversized coordinator stdout is killed and rejected');
+  const badRecord = await runMiCoordinatorRpc({ launch: launch(malformed), requestId: 'turn-5', prompt: 'bad', stdoutCap: 8192, recordCap: 1024, timeoutMs: 3000 });
+  assert.equal(badRecord.reason, 'malformed-output', 'oversized unterminated output record is rejected');
+  const promptRejected = await runMiCoordinatorRpc({ launch: launch(rejected), requestId: 'turn-6', prompt: 'reject', timeoutMs: 3000 });
+  assert.equal(promptRejected.reason, 'prompt-rejected', 'explicit RPC prompt rejection fails immediately');
+  const settledWithoutAssistant = await runMiCoordinatorRpc({ launch: launch(noAssistant), requestId: 'turn-7', prompt: 'empty', timeoutMs: 3000 });
+  assert.equal(settledWithoutAssistant.reason, 'settled-without-assistant', 'settlement without a final assistant response fails closed');
 
   console.log('Mi coordinator RPC lifecycle checks passed.');
 } finally {

@@ -3,7 +3,7 @@ import net from "node:net";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { appendFile, chmod, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { parseWorkerCompletion } from "../../scripts/mi-worker-completion.mjs";
@@ -42,6 +42,7 @@ const MI_WORKER_NICE = Number(process.env.MI_WORKER_NICE || 10);
 const MI_WORKER_IONICE_CLASS = String(process.env.MI_WORKER_IONICE_CLASS || "3");
 const MI_CAPABILITY_GUARD = process.env.MI_CAPABILITY_GUARD || join(MI_ROOT, "pi", "extensions", "mi-capability-guard.ts");
 const MI_CAPABILITY_GRANT_TTL_MS = Number(process.env.MI_CAPABILITY_GRANT_TTL_MS || 6 * 60 * 60_000);
+const MI_ADVISOR_SKILL_PATH = process.env.MI_ADVISOR_SKILL_PATH || join(HOME, ".pi", "agent", "skills", "advisor");
 const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "HOSTNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR", "TMP", "TEMP", "PI_PROVIDER", "PI_MODEL", "PI_CONFIG_DIR", "PI_GATEWAY_URL", "AGENT_GATEWAY_URL"];
 
 function reducedPiEnv(extra = {}) {
@@ -57,11 +58,29 @@ function cwdInsideWorkflows(cwd = HOME) {
   return absolute === MI_WORKFLOWS_DIR || absolute.startsWith(`${MI_WORKFLOWS_DIR}/`);
 }
 
+function trustedAdvisorSkillRoot() {
+  const root = realpathSync(MI_ADVISOR_SKILL_PATH);
+  if (!statSync(root).isDirectory() || !statSync(join(root, "SKILL.md")).isFile()) {
+    throw new Error("advisor skill root is unavailable");
+  }
+  return root;
+}
+
+function advisorName(request = {}, task = undefined) {
+  const value = String(request.advisor || task?.advisor || "").trim();
+  return value === "Seth" || value === "Alex" ? value : "";
+}
+
 function workerCapabilityProfile(request = {}, cwd = HOME, task = undefined) {
   const requested = request.capabilityProfile || request.capability_profile || task?.capabilityProfile;
   if (requested === "worker-write-scoped") {
     if (!cwdInsideWorkflows(cwd)) throw new Error("worker-write-scoped is only allowed under ~/workflows");
     return "worker-write-scoped";
+  }
+  if (requested === "advisor-read") {
+    if (!advisorName(request, task)) throw new Error("advisor-read requires a selected registered advisor");
+    trustedAdvisorSkillRoot();
+    return "advisor-read";
   }
   return "worker-read";
 }
@@ -72,16 +91,29 @@ function writeWorkerCapabilityGrantsFile(cwd = HOME, profile = "worker-read") {
   try { chmodSync(dir, 0o700); } catch {}
   const file = join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
   const createdAt = new Date().toISOString();
-  const grant = {
-    id: `${profile}-${Date.now().toString(36)}`,
-    resource: `file://${resolve(cwd)}`,
+  const workspaceRoot = realpathSync(cwd);
+  const grants = [{
+    id: `${profile}-workspace-${Date.now().toString(36)}`,
+    resource: `file://${workspaceRoot}`,
     rights: profile === "worker-write-scoped" ? ["read", "write"] : ["read"],
     constraints: { recursive: true, profile, scope: profile === "worker-write-scoped" ? "workflows-only" : undefined },
     principal: { id: "mi-worker", type: "worker", displayName: "Mi worker" },
     createdAt,
     expiresAt: new Date(Date.parse(createdAt) + MI_CAPABILITY_GRANT_TTL_MS).toISOString(),
-  };
-  writeFileSync(file, JSON.stringify({ profile, grants: [grant] }, null, 2), { mode: 0o600 });
+  }];
+  if (profile === "advisor-read") {
+    const advisorRoot = trustedAdvisorSkillRoot();
+    grants.push({
+      id: `advisor-skill-${Date.now().toString(36)}`,
+      resource: `file://${advisorRoot}`,
+      rights: ["read"],
+      constraints: { recursive: true, profile: "advisor-read", scope: "trusted-advisor-skill" },
+      principal: { id: "mi-worker", type: "worker", displayName: "Mi advisor worker" },
+      createdAt,
+      expiresAt: new Date(Date.parse(createdAt) + MI_CAPABILITY_GRANT_TTL_MS).toISOString(),
+    });
+  }
+  writeFileSync(file, JSON.stringify({ profile, grants }, null, 2), { mode: 0o600 });
   try { chmodSync(file, 0o600); } catch {}
   return file;
 }
@@ -1463,17 +1495,21 @@ function rpcLaunchCommand(args, env = {}) {
 
 function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODEL, env = {} } = {}) {
   const profile = env.MI_CAPABILITY_PROFILE || (env.MI_WORKER === "1" ? "worker-read" : "mi-main-orchestrator");
+  const advisorRoot = profile === "advisor-read" ? trustedAdvisorSkillRoot() : "";
   const grantsFile = env.MI_CAPABILITY_GRANTS_FILE || writeWorkerCapabilityGrantsFile(cwd, profile);
   const auditFile = env.MI_CAPABILITY_AUDIT_FILE || join(RUNTIME_DIR, "capability-audit.jsonl");
   const tools = env.MI_CAPABILITY_TOOLS || env.MI_WORKER_TOOLS || (profile === "worker-write-scoped" ? "read,grep,find,ls,write,edit" : "read,grep,find,ls");
   const args = ["--mode", "rpc", "--model", model, "--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--tools", tools];
+  // --no-skills blocks every discovered global/project skill. Pi still loads
+  // this one reviewed root through the explicit additive --skill flag.
+  if (advisorRoot) args.push("--skill", advisorRoot);
   if (existsSync(MI_CAPABILITY_GUARD)) args.push("--extension", MI_CAPABILITY_GUARD);
   if (sessionDir) args.splice(2, 0, "--session-dir", sessionDir);
   if (sessionFile) args.splice(2, 0, "--session", sessionFile);
   const launch = rpcLaunchCommand(args, env);
   const proc = spawn(launch.command, launch.args, {
     cwd,
-    env: reducedPiEnv({ ...env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile }),
+    env: reducedPiEnv({ ...env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile, ...(advisorRoot ? { MI_ADVISOR_SKILL_PATH: advisorRoot } : {}) }),
     stdio: ["pipe", "pipe", "pipe"],
   });
   let rpcBuffer = "";
@@ -1756,7 +1792,7 @@ async function runWorker(request) {
       return { text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
     }
     log(`starting worker ${name} cwd=${cwd} model=${model} capabilityProfile=${capabilityProfile}`);
-    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: capabilityProfile } });
+    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: capabilityProfile, ...(advisorName(request) ? { MI_ADVISOR_NAME: advisorName(request) } : {}) } });
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     task = request.background
       ? await upsertTask({
@@ -1770,6 +1806,7 @@ async function runWorker(request) {
         model,
         modelSpec: model,
         capabilityProfile,
+        advisor: advisorName(request) || undefined,
         lastInput: taskInput,
       })
       : undefined;
@@ -1792,6 +1829,7 @@ async function runWorker(request) {
       model: before.model,
       modelSpec: model,
       capabilityProfile,
+      advisor: advisorName(request) || undefined,
       lastInput: taskInput,
     });
     installTaskHeartbeat(worker, task);

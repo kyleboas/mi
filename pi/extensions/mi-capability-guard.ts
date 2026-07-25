@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { appendFileSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 
 /**
  * Mi capability guard for scoped Pi workers and coordinators.
@@ -15,7 +16,7 @@ type Grant = {
   id: string;
   resource: string;
   rights: Right[];
-  constraints?: { recursive?: boolean; exact?: boolean; commands?: string[]; env?: string[]; profile?: string; excludedPaths?: string[] };
+  constraints?: { recursive?: boolean; exact?: boolean; commands?: string[]; env?: string[]; profile?: string; scope?: string };
   expiresAt?: string;
   principal?: unknown;
 };
@@ -101,14 +102,33 @@ function protectedPath(resource: string) {
   return parts.some((part) => PROTECTED_PATH_NAMES.has(part) || /^\.env(?:\.|$)/i.test(part));
 }
 
+function trustedAdvisorSkillResource() {
+  try {
+    const root = realpathSync(process.env.MI_ADVISOR_SKILL_PATH || join(homedir(), '.pi', 'agent', 'skills', 'advisor'));
+    return `file://${root}`.replace(/\\/g, '/');
+  } catch {
+    return '';
+  }
+}
+
+function isTrustedAdvisorReadGrant(grant: Grant, resource: string, right: Right) {
+  const root = trustedAdvisorSkillResource();
+  return right === 'read'
+    && grant.constraints?.profile === 'advisor-read'
+    && Boolean(root)
+    && (resource === root || resource.startsWith(`${root}/`))
+    && resourceMatches(grant, resource);
+}
+
 function authorize(resource: string, right: Right) {
-  if (protectedPath(resource)) return { allowed: false, reason: `protected Mi path is not available: ${resource}` };
   for (const grant of grants) {
     if (isExpired(grant)) continue;
     if (!grant.rights?.includes(right)) continue;
     if (!resourceMatches(grant, resource)) continue;
+    if (protectedPath(resource) && !isTrustedAdvisorReadGrant(grant, resource, right)) continue;
     return { allowed: true, capabilityId: grant.id, reason: `authorized by ${grant.id}` };
   }
+  if (protectedPath(resource)) return { allowed: false, reason: `protected Mi path is not available: ${resource}` };
   return { allowed: false, reason: `missing ${right} capability for ${resource}` };
 }
 
