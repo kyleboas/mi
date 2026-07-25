@@ -25,13 +25,18 @@ try {
   await assert.rejects(() => createPendingConfirmation({ threadId: 'fresh-malformed-lock', summary: 'safe', riskReason: 'test' }, { statePath }), /Could not lock/);
   await rm(lockPath, { force: true });
 
-  // An old lock whose recorded process is absent can be recovered. The
-  // metadata stays bounded and owner-readable only.
+  // A stale recovery marker from a dead owner is reclaimed before the old
+  // lock. This covers a crash after the marker directory was created.
   const staleTime = Date.now() - 120_000;
+  const recoveryPath = `${lockPath}.recovery`;
+  await mkdir(recoveryPath, { mode: 0o700 });
+  await writeFile(join(recoveryPath, 'owner'), JSON.stringify({ pid: 4_000_000, createdAt: staleTime, nonce: 'c'.repeat(32) }), { mode: 0o600 });
+  await utimes(recoveryPath, staleTime / 1000, staleTime / 1000);
   await writeFile(lockPath, JSON.stringify({ pid: 4_000_000, createdAt: staleTime, nonce: 'b'.repeat(32) }), { mode: 0o600 });
   await utimes(lockPath, staleTime / 1000, staleTime / 1000);
   const first = await createPendingConfirmation({ threadId: 'thread-a', summary: 'Send the approved reply', riskReason: 'This sends an external message', continuationRef: 'resume-1', objective: 'Deploy the garden plan change', actionClass: 'confirmed-high-impact' }, { statePath, now: at('2026-01-01T00:00:00Z') });
   assert.equal(await stat(lockPath).then(() => true, () => false), false, 'recovered lock is cleaned after the normal path');
+  assert.equal(await stat(recoveryPath).then(() => true, () => false), false, 'stale recovery marker is cleaned');
   const storedFirst = await readPendingConfirmation('thread-a', { statePath, now: at('2026-01-01T00:01:00Z') });
   assert.equal(storedFirst.id, first.id);
   assert.equal(storedFirst.objective, 'Deploy the garden plan change', 'bounded approved objective persists for one confirmation');

@@ -119,7 +119,8 @@ app = await Spectrum({
 });
 
 const knownSpaces = new Map();
-const seen = new Set();
+const seen = new Map();
+const MAX_SEEN = 5000;
 
 function splitList(value) {
   return String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -137,21 +138,25 @@ function stableDeliveryId(space, message) {
     .find(Boolean);
   if (upstream && acceptedDeliveryId.test(upstream)) return upstream;
 
-  // Photon normally supplies message.id. If it does not, this digest uses
-  // only stable event metadata, never message text. It is bounded to 32 hex
-  // characters. Events with the same sender, space, timestamp, direction,
-  // content type, and upstream id can collide; that is the deliberate scope
-  // of the fallback because no unique upstream identifier was available.
-  const content = message?.content || {};
+  // Hash stable event metadata and normalized content. The digest is the only
+  // content-derived value retained or sent; plaintext message text never
+  // enters the delivery ID.
+  const normalize = (value) => {
+    if (typeof value === 'string') return value.replace(/\r\n?/g, '\n').trim();
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalize(value[key])]));
+    }
+    return value ?? null;
+  };
   const stableFields = {
-    version: 1,
+    version: 2,
     upstream: upstream || '',
     spaceId: String(space?.id || message?.space?.id || ''),
     sender: senderFor(space, message),
     timestamp: String(message?.timestamp || message?.createdAt || ''),
     direction: String(message?.direction || ''),
-    contentType: String(content?.type || ''),
-    contentId: String(content?.id || content?.attachmentId || ''),
+    content: normalize(message?.content || null),
   };
   return `photon-${createHash('sha256').update(JSON.stringify(stableFields)).digest('hex').slice(0, 32)}`;
 }
@@ -309,8 +314,9 @@ async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
   const id = stableDeliveryId(space, message);
   if (seen.has(id)) return;
-  seen.add(id);
-  if (seen.size > 5000) seen.clear();
+  seen.set(id, Date.now());
+  // Remove only the oldest entry, preserving replay protection for the rest.
+  if (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value);
 
   const sender = senderFor(space, message);
   const spaceId = String(space?.id || message?.space?.id || '');

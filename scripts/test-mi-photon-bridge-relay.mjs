@@ -114,12 +114,13 @@ async function runRelayCase(root, name, workerReply) {
   const sendsPath = join(dir, 'sends.jsonl');
   await writeFile(eventsPath, JSON.stringify([
     {
-      space: { id: `${name}-space`, phone: '+15551234567' },
+      space: { id: workerReply.spaceId || `${name}-space`, phone: '+15551234567' },
       message: {
         ...(workerReply.omitMessageId ? {} : { id: workerReply.messageId || `${name}-message` }),
         direction: 'inbound',
         sender: { id: '+15551234567' },
-        content: { type: 'text', text: 'check detect status' },
+        timestamp: workerReply.timestamp,
+        content: { type: 'text', text: workerReply.body || 'check detect status' },
       },
     },
   ], null, 2));
@@ -158,7 +159,7 @@ async function runRelayCase(root, name, workerReply) {
     }
 
     const inboundCall = mi.calls.find((call) => call.method === 'POST' && call.path === '/api/imessage');
-    assert.ok(inboundCall && inboundCall.body.message === 'check detect status' && inboundCall.body.thread === 'main', `${name}: bridge should forward inbound iMessage to Mi web`);
+    assert.ok(inboundCall && inboundCall.body.message === (workerReply.body || 'check detect status') && inboundCall.body.thread === 'main', `${name}: bridge should forward inbound iMessage to Mi web`);
     assert.equal(typeof inboundCall.body.deliveryId, 'string', `${name}: bridge should send a bounded delivery identifier`);
     assert.ok(/^[A-Za-z0-9._:-]{1,200}$/.test(inboundCall.body.deliveryId), `${name}: delivery identifier uses the web API format`);
     assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
@@ -176,6 +177,9 @@ try {
   const fallbackIdOne = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', text: 'Fallback identifier result.' });
   const fallbackIdTwo = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', text: 'Fallback identifier result.' });
   assert.equal(fallbackIdOne, fallbackIdTwo, 'fallback digest stays stable when the upstream event has no id');
+  const differentBucketMessage = await runRelayCase(root, 'fallback-different-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'a different message', text: 'Fallback identifier result.' });
+  const sameBucketMessage = await runRelayCase(root, 'fallback-same-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'check detect status', text: 'Fallback identifier result.' });
+  assert.notEqual(differentBucketMessage, sameBucketMessage, 'fallback digest distinguishes same-bucket message content');
   assert.match(fallbackIdOne, /^photon-[a-f0-9]{32}$/, 'fallback identifier is a bounded digest and does not contain message text');
   await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });

@@ -172,6 +172,46 @@ function sameLockSnapshot(left: Awaited<ReturnType<typeof lockSnapshot>>, right:
     && left.text === right.text);
 }
 
+type RecoverySnapshot = {
+  info: Awaited<ReturnType<typeof stat>>;
+  ownerText: string | undefined;
+};
+
+async function recoverySnapshot(recovery: string): Promise<RecoverySnapshot | null> {
+  const info = await stat(recovery).catch(() => undefined);
+  if (!info || !info.isDirectory()) return null;
+  const ownerText = await readFile(path.join(recovery, 'owner'), 'utf8').catch(() => undefined);
+  return { info, ownerText };
+}
+
+function sameRecoverySnapshot(left: RecoverySnapshot | null, right: RecoverySnapshot | null) {
+  return Boolean(left && right && left.info.ino === right.info.ino
+    && left.info.mtimeMs === right.info.mtimeMs && left.ownerText === right.ownerText);
+}
+
+async function recoverStaleRecovery(recovery: string) {
+  const first = await recoverySnapshot(recovery);
+  if (!first) return false;
+  const owner = first.ownerText === undefined ? null : parseLockMetadata(first.ownerText);
+  // An empty owner file means a crash between mkdir and writeFile. It is safe
+  // to reclaim only after the marker itself is old. Malformed metadata is
+  // uncertainty, so it stays in place rather than being guessed dead.
+  if (first.ownerText !== undefined && !owner) return false;
+  const ageMs = Date.now() - Math.max(Number(first.info.mtimeMs), owner?.createdAt || 0);
+  if (ageMs < LOCK_STALE_MS || (owner && ownerIsAlive(owner.pid))) return false;
+  const current = await recoverySnapshot(recovery);
+  if (!sameRecoverySnapshot(first, current)) return false;
+  const quarantine = `${recovery}.reclaim-${randomBytes(8).toString('hex')}`;
+  try {
+    await rename(recovery, quarantine);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    return false;
+  }
+  await rm(quarantine, { recursive: true, force: true });
+  return true;
+}
+
 async function recoverStaleLock(lock: string) {
   const first = await lockSnapshot(lock);
   if (!first) return false;
@@ -179,22 +219,19 @@ async function recoverStaleLock(lock: string) {
   if (ageMs < LOCK_STALE_MS) return false;
   if (first.metadata && ownerIsAlive(first.metadata.pid)) return false;
 
-  // Only one process may decide to remove a stale lock. The recovery marker
-  // is acquired with mkdir, which is atomic. A process that sees a marker
-  // waits rather than touching either the old lock or the new owner lock.
   const recovery = `${lock}.recovery`;
   try {
     await mkdir(recovery, { mode: 0o700 });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    // A crashed recovery attempt must not permanently block this lock.
+    await recoverStaleRecovery(recovery);
+    return false;
   }
   try {
     await writeFile(path.join(recovery, 'owner'), JSON.stringify({ pid: process.pid, createdAt: Date.now(), nonce: randomBytes(16).toString('hex') }), { mode: 0o600, flag: 'wx' });
     const current = await lockSnapshot(lock);
     if (!sameLockSnapshot(first, current)) return false;
-    // Do not use force here: if another process already removed this exact
-    // lock, the failed unlink leaves the replacement lock untouched.
     await rm(lock, { force: false });
     return true;
   } catch (error) {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -27,6 +27,11 @@ assert.match(deployScript, /npm test[\s\S]*install -m 600 pi\/extensions\/mi\.ts
 const root = await mkdtemp(join(tmpdir(), 'mi-tick-'));
 try {
   await mkdir(join(root, 'mi', 'state'), { recursive: true });
+  const staleTickLock = join(root, 'assistant', 'state', 'tick.lock');
+  await mkdir(join(root, 'assistant', 'state'), { recursive: true });
+  const staleTime = Date.now() - 120_000;
+  await writeFile(staleTickLock, JSON.stringify({ pid: 4_000_000, createdAt: staleTime, nonce: 'a'.repeat(32) }), { mode: 0o600 });
+  await utimes(staleTickLock, staleTime / 1000, staleTime / 1000);
   const capabilityDir = join(root, '.pi', 'agent', 'mi', 'capabilities');
   await mkdir(capabilityDir, { recursive: true });
   await writeFile(join(capabilityDir, 'expired.json'), JSON.stringify({ grants: [{ expiresAt: new Date(Date.now() - 1000).toISOString() }] }));
