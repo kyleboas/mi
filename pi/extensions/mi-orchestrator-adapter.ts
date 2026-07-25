@@ -80,16 +80,18 @@ function readPolicy(): CoordinatorPolicy | undefined {
 
 function saveAdvisorTaskIds(policy: CoordinatorPolicy, taskIds: string[]) {
   const file = policyFile();
-  if (!file) return;
+  if (!file) return false;
   try {
     const raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
-    if (raw.version !== 1 || raw.correlationId !== policy.correlationId) return;
+    if (raw.version !== 1 || raw.correlationId !== policy.correlationId) return false;
     const next = safeTaskIds(taskIds);
+    if (next.length !== taskIds.length) return false;
     const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
     writeFileSync(temporary, JSON.stringify({ ...raw, advisorTaskIds: next }), { mode: 0o600 });
     renameSync(temporary, file);
+    return true;
   } catch {
-    // The parent will fail closed if it cannot find all advisor task IDs.
+    return false;
   }
 }
 
@@ -147,32 +149,52 @@ function advisorTask(policy: CoordinatorPolicy, advisor: Advisor) {
   ].join('\n');
 }
 
-async function startAdvisorWorkers(policy: CoordinatorPolicy) {
-  if (policy.advisorSelections.length === 0) return [];
-  if (policy.advisorTaskIds.length === policy.advisorSelections.length) return policy.advisorTaskIds;
+type AdvisorWorkerStarts = { taskIds: string[]; started: boolean };
+
+function freshAdvisorTaskId(result: Record<string, unknown>, advisor: Advisor, taskIds: string[]) {
+  // A daemon reply with duplicate: true reused another start. That is safe for
+  // a same-advisor replay, but does not prove this request started that advisor.
+  if (result.duplicate === true) throw new Error(`Mi suppressed the ${advisor} advisor start as a duplicate.`);
+  if (result.duplicate !== undefined && result.duplicate !== false) throw new Error(`Mi returned an invalid duplicate status for ${advisor}.`);
+  const taskId = typeof result.taskId === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(result.taskId) ? result.taskId : '';
+  if (!taskId) throw new Error(`Mi did not return a valid task ID for ${advisor}.`);
+  if (taskIds.includes(taskId)) throw new Error(`Mi reused a task ID for ${advisor}.`);
+  return taskId;
+}
+
+async function startAdvisorWorkers(policy: CoordinatorPolicy): Promise<AdvisorWorkerStarts> {
+  if (policy.advisorSelections.length === 0) return { taskIds: [], started: false };
+  if (policy.advisorTaskIds.length === policy.advisorSelections.length) return { taskIds: policy.advisorTaskIds, started: false };
   if (policy.advisorTaskIds.length > 0) throw new Error('Mi found an incomplete advisor task list.');
   const taskIds: string[] = [];
   for (const advisor of policy.advisorSelections) {
-    const result = await daemonRequest(policy.socketPath, {
-      type: 'run_worker',
-      // The advisor name and lane-specific lastInput make both normal task
-      // matching and daemon deduplication distinct for a multi-advisor ask.
-      name: `Mi advisor ${advisor} ${policy.correlationId.slice(0, 12)}`,
-      message: advisorTask(policy, advisor),
-      lastInput: `${advisor}: ${policy.objective}`,
-      cwd: policy.workspaceCwd,
-      model: WORKERS['Sol-High'],
-      capabilityProfile: 'advisor-read',
-      advisor,
-      background: true,
-      reportToMain: false,
-    });
-    const taskId = safeText(result.taskId, 200);
-    if (!taskId) throw new Error(`Mi did not return a task ID for ${advisor}.`);
-    taskIds.push(taskId);
+    try {
+      const result = await daemonRequest(policy.socketPath, {
+        type: 'run_worker',
+        // The advisor name and lane-specific lastInput make both normal task
+        // matching and daemon deduplication distinct for a multi-advisor ask.
+        name: `Mi advisor ${advisor} ${policy.correlationId.slice(0, 12)}`,
+        message: advisorTask(policy, advisor),
+        lastInput: `${advisor}: ${policy.objective}`,
+        cwd: policy.workspaceCwd,
+        model: WORKERS['Sol-High'],
+        capabilityProfile: 'advisor-read',
+        advisor,
+        background: true,
+        reportToMain: false,
+      });
+      taskIds.push(freshAdvisorTaskId(result, advisor, taskIds));
+      // Keep each safe started task ID right away. If a later advisor fails,
+      // Mi can still wait for this result instead of losing it.
+      if (!saveAdvisorTaskIds(policy, taskIds)) throw new Error('Mi could not record the started advisor task.');
+    } catch (error) {
+      // Keep a partial list in the policy. A later repeat must reject it
+      // instead of pretending every advisor started.
+      if (taskIds.length > 0) saveAdvisorTaskIds(policy, taskIds);
+      throw error;
+    }
   }
-  saveAdvisorTaskIds(policy, taskIds);
-  return taskIds;
+  return { taskIds, started: true };
 }
 
 export default function miOrchestratorAdapter(pi: ExtensionAPI) {
@@ -191,8 +213,10 @@ export default function miOrchestratorAdapter(pi: ExtensionAPI) {
       try { cwd = realpathSync(ctx.cwd); } catch {}
       if (cwd === policy.workspaceCwd && inside(policy.workspaceRoot, cwd)) {
         try {
-          const taskIds = await startAdvisorWorkers(policy);
-          advisorNotice = `\n\nMi advisor routing is complete: ${taskIds.length} independent read-only advisor worker${taskIds.length === 1 ? '' : 's'} started. Do not call mi_orchestrator_delegate for this advisor request.`;
+          const advisorStarts = await startAdvisorWorkers(policy);
+          advisorNotice = advisorStarts.started
+            ? `\n\nMi advisor routing is complete: ${advisorStarts.taskIds.length} independent read-only advisor worker${advisorStarts.taskIds.length === 1 ? '' : 's'} started. Do not call mi_orchestrator_delegate for this advisor request.`
+            : `\n\nMi advisor routing is already active: ${advisorStarts.taskIds.length} independent read-only advisor worker${advisorStarts.taskIds.length === 1 ? '' : 's'} ${advisorStarts.taskIds.length === 1 ? 'is' : 'are'} tracked. Do not call mi_orchestrator_delegate for this advisor request.`;
         } catch {
           advisorNotice = '\n\nMi advisor routing failed before all selected advisors started. Do not claim an advisor result; tell Mi that this request could not start safely.';
         }
@@ -227,10 +251,10 @@ export default function miOrchestratorAdapter(pi: ExtensionAPI) {
           return { content: [{ type: 'text', text: 'Delegation denied: the requested advisor has no approved read-only route.' }] };
         }
         try {
-          const taskIds = await startAdvisorWorkers(policy);
+          const advisorStarts = await startAdvisorWorkers(policy);
           return {
-            content: [{ type: 'text', text: 'Started the selected independent advisor workers.' }],
-            details: { taskIds, correlationId: policy.correlationId, worker: 'Sol-High', capabilityProfile: 'advisor-read' },
+            content: [{ type: 'text', text: advisorStarts.started ? 'Started the selected independent advisor workers.' : 'The selected independent advisor workers are already tracked.' }],
+            details: { taskIds: advisorStarts.taskIds, correlationId: policy.correlationId, worker: 'Sol-High', capabilityProfile: 'advisor-read' },
           };
         } catch {
           return { content: [{ type: 'text', text: 'Delegation failed: Mi could not start every selected advisor worker.' }] };

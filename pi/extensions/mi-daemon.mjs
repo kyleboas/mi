@@ -126,7 +126,7 @@ let nextId = 1;
 const pending = new Map();
 const promptQueue = [];
 const activeWorkers = new Map();
-const startingWorkerKeys = new Set();
+const startingWorkerKeys = new Map();
 let activePrompt;
 let piIdleTimer;
 let idleExitTimer;
@@ -646,8 +646,8 @@ function normalizedLastInput(task) {
   return normalizeLastInputText(task?.lastInput).toLowerCase().slice(0, 500);
 }
 
-function logicalTaskStartKey({ name, cwd, message }) {
-  return [String(cwd || ""), normalizedNameText(name), normalizeLastInputText(message).toLowerCase().slice(0, 500)].join("\u001f");
+function logicalTaskStartKey({ name, cwd, message, advisor }) {
+  return [String(cwd || ""), normalizedNameText(name), normalizeLastInputText(message).toLowerCase().slice(0, 500), advisorName({ advisor })].join("\u001f");
 }
 
 function taskInputFromRequest(request, fallback) {
@@ -669,6 +669,11 @@ function taskSessionIdentityKeys(task) {
 }
 
 function sameLogicalTask(a, b) {
+  // Advisor requests are for separate people. Never let a shared session,
+  // task name, input, or loose topic match join their identities.
+  const aAdvisor = advisorName({}, a);
+  const bAdvisor = advisorName({}, b);
+  if (aAdvisor && bAdvisor && aAdvisor !== bAdvisor) return false;
   if (samePiSessionTask(a, b)) return true;
   const sameCwd = String(a?.cwd || "") === String(b?.cwd || "");
   const aName = normalizedTaskName(a);
@@ -1760,8 +1765,8 @@ function existingOpenIssueMessage(task, name) {
   return `Not starting duplicate task: ${name}. Existing task is ${status}${reason}.${session}`;
 }
 
-async function findOpenDuplicateWorkerIssue({ name, cwd, message }) {
-  const probe = { name, sessionName: name, cwd, lastInput: message };
+async function findOpenDuplicateWorkerIssue({ name, cwd, message, advisor }) {
+  const probe = { name, sessionName: name, cwd, lastInput: message, advisor };
   const tasks = await listAllTasks();
   return tasks.find((task) => sameLogicalTask(task, probe) && taskIsOpenIssue(task));
 }
@@ -1775,25 +1780,27 @@ async function runWorker(request) {
   const model = String(request.model || MI_MODEL).trim();
   const sessionDir = request.sessionDir ? String(request.sessionDir).trim() : undefined;
   const capabilityProfile = workerCapabilityProfile(request, cwd);
-  const startKey = logicalTaskStartKey({ name, cwd, message: taskInput });
-  if (startingWorkerKeys.has(startKey)) {
+  const selectedAdvisor = advisorName(request);
+  const startKey = logicalTaskStartKey({ name, cwd, message: taskInput, advisor: selectedAdvisor });
+  const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const starting = startingWorkerKeys.get(startKey);
+  if (starting) {
     await log(`duplicate_worker_start_suppressed ${name}`);
-    return { text: `Not starting duplicate task: ${name}. Existing task is already starting.`, sessionName: name };
+    return { duplicate: true, text: `Not starting duplicate task: ${name}. Existing task is already starting.`, taskId: starting.taskId, sessionName: starting.sessionName || name };
   }
-  startingWorkerKeys.add(startKey);
+  startingWorkerKeys.set(startKey, { taskId, sessionName: name });
   let worker;
   let task;
   let before;
   try {
-    const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message: taskInput });
+    const duplicate = await findOpenDuplicateWorkerIssue({ name, cwd, message: taskInput, advisor: selectedAdvisor });
     if (duplicate) {
       const text = existingOpenIssueMessage(duplicate, name);
       await log(`duplicate_worker_suppressed ${name} existing=${duplicate.id || duplicate.sessionName || duplicate.sessionFile || "unknown"}`);
-      return { text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
+      return { duplicate: true, text, taskId: duplicate.id, sessionFile: duplicate.sessionFile, sessionId: duplicate.sessionId, sessionName: duplicate.sessionName || duplicate.name || name };
     }
     log(`starting worker ${name} cwd=${cwd} model=${model} capabilityProfile=${capabilityProfile}`);
-    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: capabilityProfile, ...(advisorName(request) ? { MI_ADVISOR_NAME: advisorName(request) } : {}) } });
-    const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    worker = createRpcProcess({ cwd, model, sessionDir, env: { MI_WORKER: "1", MI_CAPABILITY_PROFILE: capabilityProfile, ...(selectedAdvisor ? { MI_ADVISOR_NAME: selectedAdvisor } : {}) } });
     task = request.background
       ? await upsertTask({
         id: taskId,

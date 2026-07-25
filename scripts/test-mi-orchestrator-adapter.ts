@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,6 +17,7 @@ const advisorRoot = path.join(root, 'global', '.pi', 'agent', 'skills', 'advisor
 const advisorReference = path.join(advisorRoot, 'references', 'source-standards.md');
 const grantsPath = path.join(root, 'grants.json');
 const requests: Record<string, unknown>[] = [];
+const daemonReplies: Record<string, unknown>[] = [];
 const handlers = new Map<string, Array<(...args: any[]) => any>>();
 let registeredTool: any;
 let activeTools = ['read', 'orchestrator_delegate', 'orchestrator_workers'];
@@ -38,7 +39,7 @@ const daemon = net.createServer((socket) => {
     const newline = buffer.indexOf('\n');
     if (newline < 0) return;
     requests.push(JSON.parse(buffer.slice(0, newline)));
-    socket.end(`${JSON.stringify({ ok: true, taskId: `restricted-${requests.length}` })}\n`);
+    socket.end(`${JSON.stringify(daemonReplies.shift() || { ok: true, taskId: `restricted-${requests.length}` })}\n`);
   });
 });
 await new Promise<void>((resolve, reject) => {
@@ -142,21 +143,64 @@ try {
   }
 
   const beforeAdvisor = requests.length;
-  await writePolicy('Ask Seth how I should position this offer.', false, ['Seth']);
   const beforeAgent = (handlers.get('before_agent_start') || [])[0];
   assert.ok(beforeAgent, 'adapter starts direct advisor routes before the coordinator can answer');
+
+  await writePolicy('/skill:advisor Ask Seth how I should position this offer.', false, ['Seth']);
+  const singleSeth = await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
+  const singleSethReplay = await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
+  assert.equal(requests.length, beforeAdvisor + 1, 'single Seth starts exactly one advisor worker and a same-advisor replay is safe');
+  assert.match(singleSeth.systemPrompt, /1 independent read-only advisor worker started/, 'a fresh single-advisor notice is truthful');
+  assert.match(singleSethReplay.systemPrompt, /already active: 1 independent read-only advisor worker is tracked/, 'a replay does not claim a fresh advisor start');
+
+  await writePolicy('Ask Alex how I should price this offer.', false, ['Alex']);
   await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
-  await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
-  assert.equal(requests.length, beforeAdvisor + 1, 'Ask Seth starts exactly one independent advisor worker and does not repeat it');
-  await writePolicy('Ask the advisors how I should position this offer.', false, ['Seth', 'Alex']);
-  await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
-  assert.equal(requests.length, beforeAdvisor + 3, 'Ask the advisors starts one Sol-High worker per registered advisor');
+  assert.equal(requests.length, beforeAdvisor + 2, 'single Alex starts exactly one advisor worker');
+
+  const collisionTopics = [
+    'Ask the advisors: should I invest more in research?',
+    'Ask the advisors whether to keep the daily briefing',
+    'Ask Seth and Alex how to fix my worker routing.',
+  ];
+  for (const objective of collisionTopics) {
+    for (const advisors of [['Seth', 'Alex'], ['Alex', 'Seth']] as Array<Array<'Seth' | 'Alex'>>) {
+      const start = requests.length;
+      await writePolicy(objective, false, advisors);
+      const result = await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
+      const started = requests.slice(start);
+      assert.equal(started.length, 2, `${objective} starts both advisors in ${advisors.join(', ')} order`);
+      assert.deepEqual(started.map((request) => request.advisor), advisors, `${objective} preserves both advisor identities`);
+      assert.notEqual(started[0].name, started[1].name, `${objective} gives advisors distinct names`);
+      assert.notEqual(started[0].lastInput, started[1].lastInput, `${objective} gives advisors distinct deduplication inputs`);
+      assert.notEqual(started[0].message, started[1].message, `${objective} gives advisors distinct lane instructions`);
+      assert.match(result.systemPrompt, /2 independent read-only advisor workers started/, `${objective} reports both fresh starts truthfully`);
+      const saved = JSON.parse(await readFile(policyPath, 'utf8'));
+      assert.equal(saved.advisorTaskIds.length, 2, `${objective} persists both task IDs`);
+      assert.equal(new Set(saved.advisorTaskIds).size, 2, `${objective} persists each task ID exactly once`);
+    }
+  }
   const advisorRequests = requests.slice(beforeAdvisor);
-  assert.deepEqual(advisorRequests.map((request) => request.model), ['openai-codex/gpt-5.6-sol:high', 'openai-codex/gpt-5.6-sol:high', 'openai-codex/gpt-5.6-sol:high'], 'advisor workers always use Sol-High');
-  assert.deepEqual(advisorRequests.map((request) => request.capabilityProfile), ['advisor-read', 'advisor-read', 'advisor-read'], 'advisor workers are read-only');
-  assert.notEqual(advisorRequests[1].name, advisorRequests[2].name, 'multi-advisor worker names are independent');
-  assert.notEqual(advisorRequests[1].message, advisorRequests[2].message, 'multi-advisor worker messages preserve individual identities');
+  assert.ok(advisorRequests.every((request) => request.model === 'openai-codex/gpt-5.6-sol:high'), 'advisor workers always use Sol-High');
+  assert.ok(advisorRequests.every((request) => request.capabilityProfile === 'advisor-read'), 'advisor workers are read-only');
   assert.match(String(advisorRequests[0].message), /^\/skill:advisor/m, 'advisor worker explicitly loads the trusted advisor skill');
+
+  // The adapter must fail closed when the daemon says a start was suppressed,
+  // omits a usable ID, or returns the same ID for two advisor lanes.
+  const failedAdvisorStart = async (replies: Record<string, unknown>[], expectedTaskIds: string[] = []) => {
+    daemonReplies.push(...replies);
+    await writePolicy('Ask the advisors about fail-closed replies.', false, ['Seth', 'Alex']);
+    const result = await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
+    assert.match(result.systemPrompt, /routing failed before all selected advisors started/, 'unsafe daemon reply does not claim advisor success');
+    const saved = JSON.parse(await readFile(policyPath, 'utf8'));
+    assert.deepEqual(saved.advisorTaskIds, expectedTaskIds, 'only safely started advisor IDs are recorded after a failed multi-advisor start');
+  };
+  await failedAdvisorStart([{ ok: true, duplicate: true, taskId: 'already-running' }]);
+  await failedAdvisorStart([{ ok: true, taskId: 'not a valid task id' }]);
+  await failedAdvisorStart([{ ok: true, taskId: 'same-id' }, { ok: true, taskId: 'same-id' }], ['same-id']);
+  const beforePartialReplay = requests.length;
+  const partialReplay = await beforeAgent({ systemPrompt: 'base' }, { cwd: await realpath(workspace) });
+  assert.equal(requests.length, beforePartialReplay, 'a partial advisor start never retries or conceals the missing lane');
+  assert.match(partialReplay.systemPrompt, /routing failed before all selected advisors started/, 'a partial advisor start stays visibly failed');
 
   const beforeDenied = requests.length;
   const outsideResult = await registeredTool.execute('tool-call', { worker: 'Terra' }, new AbortController().signal, () => {}, { cwd: outside });

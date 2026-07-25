@@ -12,8 +12,11 @@ const runtime = join(root, 'runtime');
 const socketPath = join(runtime, 'main.sock');
 const tasksPath = join(home, 'mi', 'state', 'tasks.json');
 const sessionsRoot = join(home, '.pi', 'agent', 'sessions', '--home-test--');
+const advisorRoot = join(root, 'advisor-skill');
 await mkdir(sessionsRoot, { recursive: true });
 await mkdir(join(home, 'mi', 'state'), { recursive: true });
+await mkdir(advisorRoot, { recursive: true });
+await writeFile(join(advisorRoot, 'SKILL.md'), '# Advisor fixture\n');
 
 const fakePiJsPath = join(root, 'fake-pi.js');
 const fakePiPath = join(root, 'fake-pi');
@@ -32,7 +35,10 @@ process.stdin.on('data', (chunk) => {
       console.log(JSON.stringify({ type: 'response', id: request.id, success: true, data: { sessionFile, sessionId, sessionName, model: {} } }));
     } else if (request.type === 'prompt') {
       console.log(JSON.stringify({ type: 'response', id: request.id, success: true, data: {} }));
-      setTimeout(() => console.log(JSON.stringify({ type: 'agent_end', messages: [{ role: 'assistant', content: [{ type: 'text', text: 'done' }] }] })), 500);
+      setTimeout(() => {
+        console.log(JSON.stringify({ type: 'agent_end', messages: [{ role: 'assistant', content: [{ type: 'text', text: 'done' }] }] }));
+        console.log(JSON.stringify({ type: 'agent_settled' }));
+      }, 500);
     }
   }
 });
@@ -99,6 +105,7 @@ const daemon = spawn(process.execPath, [new URL('../pi/extensions/mi-daemon.mjs'
     MI_RUNTIME_DIR: runtime,
     MI_SOCKET_PATH: socketPath,
     MI_PI_BIN: fakePiPath,
+    MI_ADVISOR_SKILL_PATH: advisorRoot,
     MI_ACTIVE_PI_SESSION_WINDOW_MS: String(365 * 24 * 60 * 60_000),
     MI_PI_SESSION_SCAN_CACHE_MS: '0',
     MI_IDLE_PI_SESSION_SCAN_CACHE_MS: '0',
@@ -181,6 +188,59 @@ try {
   assert.equal([firstStart, secondStart].filter((result) => /Not starting duplicate task/.test(result.text || '')).length, 1, 'concurrent duplicate start was not reported as suppressed');
   rows = (await request('list_tasks')).tasks;
   assert.equal(rows.filter((t) => t.name === 'same-start').length, 1, 'concurrent duplicate start persisted duplicate task rows');
+  const duplicateStart = [firstStart, secondStart].find((result) => result.duplicate === true);
+  const freshStart = [firstStart, secondStart].find((result) => result.duplicate !== true);
+  assert.equal(duplicateStart?.duplicate, true, 'daemon explicitly marks an in-flight duplicate response');
+  assert.equal(duplicateStart?.taskId, freshStart?.taskId, 'an in-flight duplicate response identifies the reused task ID');
+
+  // 7b. Non-advisor topic-based duplicate protection stays in place.
+  const ordinaryRoutingFirst = await request('run_worker', { name: 'ordinary-routing-one', cwd: home, message: 'Ask how to fix my worker routing now.', background: true });
+  const ordinaryRoutingReplay = await request('run_worker', { name: 'ordinary-routing-two', cwd: home, message: 'Ask how to fix my worker routing later.', background: true });
+  assert.equal(ordinaryRoutingReplay.duplicate, true, 'ordinary same-topic work is still duplicate-suppressed');
+  assert.equal(ordinaryRoutingReplay.taskId, ordinaryRoutingFirst.taskId, 'ordinary duplicate suppression still reuses the open task ID');
+
+  // 7c. Different advisor identities never collapse through the loose topic
+  // heuristic. Exercise every reported collision in both requested orders.
+  const advisorTopics = [
+    'Ask the advisors: should I invest more in research?',
+    'Ask the advisors whether to keep the daily briefing',
+    'Ask Seth and Alex how to fix my worker routing.',
+  ];
+  let advisorRun = 0;
+  for (const topic of advisorTopics) {
+    for (const advisors of [['Seth', 'Alex'], ['Alex', 'Seth']]) {
+      const run = ++advisorRun;
+      const starts = [];
+      for (const advisor of advisors) {
+        starts.push(await request('run_worker', {
+          name: `Mi advisor ${advisor} collision-${run}`,
+          message: `/skill:advisor\nSelected advisor: ${advisor}.\n${topic}`,
+          lastInput: `${advisor}: ${topic}`,
+          cwd: home,
+          capabilityProfile: 'advisor-read',
+          advisor,
+          background: true,
+          reportToMain: false,
+        }));
+      }
+      assert.ok(starts.every((result) => result.duplicate !== true), `${topic} starts fresh ${advisors.join(', ')} advisor lanes`);
+      assert.equal(new Set(starts.map((result) => result.taskId)).size, 2, `${topic} gives both advisor lanes distinct task IDs`);
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      rows = (await request('list_tasks')).tasks.filter((task) => starts.some((result) => result.taskId === task.id));
+      assert.equal(rows.length, 2, `${topic} stores two advisor task records for ${advisors.join(', ')}`);
+      assert.deepEqual(rows.map((task) => task.advisor).sort(), ['Alex', 'Seth'], `${topic} keeps both stored advisor identities`);
+      assert.ok(rows.every((task) => task.status === 'complete' && task.text === 'done'), `${topic} delivers each advisor result once to its own task`);
+    }
+  }
+
+  // Exact same-advisor replay remains safe and explicitly says that it reused
+  // the open task instead of looking like a fresh start.
+  const sameAdvisor = { name: 'Mi advisor Seth replay', cwd: home, message: '/skill:advisor\nSelected advisor: Seth.\nShould I price this at $99?', lastInput: 'Seth: Should I price this at $99?', capabilityProfile: 'advisor-read', advisor: 'Seth', background: true };
+  const sameAdvisorFirst = await request('run_worker', sameAdvisor);
+  const sameAdvisorReplay = await request('run_worker', sameAdvisor);
+  assert.notEqual(sameAdvisorFirst.duplicate, true, 'the first same-advisor request starts normally');
+  assert.equal(sameAdvisorReplay.duplicate, true, 'exact same-advisor replay is duplicate-suppressed');
+  assert.equal(sameAdvisorReplay.taskId, sameAdvisorFirst.taskId, 'same-advisor replay identifies its reused task ID');
 
   // 8. A freshly queued follow-up must not be overwritten by the previous completed scan.
   await writeTasks([{ id: 'task-new-followup', name: 'new-followup', sessionName: 'new-followup', cwd: '/repo', status: 'running', sessionId: uuid(10), sessionFile: await sessionFile({ id: uuid(10), name: 'new-followup', cwd: '/repo', finalText: 'old complete', at: iso(6000) }), continuedAt: iso(7000), updatedAt: iso(7000), lastInput: 'new prompt' }]);
