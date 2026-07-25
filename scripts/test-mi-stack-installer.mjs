@@ -19,7 +19,7 @@ const stageNames = ['production-gateway', 'production-registry', 'gateway-client
 const stageLog = path.join(tmp, 'stage-log');
 for (const name of stageNames) {
   const gatewayValues = name === 'production-gateway'
-    ? `printf '%s\\n' "$MI_GATEWAY_SERVICE_USER|$MI_GATEWAY_SERVICE_HOME|$MI_GATEWAY_PI_BINARY|$MI_GATEWAY_PI_COMMAND_DIR|$MI_GATEWAY_PI_AGENT_DIR|$MI_GATEWAY_WORK_DIR|$MI_GATEWAY_HEALTH_USER" > ${JSON.stringify(path.join(tmp, 'gateway-values'))}\n`
+    ? `printf '%s\\n' "$MI_GATEWAY_SERVICE_USER|$MI_GATEWAY_SERVICE_HOME|$MI_GATEWAY_PI_BINARY|$MI_GATEWAY_PI_COMMAND_DIR|$MI_GATEWAY_PI_AGENT_DIR|$MI_GATEWAY_WORK_DIR|$MI_GATEWAY_HEALTH_COMMAND|$MI_GATEWAY_HEALTH_USER" > ${JSON.stringify(path.join(tmp, 'gateway-values'))}\n`
     : '';
   await writeFile(path.join(stages, name), `#!/bin/sh\necho ${name} >> ${JSON.stringify(stageLog)}\n${gatewayValues}`);
   await chmod(path.join(stages, name), 0o700);
@@ -39,6 +39,7 @@ const env = {
   MI_GATEWAY_PI_COMMAND_DIR: bin,
   MI_GATEWAY_PI_AGENT_DIR: path.join(home, '.pi/agent'),
   MI_GATEWAY_WORK_DIR: path.join(tmp, 'gateway-work'),
+  MI_GATEWAY_HEALTH_COMMAND: path.join(tmp, 'other-health-command'),
   MI_GATEWAY_HEALTH_USER: 'other-health',
 };
 const run = (args = [], extra = {}) => spawnSync('bash', [path.join(repo, 'scripts/install-mi-stack.sh'), ...args], { env: { ...env, ...extra }, encoding: 'utf8' });
@@ -55,7 +56,7 @@ assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').length, 1, '
 assert.deepEqual((await readFile(stageLog, 'utf8')).trim().split('\n'), stageNames, 'fresh orchestration order');
 assert.equal(
   (await readFile(path.join(tmp, 'gateway-values'), 'utf8')).trim(),
-  `other-user|${home}|${path.join(tmp, 'pi-real')}|${bin}|${path.join(home, '.pi/agent')}|${path.join(tmp, 'gateway-work')}|other-health`,
+  `other-user|${home}|${path.join(tmp, 'pi-real')}|${bin}|${path.join(home, '.pi/agent')}|${path.join(tmp, 'gateway-work')}|${path.join(tmp, 'other-health-command')}|other-health`,
   'stack forwards all portable gateway settings',
 );
 assert.equal((await stat(path.join(home, 'install-mi-stack.sh'))).mode & 0o777, 0o700);
