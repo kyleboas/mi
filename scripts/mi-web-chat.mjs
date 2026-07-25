@@ -12,9 +12,11 @@ import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
 import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
-import { createApproval, logEvent, readApprovals, resolveApproval, writeApprovals } from '../dist/src/state.js';
+import { logEvent } from '../dist/src/state.js';
+import { clearPendingImessageConfirmation, createPendingImessageConfirmation, pendingImessageConfirmation } from './mi-imessage-v2-pending-adapter.mjs';
 import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
+import { miCoordinatorLaunch, miCoordinatorPrompt } from './mi-imessage-coordinator.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
@@ -75,6 +77,7 @@ const loopFactoryWorkflowsDir = process.env.MI_LOOP_FACTORY_WORKFLOWS_DIR || pat
 
 let sendQueue = Promise.resolve();
 const imessageThreadQueues = new Map();
+const imessageDeliveryResponses = new Map();
 const activeJobs = new Map();
 const activeWorkers = new Map();
 const recentNotificationKeys = new Map();
@@ -94,7 +97,7 @@ function capabilityGuardPath() {
   return process.env.MI_CAPABILITY_GUARD || path.join(root, 'pi', 'extensions', 'mi-capability-guard.ts');
 }
 
-async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }) {
+async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }, rights = ['read']) {
   const dir = path.join(miRuntimeDir, 'capabilities');
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
@@ -102,7 +105,7 @@ async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal =
   const grant = {
     id: `${profile}-${Date.now().toString(36)}`,
     resource: `file://${path.resolve(cwd)}`,
-    rights: ['read'],
+    rights,
     constraints: { recursive: true, profile },
     principal,
     createdAt,
@@ -126,6 +129,25 @@ async function withImessageThreadQueue(threadId, fn) {
     release();
     if (imessageThreadQueues.get(key) === queued) imessageThreadQueues.delete(key);
   }
+}
+
+function validImessageDeliveryId(value) {
+  const id = String(value || '').trim();
+  return /^[A-Za-z0-9._:-]{1,200}$/.test(id) ? id : '';
+}
+
+async function withImessageDelivery(threadId, deliveryId, fn) {
+  const id = validImessageDeliveryId(deliveryId);
+  if (!id) return fn();
+  const key = `${safeThreadId(threadId)}:${id}`;
+  const existing = imessageDeliveryResponses.get(key);
+  if (existing && Date.now() - existing.createdAt < 10 * 60 * 1000) return existing.response;
+  const response = await fn();
+  imessageDeliveryResponses.set(key, { createdAt: Date.now(), response });
+  for (const [entryKey, entry] of imessageDeliveryResponses) {
+    if (Date.now() - entry.createdAt > 10 * 60 * 1000) imessageDeliveryResponses.delete(entryKey);
+  }
+  return response;
 }
 
 function now() {
@@ -917,7 +939,9 @@ function messageLooksLikeWorkerFollowup(message, worker) {
 }
 
 async function saveActiveWorkers() {
-  const keep = Array.from(activeWorkers.values()).filter((worker) => workerIsActive(worker) || workerIsRecent(worker));
+  const keep = Array.from(activeWorkers.values())
+    .filter((worker) => workerIsActive(worker) || workerIsRecent(worker))
+    .map(({ process: _process, ...worker }) => worker);
   await writeJsonFile(webWorkersPath, keep);
 }
 
@@ -1078,7 +1102,8 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   let workerPrompt = await buildBackgroundWorkerPrompt(threadId, message, decision);
   if (options.taskId === true) workerPrompt = `${workerPrompt}\n\n${workerCompletionInstruction()}`;
   const startedAt = now();
-  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: options.taskId !== true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
+  const workerCwd = options.cwd || home;
+  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: workerCwd, message: workerPrompt, lastInput: message, background: true, reportToMain: options.taskId !== true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
   const worker = {
     id: result.taskId || result.sessionId || result.sessionFile || `worker_${Date.now().toString(36)}`,
     threadId,
@@ -1090,6 +1115,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
     status: 'running',
     text: message,
     subject: options.subject || '',
+    cwd: workerCwd,
     imessageV2: options.taskId === true,
     correlationId: options.correlationId || (options.taskId === true ? randomUUID() : undefined),
     createdAt: startedAt,
@@ -1416,7 +1442,7 @@ async function monitorBackgroundWorkers() {
   }
   let changed = false;
   for (const worker of Array.from(activeWorkers.values())) {
-    if (!workerIsActive(worker) || worker.formatting) continue;
+    if (!workerIsActive(worker) || worker.formatting || worker.coordinator) continue;
     const existingResult = await workerResultSince(worker).catch(() => undefined);
     if (existingResult) {
       // A V2 result with this stable correlation was already formatted and persisted.
@@ -2220,17 +2246,35 @@ async function buildImessageV2Context(threadId, message) {
 }
 
 const imessageV2UnavailableReply = 'I’m temporarily unable to reach my assistant service. Please try again shortly.';
-const v2TaskCapabilities = new Set(['read', 'write', 'execute', 'external']);
 const v2NeutralReadAck = 'I’ll check that and get back to you.';
+const v2ScopedWriteAck = 'I’ll make that safe change and get back to you.';
+const v2WorkspaceRoot = path.resolve(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(home, 'workflows'));
+const v2WorkspaceCwd = path.resolve(process.env.MI_IMESSAGE_WORK_CWD || v2WorkspaceRoot);
 
 function v2CanonicalObjective(value) {
   return redactV2Text(String(value || '')).replace(/\s+/g, ' ').trim().slice(0, 4000);
 }
 
-function v2ReadOnlyObjective(objective) {
+function v2ScopedWorkspace() {
+  if (v2WorkspaceCwd === v2WorkspaceRoot || v2WorkspaceCwd.startsWith(`${v2WorkspaceRoot}/`)) return v2WorkspaceCwd;
+  return '';
+}
+
+function v2ActionPlan(message) {
+  const objective = v2CanonicalObjective(message);
   const text = objective.toLowerCase();
-  if (!/\b(read|inspect|check|verify|report|summari[sz]e|status|list|find|grep|package|readme)\b/.test(text)) return false;
-  return !/\b(restart|systemctl|service|deploy|publish|merge|delete|write|edit|install|send|message|email|http|curl|network|token|secret|password|key)\b/.test(text);
+  const asksCoordinator = /\b(?:ask|have)\s+(?:terra|sol|luna|claude)\b/.test(text);
+  const actionable = /\b(fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|install|deploy|wire|adjust|improve|tighten|save|remember|remind|schedule|restart|start|stop|send|publish|merge|delete|buy|purchase|pay|auth|login|credential|secret)\b/.test(text);
+  if (!asksCoordinator && !actionable) return undefined;
+  const risky = /\b(deploy|publish|merge|delete|remove\s+(?:all|the|a)?\s*(?:data|database|account|project)|restart|systemctl|service|send|email|message|post|tweet|purchase|buy|pay|spend|auth|login|credential|token|secret|password|api[_ -]?key|install)\b/.test(text);
+  if (risky) return { objective, capability: 'external', risky: true };
+  if (asksCoordinator) return { objective, capability: 'coordinator', risky: false, cwd: v2ScopedWorkspace() || home };
+  if (/^(?:check|read|inspect|verify|list|find)\b/.test(text)) return { objective, capability: 'read', risky: false, cwd: home };
+  const writes = /\b(fix|implement|update|repair|patch|make|add|create|change|remove|build|wire|adjust|improve|tighten)\b/.test(text);
+  if (!writes) return { objective, capability: 'read', risky: false, cwd: home };
+  const cwd = v2ScopedWorkspace();
+  if (!cwd) return { objective, capability: 'write', risky: true };
+  return { objective, capability: 'write', risky: false, cwd };
 }
 
 function v2Affirmative(message) {
@@ -2245,25 +2289,105 @@ function v2ConfirmationQuestion(value) {
   return String(value || '').trim().replace(/[.!?]+$/, '').trim() + '?';
 }
 
-async function v2CreatePendingAction(threadId, objective, capability) {
-  const approval = await createApproval('Confirm this pending iMessage action.', 'iMessage V2 non-read action requires explicit confirmation.');
-  const approvals = await readApprovals();
-  const pending = approvals.find((item) => item.id === approval.id);
-  if (pending) {
-    pending.v2PendingAction = { threadId, objective, capability, confirmationId: approval.id, consumedAt: undefined };
-    await writeApprovals(approvals);
-  }
-  return approval.id;
+function v2ConfirmReply(plan) {
+  if (plan.capability === 'write') return 'This would make a change outside the approved work area. Do you want to approve it?';
+  return 'This could make a real change or contact another service. Do you want to approve it?';
 }
 
-async function v2PendingAction(threadId) {
-  const approvals = await readApprovals();
-  return approvals.find((item) => item.status === 'pending' && item.v2PendingAction?.threadId === threadId && !item.v2PendingAction?.consumedAt);
+function v2PendingAction(threadId) {
+  return pendingImessageConfirmation(threadId);
 }
 
-async function v2ClearPendingAction(threadId) {
-  const pending = await v2PendingAction(threadId);
-  if (pending) await resolveApproval(pending.id, 'rejected', 'cancelled');
+function v2ClearPendingAction(threadId) {
+  clearPendingImessageConfirmation(threadId);
+}
+
+async function v2StartWorker(threadId, message, plan, options = {}) {
+  const isWrite = plan.capability === 'write';
+  const result = await startBackgroundWorker(threadId, plan.objective, {
+    appendUser: options.appendUser === true,
+    ackReply: isWrite ? v2ScopedWriteAck : v2NeutralReadAck,
+    ackSource: 'imessage-v2-task-ack', taskId: true, userSource: 'imessage-v2-user', subject: plan.objective,
+    capabilityProfile: isWrite ? 'worker-write-scoped' : 'worker-read', cwd: plan.cwd || home,
+    allowDuplicate: false, decision: { start: true, reason: isWrite ? 'iMessage V2 scoped write task' : 'iMessage V2 read task' },
+  });
+  return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
+}
+
+function coordinatorAssistantText(event) {
+  const content = event?.message?.content;
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text).join('\n').trim();
+}
+
+async function finishImessageCoordinator(worker, findings, isError = false) {
+  if (worker.completedAt) return;
+  const completion = await formatImessageV2Completion(worker, findings, isError);
+  worker.status = isError ? 'error' : 'complete';
+  worker.completedAt = now();
+  worker.updatedAt = now();
+  worker.resultText = completion;
+  await appendThreadMessage(worker.threadId, 'assistant', completion, {
+    unread: false, source: isError ? 'mi-worker-error' : 'mi-worker-result', taskId: workerCorrelationId(worker), generation: 1,
+  });
+  await saveActiveWorkers().catch(() => undefined);
+  await emitTurnEvent(root, { stage: 'terminal', outcome: isError ? 'error' : 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(worker) }).catch(() => undefined);
+}
+
+async function startImessageCoordinator(threadId, message, plan) {
+  const correlationId = randomUUID();
+  const history = await recentThreadContextForWorker(threadId, message);
+  const guard = capabilityGuardPath();
+  const coordinatorGrants = await writeCapabilityGrantsFile(plan.cwd || home, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read', 'write']);
+  const launch = miCoordinatorLaunch({
+    piCommand: process.env.PI_CMD || 'pi', cwd: plan.cwd || home, runtimeDir: miRuntimeDir, model: workerModel,
+    capabilityGuardPath: existsSync(guard) ? guard : '',
+    env: reducedPiEnv({ MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: coordinatorGrants, MI_CAPABILITY_AUDIT_FILE: path.join(miRuntimeDir, 'capability-audit.jsonl') }),
+  });
+  const worker = {
+    id: `coordinator_${correlationId}`, threadId, taskId: correlationId, correlationId, name: 'iMessage coordinator',
+    status: 'running', text: message, subject: plan.objective, cwd: launch.cwd, imessageV2: true, coordinator: true,
+    createdAt: now(), updatedAt: now(), awaitingResultSince: now(),
+  };
+  const child = spawn(launch.command, launch.args, { cwd: launch.cwd, env: launch.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  // A missing Pi binary can emit before the first awaited state write below.
+  // Attach a listener now so it becomes a correlated failure, not a web crash.
+  let launchFailed = false;
+  child.on('error', () => { launchFailed = true; });
+  worker.process = child;
+  activeWorkers.set(worker.id, worker);
+  await saveActiveWorkers();
+  const reply = 'I’ll ask the team and get back to you.';
+  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-task-ack', taskId: correlationId });
+  let buffer = '';
+  let finalText = '';
+  let settled = false;
+  const settle = async (isError = false, fallback = '') => {
+    if (settled) return;
+    settled = true;
+    await finishImessageCoordinator(worker, finalText || fallback || 'The coordinator finished without a usable result.', isError);
+  };
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    while (buffer.includes('\n')) {
+      const index = buffer.indexOf('\n');
+      const line = buffer.slice(0, index).trim();
+      buffer = buffer.slice(index + 1);
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type === 'message_end') finalText = coordinatorAssistantText(event) || finalText;
+        if (event.type === 'agent_settled') void settle();
+      } catch {}
+    }
+  });
+  child.on('error', () => { void settle(true, 'I could not start the coordinator.'); });
+  child.on('exit', (code) => { if (!settled) void settle(code !== 0, code === 0 ? '' : 'The coordinator stopped before it finished.'); });
+  if (launchFailed) void settle(true, 'I could not start the coordinator.');
+  else child.stdin.end(`${JSON.stringify({ type: 'prompt', id: correlationId, message: miCoordinatorPrompt({ message, context: history }) })}\n`);
+  await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: correlationId }).catch(() => undefined);
+  return { ok: true, reply, handoff: true, taskId: correlationId };
 }
 
 
@@ -2285,10 +2409,35 @@ async function handleImessageV2(threadId, message) {
   const turnStartedAt = Date.now();
   await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message }).catch(() => undefined);
   if (v2Cancellation(message)) {
-    await v2ClearPendingAction(threadId);
+    v2ClearPendingAction(threadId);
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', 'Okay, I won’t proceed with that action.', { unread: false, source: 'imessage-v2-confirm-cancelled' });
     return { ok: true, reply: 'Okay, I won’t proceed with that action.', handoff: false };
+  }
+  const pending = v2PendingAction(threadId);
+  if (pending && v2Affirmative(message)) {
+    // Luna's durable confirmation module will replace this adapter. Until then,
+    // confirmations acknowledge the request but never grant an unrestricted path.
+    v2ClearPendingAction(threadId);
+    const reply = 'I have your confirmation. I’ll keep this action blocked until the approved action path is available.';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirmed' });
+    return { ok: true, reply, handoff: false, confirmationId: pending.id };
+  }
+  const directPlan = v2ActionPlan(message);
+  if (directPlan) {
+    if (directPlan.risky) {
+      const pendingAction = createPendingImessageConfirmation(threadId, directPlan);
+      const reply = v2ConfirmReply(directPlan);
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
+      return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
+    }
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    const result = directPlan.capability === 'coordinator'
+      ? await startImessageCoordinator(threadId, message, directPlan)
+      : await v2StartWorker(threadId, message, directPlan);
+    return result;
   }
   const invocation = await runImessageV2(message, threadId);
   if (invocation.failure) {
@@ -2299,51 +2448,17 @@ async function handleImessageV2(threadId, message) {
   const decision = invocation.decision;
   await emitTurnEvent(root, { stage: 'decision', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message, durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
   if (decision.kind === 'task') {
-    const objective = v2CanonicalObjective(decision.objective);
-    const capability = v2TaskCapabilities.has(decision.capability) ? decision.capability : undefined;
-    const pending = await v2PendingAction(threadId);
-    const approved = Boolean(pending && v2Affirmative(message) && decision.confirmationId === pending.id &&
-      pending.v2PendingAction?.confirmationId === decision.confirmationId && pending.v2PendingAction?.objective === objective &&
-      pending.v2PendingAction?.capability === capability);
-    if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
-      if (!approved) {
-        const reply = 'What exactly should I act on?';
-        await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
-        return { ok: true, reply, handoff: false };
-      }
-      await resolveApproval(pending.id, 'approved', 'bound confirmation accepted');
-    }
-    if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
-      const reply = 'That action is approved, but this channel can only dispatch read-only checks.';
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
-      return { ok: true, reply, handoff: false };
-    }
-    const explicit = v2ExplicitCorrelation(message, threadId);
-    if (explicit.invalid || (decision.continueTaskId && !activeWorkerForV2Continuation(threadId, decision.continueTaskId))) {
-      const reply = 'Which earlier task should I continue?';
+    const plan = v2ActionPlan(decision.objective);
+    if (plan?.risky || !plan) {
+      const reply = 'What exactly should I act on?';
       await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
       await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
       return { ok: true, reply, handoff: false };
     }
-    const active = explicit.worker || (decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined);
-    if (active) {
-      const result = await continueBackgroundWorker(threadId, active, objective, {
-        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
-        ackSource: 'imessage-v2-task-ack', taskId: true, subject: objective,
-      });
-      await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(result.worker), durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
-      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
-    }
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    const result = await startBackgroundWorker(threadId, objective, {
-      appendUser: false, ackReply: v2NeutralReadAck, ackSource: 'imessage-v2-task-ack', taskId: true,
-      userSource: 'imessage-v2-user', subject: objective, capabilityProfile: 'worker-read', allowDuplicate: true,
-      decision: { start: true, reason: 'iMessage V2 read-only task gate' },
-    });
-    await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(result.worker), durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
-    return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
+    return plan.capability === 'coordinator'
+      ? startImessageCoordinator(threadId, message, plan)
+      : v2StartWorker(threadId, message, plan);
   }
   const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
   const reply = decision.kind === 'confirm'
@@ -2429,9 +2544,13 @@ async function handle(req, res) {
       if (Array.from(message).length > maxMessageChars) return sendJson(res, 400, { ok: false, error: `message too long; max ${maxMessageChars} chars` });
       const threadId = safeThreadId(body.thread || imessageThread);
 
+      const deliveryId = body.deliveryId || body.messageId || req.headers['x-mi-message-id'];
       return await withImessageThreadQueue(threadId, async () => {
       // V2 is deliberately first: all legacy iMessage regex routing remains below as an immediate rollback path.
-      if (imessageV2Enabled) return sendJson(res, 200, await handleImessageV2(threadId, message));
+      if (imessageV2Enabled) {
+        const result = await withImessageDelivery(threadId, deliveryId, () => handleImessageV2(threadId, message));
+        return sendJson(res, 200, result);
+      }
       const {
         imessageAskFirstReply, imessageIsBareUrl, imessageLooksLikePriorWorkStatusQuestion,
         imessagePriorWorkStatusReply, imessageWorkAck, imessageWorkDecision,

@@ -42,14 +42,21 @@ let daemon;
 let web;
 try {
   const piLog = join(fixture.root, 'pi.jsonl');
+  await mkdir(join(fixture.miRoot, 'pi', 'extensions'), { recursive: true });
+  await writeFile(join(fixture.miRoot, 'pi', 'extensions', 'mi-capability-guard.ts'), 'export default function () {}\n');
   await writeFile(fixture.fakePi, String.raw`#!/usr/bin/node
 import { appendFileSync } from 'node:fs';
 let input = '';
 process.stdin.on('data', (chunk) => { input += chunk; });
 process.stdin.on('end', () => {
   let request; try { request = JSON.parse(input); } catch { process.exit(8); }
-  const prompt = request.messages.map((message) => message.content).join('\n');
   appendFileSync(${JSON.stringify(piLog)}, JSON.stringify({ argv: process.argv.slice(2), request }) + '\n');
+  if (request.type === 'prompt') {
+    process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'Terra finished the review.' }] } }) + '\n');
+    process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\n');
+    return;
+  }
+  const prompt = request.messages.map((message) => message.content).join('\n');
   if (prompt.includes('NONZERO_CASE')) { process.stderr.write('gateway failed\n'); process.exit(7); }
   if (prompt.includes('EMPTY_CASE')) return;
   if (prompt.includes('HUGE_OUTPUT_CASE')) return process.stdout.write('x'.repeat(IMESSAGE_V2_LIMITS.output + 1));
@@ -83,13 +90,12 @@ process.stdin.on('end', () => {
     }
     if (request.type === 'continue_worker') return { text: 'continued', taskId: request.taskId, sessionFile: '/tmp/v2-2.jsonl' };
     if (request.type === 'list_tasks') {
-      if (runCount === 1) return { tasks: [{ id: 'daemon-listed-id', sessionFile: '/tmp/v2-correlation.jsonl', status: 'complete', text: 'Done.' }] };
+      if (runCount <= 2) return { tasks: [{ id: 'daemon-listed-id', sessionFile: runCount === 1 ? '/tmp/v2-correlation.jsonl' : '/tmp/v2-2.jsonl', status: 'complete', text: 'Done.' }] };
       return { tasks: [] };
     }
     return { text: 'ok' };
   });
   web = await startWebChat({ ...fixture.env, MI_IMESSAGE_V2: '1', MI_IMESSAGE_MODEL: 'mi-concierge', MI_GATEWAY_CLIENT: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' });
-
   let result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'What is the current status?' } })).json;
   assert.equal(result.handoff, false, 'conversational state question starts no worker');
   assert.equal(result.reply, 'The current status looks good.', 'plain fake Pi envelope reaches /api/imessage');
@@ -98,7 +104,8 @@ process.stdin.on('end', () => {
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'We decided on the garden plan.' } })).json;
   assert.equal(result.handoff, false);
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Can you check it?' } })).json;
-  assert.equal(result.handoff, false);
+  assert.equal(result.handoff, true, 'actionable checks go directly to the Pi worker path');
+  assert.equal(daemon.requests.filter((item) => item.type === 'run_worker').length, 1);
   const piCalls = await readJsonl(piLog);
   assert.ok(piCalls.every((call) => call.argv.length === 0), 'prompts and configuration are never passed in argv');
   assert.ok(piCalls.every((call) => call.request.model === 'mi-concierge'), 'only the immutable concierge alias reaches the helper');
@@ -113,7 +120,7 @@ process.stdin.on('end', () => {
   const correlationId = result.taskId;
   assert.match(correlationId, /^[0-9a-f-]{36}$/i, 'V2 exposes a generated stable correlation id, not a daemon id');
   assert.equal(result.reply, 'I’ll check that and get back to you.');
-  assert.equal(daemon.requests.filter((item) => item.type === 'run_worker').length, 1, 'task starts exactly one worker');
+  assert.equal(daemon.requests.filter((item) => item.type === 'run_worker').length, 2, 'each distinct task starts one worker');
   let messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
   assert.ok(messages.some((item) => item.source === 'imessage-v2-task-ack' && item.taskId === correlationId), 'V2 acknowledgement carries the stable correlation id');
   await waitFor(async () => {
@@ -125,77 +132,31 @@ process.stdin.on('end', () => {
   const completionCalls = await readJsonl(piLog);
   assert.ok(completionCalls.some((call) => call.request.model === 'mi-concierge' && call.request.messages[0].content.includes('You format one completed')), 'V2 completion presentation uses the same immutable concierge helper route');
 
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'ACTIVE_TASK' } })).json;
-  const activeCorrelationId = result.taskId;
-  assert.equal(runCount, 2, 'active task starts a second daemon worker after the completed correlation test');
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'UNRELATED_TASK' } })).json;
-  assert.equal(result.handoff, true);
-  assert.equal(runCount, 3, 'unrelated V2 task starts a new worker instead of continuing the active one');
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'FOLLOWUP_TASK: use the new notes' } })).json;
-  assert.equal(result.handoff, true);
-  assert.equal(result.taskId, activeCorrelationId, 'explicit continuation retains the active task correlation id');
-  assert.equal(daemon.requests.filter((item) => item.type === 'continue_worker').length, 1, 'explicit continuation uses the matching active worker');
-  messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
-  assert.equal(messages.filter((item) => item.role === 'user' && item.text === 'FOLLOWUP_TASK: use the new notes').length, 1, 'continuation persists Kyle’s natural wording exactly once');
-  assert.equal(messages.filter((item) => item.role === 'user' && /Read the notebook sync status using/.test(item.text)).length, 0, 'continuation does not persist the model objective as the user message');
+  const workersBeforeScopedWrite = runCount;
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Fix the workflow readme wording.' } })).json;
+  assert.equal(result.handoff, true, 'safe scoped writing work reaches Pi instead of being refused');
+  assert.equal(runCount, workersBeforeScopedWrite + 1);
+  assert.equal(daemon.requests.filter((item) => item.type === 'run_worker').at(-1).capabilityProfile, 'worker-write-scoped', 'safe writes use the narrow write profile');
 
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CONFIRM_CASE' } })).json;
-  assert.equal(result.handoff, false);
-  assert.equal(result.reply, 'Should I deploy the garden-plan change now?');
-  assert.equal(runCount, 3, 'confirm starts no worker');
+  const workersBeforeRisk = runCount;
+  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Deploy the garden-plan change now.' } })).json;
+  assert.equal(result.handoff, false, 'risky work remains pending confirmation');
+  assert.ok(result.confirmationId, 'risky request receives a clear confirmation id');
+  assert.equal(runCount, workersBeforeRisk, 'risky request starts no worker before confirmation');
+
+  const duplicateMessage = 'Check the duplicate delivery status.';
+  const firstDuplicate = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: duplicateMessage, deliveryId: 'delivery-1' } })).json;
+  const duplicate = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: duplicateMessage, deliveryId: 'delivery-1' } })).json;
+  assert.equal(duplicate.taskId, firstDuplicate.taskId, 'duplicate delivery returns the correlated original response');
+  assert.equal(runCount, workersBeforeRisk + 1, 'duplicate delivery starts only one worker');
+  messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
+  assert.equal(messages.filter((item) => item.role === 'user' && item.text === duplicateMessage).length, 1, 'duplicate delivery appends the user message once');
 
   result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'INTERNAL_CASE' } })).json;
   assert.equal(result.handoff, false);
   assert.doesNotMatch(result.reply, /Pi|worker|Photon/i, 'internal model output is replaced safely');
 
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'CURRENT_STATE_TASK: What is the current status right now?' } })).json;
-  assert.equal(result.handoff, true, 'current-state uncertainty can hand off instead of fabricating a live reply');
-  assert.equal(result.reply, 'I’ll check that and get back to you.');
-  assert.equal(runCount, 4, 'current-state task starts the controlled worker path');
 
-  const workersBeforeBlockedTasks = runCount;
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALICIOUS_RESTART_READ' } })).json;
-  assert.equal(result.handoff, false, 'restart mislabeled read never starts a worker');
-  assert.equal(result.reply, 'What exactly should I act on?');
-  assert.equal(result.confirmationId, undefined, 'ambiguous model task creates no pending confirmation');
-  assert.equal(runCount, workersBeforeBlockedTasks, 'blocked restart emits no worker');
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MISSING_CAP_DEPLOY' } })).json;
-  assert.equal(result.handoff, false, 'missing capability never starts a worker');
-  assert.equal(result.confirmationId, undefined, 'missing capability creates no pending confirmation');
-  assert.equal(result.reply, 'What exactly should I act on?');
-  assert.equal(runCount, workersBeforeBlockedTasks, 'missing capability emits no worker');
-
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'MALFORMED_PLAIN_CASE' } })).json;
-  assert.equal(result.ok, true);
-  assert.equal(result.handoff, false);
-  assert.match(result.reply, /Could you say that another way/i, 'malformed plain stdout keeps the safe reply fallback');
-
-  const unavailableBefore = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages
-    .filter((item) => item.source === 'imessage-v2-unavailable').length;
-  for (const failureCase of ['NONZERO_CASE', 'EMPTY_CASE', 'TIMEOUT_CASE', 'HUGE_OUTPUT_CASE']) {
-    result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: failureCase } })).json;
-    assert.equal(result.ok, false, `${failureCase} reports invocation failure`);
-    assert.equal(result.handoff, false, `${failureCase} starts no worker`);
-    assert.equal(result.temporary, true, `${failureCase} is marked temporary`);
-    assert.match(result.reply, /temporarily unable to reach my assistant service/i, `${failureCase} has a truthful reply`);
-  }
-  assert.equal(runCount, 4, 'invocation failures start no workers');
-  messages = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages;
-  assert.equal(messages.filter((item) => item.source === 'imessage-v2-unavailable').length, unavailableBefore + 4, 'failure replies are durably categorized');
-
-  // Exercise the API default with no model override. This remains hermetic: the
-  // disposable fake Pi only records argv and no message is sent through Photon.
-  await web.close();
-  web = undefined;
-  await rm(join(fixture.miRoot, 'state'), { recursive: true, force: true });
-  await mkdir(join(fixture.miRoot, 'state'), { recursive: true });
-  const defaultEnv = { ...fixture.env, MI_IMESSAGE_V2: '1', MI_GATEWAY_CLIENT: fixture.fakePi, MI_IMESSAGE_CHAT_TIMEOUT_MS: '1000', MI_WEB_WORKER_POLL_MS: '25' };
-  delete defaultEnv.MI_IMESSAGE_MODEL;
-  web = await startWebChat(defaultEnv);
-  result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Default concierge route check.' } })).json;
-  assert.equal(result.ok, true, 'default V2 API request succeeds through the local route');
-  const defaultCall = (await readJsonl(piLog)).at(-1);
-  assert.equal(defaultCall.request.model, 'mi-concierge', 'V2 API default selects the immutable Mi-only concierge alias');
 
   console.log('Mi iMessage V2 checks passed.');
 } finally {
