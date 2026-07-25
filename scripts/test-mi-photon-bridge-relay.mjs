@@ -112,18 +112,17 @@ async function runRelayCase(root, name, workerReply) {
   await mkdir(dir, { recursive: true });
   const eventsPath = join(dir, 'events.json');
   const sendsPath = join(dir, 'sends.jsonl');
-  await writeFile(eventsPath, JSON.stringify([
-    {
-      space: { id: workerReply.spaceId || `${name}-space`, phone: '+15551234567' },
-      message: {
-        ...(workerReply.omitMessageId ? {} : { id: workerReply.messageId || `${name}-message` }),
-        direction: 'inbound',
-        sender: { id: '+15551234567' },
-        timestamp: workerReply.timestamp,
-        content: { type: 'text', text: workerReply.body || 'check detect status' },
-      },
+  const event = {
+    space: { id: workerReply.spaceId || `${name}-space`, phone: '+15551234567' },
+    message: {
+      ...(workerReply.omitMessageId ? {} : { id: workerReply.messageId || `${name}-message` }),
+      direction: 'inbound',
+      sender: { id: '+15551234567' },
+      ...(workerReply.timestamp === undefined ? {} : { timestamp: workerReply.timestamp }),
+      content: { type: 'text', text: workerReply.body || 'check detect status' },
     },
-  ], null, 2));
+  };
+  await writeFile(eventsPath, JSON.stringify(workerReply.repeatIdentical ? [event, structuredClone(event)] : [event], null, 2));
   await writeFile(sendsPath, '');
 
   const mi = await startMiServer(workerReply);
@@ -147,9 +146,15 @@ async function runRelayCase(root, name, workerReply) {
     assert.match(result.stdout, /imessage handoff - polling for (?:task|legacy worker) result/, `${name}: bridge should poll after handoff`);
 
     const sends = (await readJsonl(sendsPath)).filter((entry) => entry.kind === 'message');
-    assert.equal(sends.length, 2, `${name}: bridge should send ack plus worker follow-up`);
-    assert.equal(sends[0].text, 'On it. I’ll follow up here.');
-    assert.equal(sends[1].text, workerReply.text);
+    const expectedMessages = workerReply.repeatIdentical ? 4 : 2;
+    assert.equal(sends.length, expectedMessages, `${name}: bridge should send ack plus worker follow-up for each inbound event`);
+    if (workerReply.repeatIdentical) {
+      assert.equal(sends.filter((entry) => entry.text === 'On it. I’ll follow up here.').length, 2);
+      assert.equal(sends.filter((entry) => entry.text === workerReply.text).length, 2);
+    } else {
+      assert.equal(sends[0].text, 'On it. I’ll follow up here.');
+      assert.equal(sends[1].text, workerReply.text);
+    }
     assert.equal(sends[0].phone, '+15551234567');
     assert.equal(sends[1].phone, '+15551234567');
     if (workerReply.delayMs) {
@@ -160,8 +165,15 @@ async function runRelayCase(root, name, workerReply) {
 
     const inboundCall = mi.calls.find((call) => call.method === 'POST' && call.path === '/api/imessage');
     assert.ok(inboundCall && inboundCall.body.message === (workerReply.body || 'check detect status') && inboundCall.body.thread === 'main', `${name}: bridge should forward inbound iMessage to Mi web`);
-    assert.equal(typeof inboundCall.body.deliveryId, 'string', `${name}: bridge should send a bounded delivery identifier`);
-    assert.ok(/^[A-Za-z0-9._:-]{1,200}$/.test(inboundCall.body.deliveryId), `${name}: delivery identifier uses the web API format`);
+    if (workerReply.repeatIdentical) {
+      const inboundCalls = mi.calls.filter((call) => call.method === 'POST' && call.path === '/api/imessage');
+      assert.equal(inboundCalls.length, 2, `${name}: identical events without identity must both be processed`);
+      assert.equal(inboundCalls[0].body.deliveryId, undefined, `${name}: no identity must fail toward processing without inventing a dedupe id`);
+      assert.equal(inboundCalls[1].body.deliveryId, undefined, `${name}: no identity must not retain plaintext or a guessed id`);
+    } else {
+      assert.equal(typeof inboundCall.body.deliveryId, 'string', `${name}: bridge should send a bounded delivery identifier`);
+      assert.ok(/^[A-Za-z0-9._:-]{1,200}$/.test(inboundCall.body.deliveryId), `${name}: delivery identifier uses the web API format`);
+    }
     assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
     return inboundCall.body.deliveryId;
   } finally {
@@ -174,8 +186,9 @@ try {
   const retryIdOne = await runRelayCase(root, 'delayed-exact-task-id-one', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
   const retryIdTwo = await runRelayCase(root, 'delayed-exact-task-id-two', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
   assert.equal(retryIdOne, retryIdTwo, 'retrying the same upstream event reuses its delivery identifier');
-  const fallbackIdOne = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', text: 'Fallback identifier result.' });
-  const fallbackIdTwo = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', text: 'Fallback identifier result.' });
+  await runRelayCase(root, 'identical-no-identity', { source: 'mi-worker-result', omitMessageId: true, repeatIdentical: true, taskId: 'wanted-task', text: 'Both distinct messages must be processed.' });
+  const fallbackIdOne = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, timestamp: '2026-01-01T00:00:00.000Z', taskId: 'wanted-task', text: 'Fallback identifier result.' });
+  const fallbackIdTwo = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, timestamp: '2026-01-01T00:00:00.000Z', taskId: 'wanted-task', text: 'Fallback identifier result.' });
   assert.equal(fallbackIdOne, fallbackIdTwo, 'fallback digest stays stable when the upstream event has no id');
   const differentBucketMessage = await runRelayCase(root, 'fallback-different-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'a different message', text: 'Fallback identifier result.' });
   const sameBucketMessage = await runRelayCase(root, 'fallback-same-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'check detect status', text: 'Fallback identifier result.' });

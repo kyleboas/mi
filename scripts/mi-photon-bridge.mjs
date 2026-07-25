@@ -158,6 +158,11 @@ function stableDeliveryId(space, message) {
     direction: String(message?.direction || ''),
     content: normalize(message?.content || null),
   };
+  // Without an upstream ID or timestamp there is no stable event identity.
+  // Process the event rather than suppressing a possibly new message that
+  // happens to have identical content. Stable metadata above still dedups
+  // normal redelivery, and this fallback retains no plaintext.
+  if (!upstream && !stableFields.timestamp) return undefined;
   return `photon-${createHash('sha256').update(JSON.stringify(stableFields)).digest('hex').slice(0, 32)}`;
 }
 
@@ -313,10 +318,12 @@ function trackFollowUp(task) {
 async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
   const id = stableDeliveryId(space, message);
-  if (seen.has(id)) return;
-  seen.set(id, Date.now());
-  // Remove only the oldest entry, preserving replay protection for the rest.
-  if (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value);
+  if (id && seen.has(id)) return;
+  if (id) {
+    seen.set(id, Date.now());
+    // Remove only the oldest entry, preserving replay protection for the rest.
+    if (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value);
+  }
 
   const sender = senderFor(space, message);
   const spaceId = String(space?.id || message?.space?.id || '');

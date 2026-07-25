@@ -7,6 +7,10 @@ const routingSource = await readFile(new URL('./mi-imessage-routing.mjs', import
 const photonSource = await readFile(new URL('./mi-photon-bridge.mjs', import.meta.url), 'utf8');
 const notifySource = await readFile(new URL('../src/notify.ts', import.meta.url), 'utf8');
 
+assert.match(source, /const IMESSAGE_DELIVERY_RESPONSE_TTL_MS = 10 \* 60 \* 1000/, 'iMessage delivery responses have a clear TTL');
+assert.match(source, /const MAX_IMESSAGE_DELIVERY_RESPONSES = 1000/, 'iMessage delivery responses have a clear capacity limit');
+assert.match(source, /while \(imessageDeliveryResponses\.size > MAX_IMESSAGE_DELIVERY_RESPONSES\)[\s\S]*delete\(imessageDeliveryResponses\.keys\(\)\.next\(\)\.value\)/, 'delivery cache evicts the oldest entries first');
+assert.match(source, /now - entry\.createdAt >= IMESSAGE_DELIVERY_RESPONSE_TTL_MS/, 'delivery cache removes expired entries before lookup');
 assert.match(source, /function messageLooksConversational\(message\)[\s\S]*what\\s\+time\\s\+is\\s\+it/, 'web chat routing must classify time questions as conversational');
 assert.match(source, /function messageLooksConversational\(message\)[\s\S]*let me see it/, 'web chat routing must classify view-only requests as conversational');
 assert.match(source, /function messageLooksConversational\(message\)[\s\S]*handoff[\s\S]*worker/, 'web chat routing must classify handoff meta-questions as conversational');

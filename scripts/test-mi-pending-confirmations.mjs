@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   classifyConfirmationReply,
   clearPendingConfirmation,
@@ -15,6 +16,13 @@ const statePath = join(root, 'state', 'pending-confirmations.json');
 const at = (value) => new Date(value);
 const lockPath = `${statePath}.lock`;
 await mkdir(join(root, 'state'), { recursive: true });
+const defaultPathProbe = spawnSync(process.execPath, ['--input-type=module', '-e', `import { createPendingConfirmation } from './dist/src/pending-confirmations.js'; await createPendingConfirmation({ threadId: 'default-root', summary: 'safe', riskReason: 'test' });`], {
+  cwd: new URL('..', import.meta.url).pathname,
+  env: { ...process.env, HOME: root, MI_ROOT: '' },
+  encoding: 'utf8',
+});
+assert.equal(defaultPathProbe.status, 0, defaultPathProbe.stderr);
+assert.equal(await stat(join(root, 'assistant', 'state', 'pending-confirmations.json')).then(() => true, () => false), true, 'unset MI_ROOT uses ~/assistant state');
 try {
   // A live owner and a fresh malformed file are both fail-closed. Neither is
   // old enough to justify recovery.

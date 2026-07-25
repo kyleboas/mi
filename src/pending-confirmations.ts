@@ -43,7 +43,7 @@ const MAX_PID = 4_194_304;
 type LockMetadata = { pid: number; createdAt: number; nonce: string };
 
 function statePath(override?: string) {
-  return override || path.join(process.env.MI_ROOT || path.join(os.homedir(), '.mi'), 'state', 'pending-confirmations.json');
+  return override || path.join(process.env.MI_ROOT || path.join(os.homedir(), 'assistant'), 'state', 'pending-confirmations.json');
 }
 
 function checkText(value: unknown, max: number, name: string): string {

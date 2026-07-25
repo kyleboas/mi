@@ -84,6 +84,8 @@ const loopFactoryWorkflowsDir = process.env.MI_LOOP_FACTORY_WORKFLOWS_DIR || pat
 let sendQueue = Promise.resolve();
 const imessageThreadQueues = new Map();
 const imessageDeliveryResponses = new Map();
+const IMESSAGE_DELIVERY_RESPONSE_TTL_MS = 10 * 60 * 1000;
+const MAX_IMESSAGE_DELIVERY_RESPONSES = 1000;
 const activeJobs = new Map();
 const activeWorkers = new Map();
 const recentNotificationKeys = new Map();
@@ -148,13 +150,19 @@ function validImessageDeliveryId(value) {
 async function withImessageDelivery(threadId, deliveryId, fn) {
   const id = validImessageDeliveryId(deliveryId);
   if (!id) return fn();
+  const now = Date.now();
+  for (const [entryKey, entry] of imessageDeliveryResponses) {
+    if (now - entry.createdAt >= IMESSAGE_DELIVERY_RESPONSE_TTL_MS) imessageDeliveryResponses.delete(entryKey);
+  }
   const key = `${safeThreadId(threadId)}:${id}`;
   const existing = imessageDeliveryResponses.get(key);
-  if (existing && Date.now() - existing.createdAt < 10 * 60 * 1000) return existing.response;
+  if (existing) return existing.response;
   const response = await fn();
   imessageDeliveryResponses.set(key, { createdAt: Date.now(), response });
-  for (const [entryKey, entry] of imessageDeliveryResponses) {
-    if (Date.now() - entry.createdAt > 10 * 60 * 1000) imessageDeliveryResponses.delete(entryKey);
+  // Map order is insertion order, so evict the oldest entries first. This
+  // keeps replay protection bounded even when delivery IDs never repeat.
+  while (imessageDeliveryResponses.size > MAX_IMESSAGE_DELIVERY_RESPONSES) {
+    imessageDeliveryResponses.delete(imessageDeliveryResponses.keys().next().value);
   }
   return response;
 }
