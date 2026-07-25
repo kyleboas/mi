@@ -13,7 +13,7 @@ import { appendThreadMessage, getThread, threadContext } from '../dist/src/threa
 import { runFlueChat } from '../dist/src/flue.js';
 import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
-import { clearPendingImessageConfirmation, createPendingImessageConfirmation, pendingImessageConfirmation } from './mi-imessage-v2-pending-adapter.mjs';
+import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
 import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 import { miCoordinatorLaunch, miCoordinatorPrompt } from './mi-imessage-coordinator.mjs';
@@ -2289,17 +2289,19 @@ function v2ConfirmationQuestion(value) {
   return String(value || '').trim().replace(/[.!?]+$/, '').trim() + '?';
 }
 
-function v2ConfirmReply(plan) {
-  if (plan.capability === 'write') return 'This would make a change outside the approved work area. Do you want to approve it?';
-  return 'This could make a real change or contact another service. Do you want to approve it?';
+function v2ConfirmReply(plan, confirmationId) {
+  const detail = plan.capability === 'write'
+    ? 'This would make a change outside the approved work area.'
+    : 'This could make a real change or contact another service.';
+  return `${detail} Reply "confirm ${confirmationId}" to approve or "deny ${confirmationId}" to cancel.`;
 }
 
-function v2PendingAction(threadId) {
-  return pendingImessageConfirmation(threadId);
+async function v2PendingAction(threadId) {
+  return readPendingConfirmation(threadId);
 }
 
-function v2ClearPendingAction(threadId) {
-  clearPendingImessageConfirmation(threadId);
+async function v2ClearPendingAction(threadId) {
+  return clearPendingConfirmation(threadId);
 }
 
 async function v2StartWorker(threadId, message, plan, options = {}) {
@@ -2409,26 +2411,35 @@ async function handleImessageV2(threadId, message) {
   const turnStartedAt = Date.now();
   await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message }).catch(() => undefined);
   if (v2Cancellation(message)) {
-    v2ClearPendingAction(threadId);
+    await v2ClearPendingAction(threadId);
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', 'Okay, I won’t proceed with that action.', { unread: false, source: 'imessage-v2-confirm-cancelled' });
     return { ok: true, reply: 'Okay, I won’t proceed with that action.', handoff: false };
   }
-  const pending = v2PendingAction(threadId);
-  if (pending && v2Affirmative(message)) {
-    // Luna's durable confirmation module will replace this adapter. Until then,
-    // confirmations acknowledge the request but never grant an unrestricted path.
-    v2ClearPendingAction(threadId);
-    const reply = 'I have your confirmation. I’ll keep this action blocked until the approved action path is available.';
-    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirmed' });
-    return { ok: true, reply, handoff: false, confirmationId: pending.id };
+  const pending = await v2PendingAction(threadId);
+  if (pending) {
+    const confirmation = await classifyConfirmationReply({ threadId, reply: message });
+    if (confirmation.kind === 'confirm') {
+      const reply = 'I have your confirmation. This high-impact action remains blocked until its reviewed execution path is available.';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirmed' });
+      return { ok: true, reply, handoff: false, confirmationId: confirmation.record.id };
+    }
+    if (confirmation.kind === 'deny') {
+      const reply = 'Okay, I won’t proceed with that action.';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-cancelled' });
+      return { ok: true, reply, handoff: false };
+    }
   }
   const directPlan = v2ActionPlan(message);
   if (directPlan) {
     if (directPlan.risky) {
-      const pendingAction = createPendingImessageConfirmation(threadId, directPlan);
-      const reply = v2ConfirmReply(directPlan);
+      const pendingAction = await createPendingConfirmation({
+        threadId, summary: 'Requested iMessage action',
+        riskReason: directPlan.capability === 'write' ? 'Write outside the approved work area' : 'High-impact iMessage action',
+      });
+      const reply = v2ConfirmReply(directPlan, pendingAction.id);
       await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
       await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
       return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
