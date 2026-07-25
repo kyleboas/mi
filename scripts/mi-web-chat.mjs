@@ -2434,6 +2434,16 @@ async function handleImessageV2(threadId, message) {
   }
   const directPlan = v2ActionPlan(message);
   if (directPlan) {
+    const directContinuation = !directPlan.risky && /^\s*continue\b/i.test(message)
+      ? v2StableContinuationCandidates(threadId).filter(workerIsActive).at(-1)
+      : undefined;
+    if (directContinuation) {
+      const result = await continueBackgroundWorker(threadId, directContinuation, directPlan.objective, {
+        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
+        ackSource: 'imessage-v2-task-ack', taskId: true, subject: directPlan.objective,
+      });
+      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
+    }
     if (directPlan.risky) {
       const pendingAction = await createPendingConfirmation({
         threadId, summary: 'Requested iMessage action',
@@ -2459,12 +2469,36 @@ async function handleImessageV2(threadId, message) {
   const decision = invocation.decision;
   await emitTurnEvent(root, { stage: 'decision', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message, durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
   if (decision.kind === 'task') {
-    const plan = v2ActionPlan(decision.objective);
+    const objective = v2CanonicalObjective(decision.objective);
+    // A model may phrase a safe check without one of our routing verbs. Its
+    // declared read capability still gets the restricted read worker, while
+    // every other capability must pass the deterministic risk gate above.
+    const plan = v2ActionPlan(objective) || (decision.capability === 'read'
+      ? { objective, capability: 'read', risky: false, cwd: home }
+      : undefined);
     if (plan?.risky || !plan) {
       const reply = 'What exactly should I act on?';
       await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
       await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
       return { ok: true, reply, handoff: false };
+    }
+    const namedActive = decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined;
+    const implicitActive = !decision.continueTaskId && /^\s*continue\b/i.test(message)
+      ? v2StableContinuationCandidates(threadId).filter(workerIsActive).at(-1)
+      : undefined;
+    const active = namedActive || implicitActive;
+    if (decision.continueTaskId && !active) {
+      const reply = 'Which earlier task should I continue?';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
+      return { ok: true, reply, handoff: false };
+    }
+    if (active) {
+      const result = await continueBackgroundWorker(threadId, active, objective, {
+        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
+        ackSource: 'imessage-v2-task-ack', taskId: true, subject: objective,
+      });
+      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
     }
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     return plan.capability === 'coordinator'
