@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 
@@ -128,6 +129,33 @@ function senderFor(space, message) {
   return String(message?.sender?.id || space?.phone || message?.space?.phone || '').trim();
 }
 
+const acceptedDeliveryId = /^[A-Za-z0-9._:-]{1,200}$/;
+
+function stableDeliveryId(space, message) {
+  const upstream = [message?.id, message?.messageId, message?.eventId, message?.guid]
+    .map((value) => String(value || '').trim())
+    .find(Boolean);
+  if (upstream && acceptedDeliveryId.test(upstream)) return upstream;
+
+  // Photon normally supplies message.id. If it does not, this digest uses
+  // only stable event metadata, never message text. It is bounded to 32 hex
+  // characters. Events with the same sender, space, timestamp, direction,
+  // content type, and upstream id can collide; that is the deliberate scope
+  // of the fallback because no unique upstream identifier was available.
+  const content = message?.content || {};
+  const stableFields = {
+    version: 1,
+    upstream: upstream || '',
+    spaceId: String(space?.id || message?.space?.id || ''),
+    sender: senderFor(space, message),
+    timestamp: String(message?.timestamp || message?.createdAt || ''),
+    direction: String(message?.direction || ''),
+    contentType: String(content?.type || ''),
+    contentId: String(content?.id || content?.attachmentId || ''),
+  };
+  return `photon-${createHash('sha256').update(JSON.stringify(stableFields)).digest('hex').slice(0, 32)}`;
+}
+
 function contentTextFor(content) {
   if (!content || typeof content !== 'object') return '';
   if (content.type === 'text') return String(content.text || '').trim();
@@ -187,12 +215,12 @@ async function miJson(path, init = {}) {
   return data;
 }
 
-async function askImessage(message) {
+async function askImessage(message, deliveryId) {
   const startedAt = Date.now();
   console.log(`imessage send chars=${String(message || '').length}`);
   const data = await miJson('/api/imessage', {
     method: 'POST',
-    body: JSON.stringify({ thread: miThread, message }),
+    body: JSON.stringify({ thread: miThread, message, deliveryId }),
   });
   await emitTurnEvent(root, { stage: 'ack', outcome: data.handoff ? 'ok' : 'skipped', route: 'photon', modelProfile: 'none', turn: String(data.taskId || message), durationMs: Date.now() - startedAt }).catch(() => undefined);
   return { reply: cleanReply(data.reply), handoff: Boolean(data.handoff), taskId: String(data.taskId || '').trim(), startedAt };
@@ -279,7 +307,7 @@ function trackFollowUp(task) {
 
 async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
-  const id = String(message?.id || `${space?.id}:${message?.timestamp || Date.now()}`);
+  const id = stableDeliveryId(space, message);
   if (seen.has(id)) return;
   seen.add(id);
   if (seen.size > 5000) seen.clear();
@@ -308,7 +336,7 @@ async function handle(space, message) {
     // Do not wrap the Mi call in space.responding(): Photon typing/read-state RPCs
     // can fail with upstream connection drops before Mi is even asked. Typing is
     // cosmetic and best-effort; replies must continue without it.
-    const result = await askImessage(body);
+    const result = await askImessage(body, id);
     const ackSent = await send(space, result.reply);
     await stopTypingNow();
     if (result.handoff && ackSent) {

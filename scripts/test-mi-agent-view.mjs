@@ -398,6 +398,15 @@ assert.match(daemon, /function existingOpenIssueMessage[\s\S]*needs input: \$\{t
 assert.match(daemon, /\["complete", "completed", "done", "error", "stopped", "paused", "inactive"\]\.includes\(taskStatus\)/, 'daemon treats paused tasks as terminal when merging stale busy sessions');
 assert.match(daemon, /function workerKeys\(task, fallbackName\)[\s\S]*task\.sessionId[\s\S]*task\.sessionFile[\s\S]*sessionFingerprint\(task\)/, 'daemon tracks active workers by task and session identity');
 assert.match(daemon, /const sessions = await listPiSessionTasks\(\)[\s\S]*const task = \[\.\.\.tasks, \.\.\.sessions\]\.find[\s\S]*const activeWorker = task \? workerKeys\(task, name\)\.map[\s\S]*activeWorker\.expectedStop = true;[\s\S]*activeWorker\.proc\.kill\(\)/, 'daemon marks stop_task worker exits as expected before SIGTERM and can stop discovered pi sessions');
+const stopTaskSource = daemon.slice(daemon.indexOf('async function stopTask('), daemon.indexOf('async function dismissTask('));
+const completeGuardOffset = stopTaskSource.indexOf('if (task && ["complete", "completed", "done"].includes(taskStatus))');
+assert.ok(completeGuardOffset >= 0, 'stop_task has the stale-complete guard');
+const earlyMarkOffset = stopTaskSource.indexOf('earlyActiveWorker.expectedStop = true;');
+const taskReadOffset = stopTaskSource.indexOf('const tasks = await readTasks();');
+const sessionScanOffset = stopTaskSource.indexOf('const sessions = await listPiSessionTasks();');
+assert.ok(earlyMarkOffset > taskReadOffset && earlyMarkOffset < sessionScanOffset, 'normal stops mark known live workers before the slow session scan');
+assert.match(stopTaskSource.slice(taskReadOffset, earlyMarkOffset), /earlyTask[\s\S]*!\["complete", "completed", "done"\]/, 'early stop marking checks the stored task status');
+assert.match(stopTaskSource.slice(completeGuardOffset), /return \{ text: `\$\{name\} is already complete` \}[\s\S]*if \(earlyActiveWorker\) earlyActiveWorker\.expectedStop = true;[\s\S]*if \(activeWorker\) activeWorker\.expectedStop = true;/, 'normal stop behavior still marks workers after the complete guard');
 assert.match(daemon, /if \(worker\.expectedStop\)[\s\S]*worker_expected_stop[\s\S]*return/, 'daemon does not overwrite paused stopped tasks with SIGTERM errors');
 assert.match(daemon, /\}\)\(\)\.catch\(async \(error\) => \{[\s\S]*if \(worker\.expectedStop\)[\s\S]*return;[\s\S]*status: "error"/, 'daemon ignores expected SIGTERM during background continue startup');
 assert.match(daemon, /status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined[\s\S]*stopped by Escape; needs input/, 'daemon stop_task parks stopped workers in needs input');

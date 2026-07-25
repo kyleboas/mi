@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtemp, chmod, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -13,8 +13,25 @@ import {
 const root = await mkdtemp(join(tmpdir(), 'mi-pending-confirmations-'));
 const statePath = join(root, 'state', 'pending-confirmations.json');
 const at = (value) => new Date(value);
+const lockPath = `${statePath}.lock`;
+await mkdir(join(root, 'state'), { recursive: true });
 try {
+  // A live owner and a fresh malformed file are both fail-closed. Neither is
+  // old enough to justify recovery.
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: Date.now(), nonce: 'a'.repeat(32) }), { mode: 0o600 });
+  await assert.rejects(() => createPendingConfirmation({ threadId: 'live-lock', summary: 'safe', riskReason: 'test' }, { statePath }), /Could not lock/);
+  await rm(lockPath, { force: true });
+  await writeFile(lockPath, '{not metadata', { mode: 0o600 });
+  await assert.rejects(() => createPendingConfirmation({ threadId: 'fresh-malformed-lock', summary: 'safe', riskReason: 'test' }, { statePath }), /Could not lock/);
+  await rm(lockPath, { force: true });
+
+  // An old lock whose recorded process is absent can be recovered. The
+  // metadata stays bounded and owner-readable only.
+  const staleTime = Date.now() - 120_000;
+  await writeFile(lockPath, JSON.stringify({ pid: 4_000_000, createdAt: staleTime, nonce: 'b'.repeat(32) }), { mode: 0o600 });
+  await utimes(lockPath, staleTime / 1000, staleTime / 1000);
   const first = await createPendingConfirmation({ threadId: 'thread-a', summary: 'Send the approved reply', riskReason: 'This sends an external message', continuationRef: 'resume-1', objective: 'Deploy the garden plan change', actionClass: 'confirmed-high-impact' }, { statePath, now: at('2026-01-01T00:00:00Z') });
+  assert.equal(await stat(lockPath).then(() => true, () => false), false, 'recovered lock is cleaned after the normal path');
   const storedFirst = await readPendingConfirmation('thread-a', { statePath, now: at('2026-01-01T00:01:00Z') });
   assert.equal(storedFirst.id, first.id);
   assert.equal(storedFirst.objective, 'Deploy the garden plan change', 'bounded approved objective persists for one confirmation');
@@ -26,6 +43,17 @@ try {
 
   assert.equal((await classifyConfirmationReply({ threadId: 'thread-b', reply: `confirm ${second.id}` }, { statePath, now: at('2026-01-01T00:02:01Z') })).kind, 'not_found');
   assert.equal((await classifyConfirmationReply({ threadId: 'thread-a', reply: 'okay maybe' }, { statePath, now: at('2026-01-01T00:02:01Z') })).kind, 'unclear');
+
+  const concurrentRecord = await createPendingConfirmation({ threadId: 'thread-concurrent', summary: 'Send the approved reply', riskReason: 'This sends an external message' }, { statePath, now: at('2026-01-01T00:02:20Z') });
+  const concurrent = await Promise.all([
+    classifyConfirmationReply({ threadId: 'thread-concurrent', reply: `confirm ${concurrentRecord.id}` }, { statePath, now: at('2026-01-01T00:02:30Z') }),
+    classifyConfirmationReply({ threadId: 'thread-concurrent', reply: `confirm ${concurrentRecord.id}` }, { statePath, now: at('2026-01-01T00:02:30Z') }),
+  ]);
+  assert.deepEqual(concurrent.map((result) => result.kind).sort(), ['confirm', 'not_found'], 'concurrent resolution authorizes a record only once');
+
+  const replay = await createPendingConfirmation({ threadId: 'thread-replay', summary: 'Send the approved reply', riskReason: 'This sends an external message' }, { statePath, now: at('2026-01-01T00:02:45Z') });
+  assert.equal((await classifyConfirmationReply({ threadId: 'thread-replay', reply: `confirm ${replay.id}` }, { statePath, now: at('2026-01-01T00:02:46Z') })).kind, 'confirm');
+  assert.equal((await classifyConfirmationReply({ threadId: 'thread-replay', reply: `confirm ${replay.id}` }, { statePath, now: at('2026-01-01T00:02:47Z') })).kind, 'not_found', 'replayed confirmation cannot authorize again');
   assert.equal((await classifyConfirmationReply({ threadId: 'thread-a', reply: `confirm ${second.id}` }, { statePath, now: at('2026-01-01T00:03:00Z') })).kind, 'confirm');
   assert.equal((await classifyConfirmationReply({ threadId: 'thread-a', reply: `confirm ${second.id}` }, { statePath, now: at('2026-01-01T00:03:01Z') })).kind, 'not_found');
 

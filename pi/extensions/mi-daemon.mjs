@@ -976,11 +976,18 @@ async function listAllTasksLocked(options = {}) {
 async function stopTask(request) {
   const requested = [request.taskId, request.id, request.sessionFile, request.actualSessionFile, request.sessionId, request.sessionName, request.name].filter(Boolean).map(String);
   if (requested.length === 0) throw new Error("taskId required");
-  // Mark a live worker before task/session reads. Those reads can wait on a
-  // settling RPC, and a late finish must never publish while stop is pending.
+  // Keep the live-worker reference while task/session reads settle. Mark it
+  // only after the stale-complete check, so a live worker is not silenced by
+  // a record that is already terminal.
   const earlyActiveWorker = requested.map((key) => activeWorkers.get(key)).find(Boolean);
-  if (earlyActiveWorker) earlyActiveWorker.expectedStop = true;
   const tasks = await readTasks();
+  const earlyTask = tasks.find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
+  const earlyTaskStatus = String(earlyTask?.status || "").toLowerCase();
+  if (earlyActiveWorker && earlyTask && !["complete", "completed", "done"].includes(earlyTaskStatus)) {
+    // Mark a known nonterminal task before the session scan. The scan can
+    // wait on a settling session, and a late finish must not publish.
+    earlyActiveWorker.expectedStop = true;
+  }
   const sessions = await listPiSessionTasks();
   const task = [...tasks, ...sessions].find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
@@ -989,8 +996,10 @@ async function stopTask(request) {
   if (task && ["complete", "completed", "done"].includes(taskStatus)) {
     return { text: `${name} is already complete` };
   }
-  // Set this before the state write so a concurrent settled callback cannot
-  // publish a result after the user has stopped its worker.
+  // Set this after the stale-complete guard but before the state write so a
+  // concurrent settled callback cannot publish after the user stops it. This
+  // also covers a worker found only by the session scan.
+  if (earlyActiveWorker) earlyActiveWorker.expectedStop = true;
   if (activeWorker) activeWorker.expectedStop = true;
   if (task) {
     await upsertTask({ ...task, status: "paused", needsUser: true, needsUserReason: "stopped by Escape", finishedAt: undefined, error: undefined, progress: "stopped by Escape; needs input", updatedAt: new Date().toISOString() });

@@ -34,6 +34,13 @@ const MAX_REFERENCE = 160;
 const MAX_ACTION_CLASS = 80;
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const MAX_TTL_MS = 24 * 60 * 60 * 1000;
+// A lock must be old before recovery is even considered. This covers the
+// short window where a process created the file but has not written metadata.
+const LOCK_STALE_MS = 30 * 1000;
+const MAX_LOCK_BYTES = 512;
+const MAX_PID = 4_194_304;
+
+type LockMetadata = { pid: number; createdAt: number; nonce: string };
 
 function statePath(override?: string) {
   return override || path.join(process.env.MI_ROOT || path.join(os.homedir(), '.mi'), 'state', 'pending-confirmations.json');
@@ -119,13 +126,103 @@ async function writeState(file: string, records: PendingConfirmation[]) {
   }
 }
 
+function parseLockMetadata(text: string): LockMetadata | null {
+  if (Buffer.byteLength(text) > MAX_LOCK_BYTES) return null;
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== 'object') return null;
+    const metadata = value as Partial<LockMetadata>;
+    const pid = metadata.pid;
+    const createdAt = metadata.createdAt;
+    if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_PID) return null;
+    if (typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt <= 0) return null;
+    if (typeof metadata.nonce !== 'string' || !/^[a-f0-9]{32}$/u.test(metadata.nonce)) return null;
+    return { pid, createdAt, nonce: metadata.nonce };
+  } catch {
+    return null;
+  }
+}
+
+async function lockSnapshot(lock: string) {
+  const info = await stat(lock).catch(() => undefined);
+  if (!info) return null;
+  // Oversized or unreadable metadata is invalid, but its age and inode still
+  // let us recover it after the conservative stale period.
+  if (info.size > MAX_LOCK_BYTES) return { info, text: undefined, metadata: null };
+  const text = await readFile(lock, 'utf8').catch(() => undefined);
+  return { info, text, metadata: text === undefined ? null : parseLockMetadata(text) };
+}
+
+function ownerIsAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but cannot be inspected. Treat every
+    // other uncertainty as alive too; only ESRCH proves it is absent.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function sameLockSnapshot(left: Awaited<ReturnType<typeof lockSnapshot>>, right: Awaited<ReturnType<typeof lockSnapshot>>) {
+  return Boolean(left && right
+    && left.info.ino === right.info.ino
+    && left.info.size === right.info.size
+    && left.info.mtimeMs === right.info.mtimeMs
+    && left.text === right.text);
+}
+
+async function recoverStaleLock(lock: string) {
+  const first = await lockSnapshot(lock);
+  if (!first) return false;
+  const ageMs = Date.now() - Math.max(first.info.mtimeMs, first.metadata?.createdAt || 0);
+  if (ageMs < LOCK_STALE_MS) return false;
+  if (first.metadata && ownerIsAlive(first.metadata.pid)) return false;
+
+  // Only one process may decide to remove a stale lock. The recovery marker
+  // is acquired with mkdir, which is atomic. A process that sees a marker
+  // waits rather than touching either the old lock or the new owner lock.
+  const recovery = `${lock}.recovery`;
+  try {
+    await mkdir(recovery, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+  try {
+    await writeFile(path.join(recovery, 'owner'), JSON.stringify({ pid: process.pid, createdAt: Date.now(), nonce: randomBytes(16).toString('hex') }), { mode: 0o600, flag: 'wx' });
+    const current = await lockSnapshot(lock);
+    if (!sameLockSnapshot(first, current)) return false;
+    // Do not use force here: if another process already removed this exact
+    // lock, the failed unlink leaves the replacement lock untouched.
+    await rm(lock, { force: false });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  } finally {
+    await rm(recovery, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function withLock<T>(file: string, action: () => Promise<T>): Promise<T> {
   const lock = `${file}.lock`;
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await chmod(path.dirname(file), 0o700);
   for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
+      const metadata: LockMetadata = { pid: process.pid, createdAt: Date.now(), nonce: randomBytes(16).toString('hex') };
       const handle = await open(lock, 'wx', 0o600);
-      await handle.close();
+      try {
+        await handle.writeFile(JSON.stringify(metadata));
+        await handle.sync();
+        await chmod(lock, 0o600);
+      } catch (error) {
+        await rm(lock, { force: true }).catch(() => undefined);
+        throw error;
+      } finally {
+        await handle.close();
+      }
       try {
         return await action();
       } finally {
@@ -133,6 +230,7 @@ async function withLock<T>(file: string, action: () => Promise<T>): Promise<T> {
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (await recoverStaleLock(lock)) continue;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }

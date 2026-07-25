@@ -116,13 +116,14 @@ async function runRelayCase(root, name, workerReply) {
     {
       space: { id: `${name}-space`, phone: '+15551234567' },
       message: {
-        id: `${name}-message`,
+        ...(workerReply.omitMessageId ? {} : { id: workerReply.messageId || `${name}-message` }),
         direction: 'inbound',
         sender: { id: '+15551234567' },
         content: { type: 'text', text: 'check detect status' },
       },
     },
   ], null, 2));
+  await writeFile(sendsPath, '');
 
   const mi = await startMiServer(workerReply);
   try {
@@ -156,8 +157,12 @@ async function runRelayCase(root, name, workerReply) {
       assert.ok(firstPoll && Date.parse(sends[0].ts) <= firstPoll.at, `${name}: acknowledgement must precede result polling`);
     }
 
-    assert.ok(mi.calls.some((call) => call.method === 'POST' && call.path === '/api/imessage' && call.body.message === 'check detect status' && call.body.thread === 'main'), `${name}: bridge should forward inbound iMessage to Mi web`);
+    const inboundCall = mi.calls.find((call) => call.method === 'POST' && call.path === '/api/imessage');
+    assert.ok(inboundCall && inboundCall.body.message === 'check detect status' && inboundCall.body.thread === 'main', `${name}: bridge should forward inbound iMessage to Mi web`);
+    assert.equal(typeof inboundCall.body.deliveryId, 'string', `${name}: bridge should send a bounded delivery identifier`);
+    assert.ok(/^[A-Za-z0-9._:-]{1,200}$/.test(inboundCall.body.deliveryId), `${name}: delivery identifier uses the web API format`);
     assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
+    return inboundCall.body.deliveryId;
   } finally {
     await mi.close();
   }
@@ -165,7 +170,13 @@ async function runRelayCase(root, name, workerReply) {
 
 const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
 try {
-  await runRelayCase(root, 'delayed-exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  const retryIdOne = await runRelayCase(root, 'delayed-exact-task-id-one', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  const retryIdTwo = await runRelayCase(root, 'delayed-exact-task-id-two', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  assert.equal(retryIdOne, retryIdTwo, 'retrying the same upstream event reuses its delivery identifier');
+  const fallbackIdOne = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', text: 'Fallback identifier result.' });
+  const fallbackIdTwo = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', text: 'Fallback identifier result.' });
+  assert.equal(fallbackIdOne, fallbackIdTwo, 'fallback digest stays stable when the upstream event has no id');
+  assert.match(fallbackIdOne, /^photon-[a-f0-9]{32}$/, 'fallback identifier is a bounded digest and does not contain message text');
   await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
   console.log('Mi Photon bridge relay checks passed.');
