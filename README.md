@@ -1,12 +1,11 @@
 # Mi
 
-Mi is a small local assistant interface built around five surfaces only:
+Mi is a small local assistant interface built around four surfaces:
 
 1. `mi` — the main Mi conversation.
 2. `mi agents` — the live background-agent view.
-3. `mi check` — one minimal proactive check-in.
-4. `mi tick` — the single scheduled loop for reminders, configured monitor health, and the once-daily brief.
-5. the Mi pi extension — side-channel Mi commands inside pi.
+3. `mi tick` — scheduled reminders, memory upkeep, capability-file cleanup, and iMessage repair checks.
+4. the Mi pi extension — side-channel Mi commands inside pi.
 
 Everything else in this repo exists to support those surfaces.
 
@@ -77,57 +76,36 @@ Useful in-view commands:
 
 Mi discovers pi sessions from the default pi session store (`~/.pi/agent/sessions`), reconciles stale running rows after daemon restarts, and persists the merged `mi agents` view so tasks do not disappear unless cleared.
 
-## `mi check`
-
-`mi check` is the minimal proactive loop. It reads local Mi state, runs a small fixed set of checks, dedupes repeated observations, appends one useful message to the main Mi thread, and optionally sends a notification.
-
-Shape: read state → run checks → dedupe → append message → maybe start safe read-only triage for allowlisted monitor failures → maybe start repair worker for crashed checks → maybe notify.
-
-Default checks:
-
-- `pendingApprovals`
-- `failedCrons`
-- `dailyBrief`
-
-Non-error proactive messages usually end with `No action taken.` Dynamic project questions are the exception: they ask one concrete question and do not add a footer. Crashed checks report the error in the main thread and automatically request a background repair worker. The proactive loop itself still does not edit files, deploy, merge, delete, change config, or approve anything.
-
-`mi check health-check` is separate from the default check set. It reads configured monitor inputs from `assistants/monitors.md`, including Tactics Journal health sidecars from `/home/kyle/code/research/.logs` by default and Mi reminder cron state, stores transitions in `state/monitor-health.json`, and speaks only when a monitor changes state or recovers. It now goes live by default for allowlisted stale/degraded configured monitors by starting a safe read-only triage worker with the explicit `worker-read` capability. That worker may inspect and summarize only; any edit, deploy, merge, config change, secret access, or approval still requires the normal approval path. Human-required states such as Railway auth/link problems or Cloudflare billing/forbidden problems notify without starting a worker.
-
-Safe auto-action controls: set `MI_AUTO_ACTIONS_ENABLED=false` to disable live triage, `MI_AUTO_ACTION_INSPECT_MAX_PER_DAY` to cap read-only triage starts per day, or `MI_AUTO_ACTIONS_MAX_PER_DAY` as a fallback cap. Budget state is stored in `state/auto-actions.json`.
-
-`mi check question` is also separate from the default check set. It asks one dynamic question tied to current projects or explicit goals, suppresses generic questions, avoids repeats, and starts no work by itself.
-
-```bash
-mi check
-mi check health-check
-mi check question
-```
-
 ## `mi tick`
 
-`mi tick` is the single Mi-owned scheduled entrypoint. It runs due reminder-only Mi crons, checks configured monitor health, runs the iMessage send-failure repair monitor, sends the daily brief once after the configured morning hour, may ask dynamic project questions during non-quiet hours, runs weekly Pi conversation loop discovery, and runs Loop Factory digest/build-ready checks. It uses a lock file so overlapping timer invocations do not race state.
+`mi tick` is the single Mi-owned scheduled entrypoint. It:
 
-Dynamic project questions use `MI_QUESTIONS_ENABLED`, `MI_QUESTIONS_MAX_PER_DAY`, `MI_QUESTIONS_QUIET_BEFORE`, `MI_QUESTIONS_QUIET_AFTER`, and `MI_QUESTIONS_MIN_GAP_HOURS`. The daily max is a cap, not a target: Mi skips a question when it cannot find a specific, useful project or goal question.
+- runs due reminder-only crons from `~/mi/state/crons.json`;
+- removes expired capability grant files;
+- runs memory consolidation when it is due; and
+- runs the iMessage send-failure repair monitor.
 
-When the Photon bridge is running, proactive notifications can also be delivered as outbound iMessages through the bridge's local-only notify endpoint. The tick installer enables this by default with `MI_PROACTIVE_IMESSAGE_NOTIFY=true`; set it to `false` to keep notices only in Mi. Pushover is opt-in only via `MI_PUSHOVER_NOTIFY=1` or emergency fallback `MI_PUSHOVER_FALLBACK=1`.
+A lock at `state/tick.lock` prevents overlapping runs. The systemd timer runs every minute, while the repair monitor limits itself to once every 15 minutes by default (`MI_IMESSAGE_MONITOR_INTERVAL_MS`).
 
-The iMessage repair monitor runs from `mi tick` at most once every 15 minutes (`MI_IMESSAGE_MONITOR_INTERVAL_MS`). It checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, and recent Mi thread iMessage activity. Safe repair attempts restart the Photon bridge plus local Mi user services, then verify recovery before sending a plain-English iMessage confirmation. Unrepaired bridge failures are written to Mi main; Pushover fallback is sent only when `MI_PUSHOVER_FALLBACK=1` or `MI_PUSHOVER_NOTIFY=1`. Incident records are appended to `state/imessage-monitor.jsonl`; only redacted metadata and short previews are stored.
+When the Photon bridge is running, tick notices can use its local-only outbound endpoint. The stack installer sets `MI_PROACTIVE_IMESSAGE_NOTIFY=true`; set it to `false` in the tick service to keep these notices out of iMessage. Pushover is opt-in through `MI_PUSHOVER_NOTIFY=1` or `MI_PUSHOVER_FALLBACK=1`.
 
-Pi conversation loop discovery mines approved Pi session logs from the last 90 days for recurring, painful work loops. It stores aggregate state at `~/.pi/agent/state/loop-discovery.json`, updates a managed aggregate block in `~/NOTES.md`, and sends a compact top-5 iMessage brief when candidates meet the threshold. Scheduled runs only send the brief; replying with a number or candidate name starts a scoped background grilling task in `~/workflows` and records the selected candidate in Loop Factory.
+The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, and recent Mi thread activity. A repair attempt restarts the Photon bridge and the user services named by `MI_IMESSAGE_REPAIR_USER_SERVICES`, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
 
-Loop Factory captures explicit user phrases such as “this is a loop”, “make this a workflow”, “automate this recurring thing”, “I keep doing this”, and “next time do this automatically”. It stores aggregate state at `~/.pi/agent/state/loop-factory.json`, maintains a separate managed `~/NOTES.md` block, creates draft specs under `~/workflows`, runs one active scoped grilling session at a time, treats `r`/`R` as accepting the recommended answer, detects build-ready specs via a `<!-- loop-factory:build_ready -->` marker, and asks for `queue now`, `later`, or `never` before implementation.
-
-Manual run:
+Add reminder crons explicitly:
 
 ```bash
-mi loop-discovery --force
-mi loop-discovery --notify
-mi loop-discovery --select 2
+mi cron add stand-up --every 1d --message "Stand-up time"
+mi cron add appointment --at 2030-01-02T15:00:00Z --message "Appointment"
+mi cron list
+mi cron check
+mi cron remove stand-up
 ```
 
-Arbitrary command crons are legacy/deprecated; prefer reminder-only crons plus configured monitors and scoped repair workers.
+Prompt crons also exist and name a Mi thread. Arbitrary command crons remain only as a legacy, deprecated form; use reminder or prompt crons for new entries.
 
-The timer is installed with the complete Mi stack; use the single production command in **Mi stack installation** below.
+The old proactive check-in, health/question checks, configured-monitor loop, daily brief, and scheduled workflow scans are removed. `mi check <assistant>` still exists only to validate one assistant Markdown file.
+
+The timer is installed with the complete Mi stack; use the production command in **Mi stack installation** below.
 
 ## Mi pi extension
 
@@ -200,17 +178,15 @@ Normal installation and repair has one user-facing command (run normally; it req
 
 Use `/home/kyle/install-mi-stack.sh --check` for a non-secret health/configuration summary or `--dry-run` to list stages without mutation. The operation installs the production gateway and registry, brokered client helper, dynamic Tailscale TLS/web service, loopback Photon bridge, daemon, timer, and user/system units. It also removes temporary eval aliases and restores production while preserving eval harness files. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
 
-The installer creates/enables:
-
-- `/etc/systemd/system/mi-photon-bridge.service` — Photon/iMessage transport bridge.
-
-The service loads `/etc/agent-secrets/projects/assistant/photon.secret` with `EnvironmentFile=` and runs the bridge as `kyle`. It does not print or read secret values into the agent shell.
+The installer creates the system Photon bridge unit and the user web, daemon, and tick units. The Photon unit loads its broker-managed secret file with `EnvironmentFile=`. It does not print credential values into the agent shell.
 
 For automatic repair from unprivileged `mi tick`, install the narrow sudoers rule that permits only restarting `mi-photon-bridge.service`:
 
 ```bash
-sudo ./scripts/install-mi-imessage-repair-sudoers-root.sh
+sudo MI_USER="$(id -un)" ./scripts/install-mi-imessage-repair-sudoers-root.sh
 ```
+
+For a separate host and phone number, follow [`docs/second-vps-setup.md`](docs/second-vps-setup.md). Do not copy an existing Mi home or state directory.
 
 ## Development
 
