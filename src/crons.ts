@@ -249,21 +249,24 @@ export async function runCron(cron: MiCron, options: { flueChat?: (message: stri
   return result;
 }
 
-export async function tickCrons(options: { remindersOnly?: boolean; flueChat?: (message: string) => Promise<FlueChatResult>; turnCronLimit?: number } = {}) {
+export async function tickCrons(options: { remindersOnly?: boolean; flueChat?: (message: string) => Promise<FlueChatResult>; turnCronLimit?: number; notificationLimit?: number } = {}) {
   const crons = await readCrons();
   const ran: Array<{ name: string; status: 'ok' | 'error' | 'skipped' }> = [];
   let turnCronsRun = 0;
+  let notificationsRun = 0;
   const turnCronLimit = options.turnCronLimit ?? Number(process.env.MI_TURN_CRONS_PER_TICK || 2);
+  const notificationLimit = options.notificationLimit ?? Number.POSITIVE_INFINITY;
   for (const cron of crons) {
     if (!due(cron)) continue;
     if (options.remindersOnly && cron.command) {
       ran.push({ name: cron.name, status: 'skipped' });
       continue;
     }
-    if (cron.prompt && turnCronsRun >= turnCronLimit) {
+    if (notificationsRun >= notificationLimit || (cron.prompt && turnCronsRun >= turnCronLimit)) {
       ran.push({ name: cron.name, status: 'skipped' });
       continue;
     }
+    notificationsRun += 1;
     if (cron.prompt) turnCronsRun += 1;
     const result = await runCron(cron, { flueChat: options.flueChat });
     if (result.status !== 'skipped') {
@@ -279,7 +282,9 @@ export async function tickCrons(options: { remindersOnly?: boolean; flueChat?: (
 }
 
 export async function tickReminderCrons() {
-  return tickCrons({ remindersOnly: true });
+  const configured = Number(process.env.MI_TICK_NOTIFICATION_LIMIT || 10);
+  const notificationLimit = Number.isFinite(configured) ? Math.max(0, Math.floor(configured)) : 10;
+  return tickCrons({ remindersOnly: true, notificationLimit });
 }
 
 export function cronPaths() { return { cronsPath: CRONS_PATH, logPath: LOG_PATH }; }

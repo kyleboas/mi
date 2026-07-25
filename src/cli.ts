@@ -17,10 +17,6 @@ import { assistantPath } from './assistant.js';
 import { checkAssistant, runAssistant } from './runner.js';
 import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
-import { runMiCheck } from './proactive.js';
-import { generateProjectsStatus } from './project-status.js';
-import { readDelegations } from './delegations.js';
-import { acceptProposal, readProposalQueue, queuedProposals, resolveProposal } from './proposals.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import { runMiTick } from './tick.js';
 import { memoryPaths, readMemory, readMemoryHistory, runDreamConsolidation } from './memory.js';
@@ -87,15 +83,8 @@ Usage:
   mi compact [thread]             Compact old read messages in a thread
   mi agents                       Open mi agents live background agent view
   mi pi-commands --json           List Pi slash commands and Mi agents dispatch classes
-  mi check                        Run one proactive Mi check-in
-  mi check health-check           Check configured monitors and repair only stale/degraded ones
-  mi check question               Ask one dynamic project or goal question
-  mi tick                         Run due reminders, monitor health, daily brief, questions, weekly loop discovery, and Loop Factory
-  mi project-status               Regenerate ~/pi-docs/projects-status.md
-  mi status                       One-screen Mi services, monitors, budgets, and pending decisions
+  mi tick                         Run written crons, memory upkeep, and iMessage health repair
   mi approvals [approve|reject <id>] List or resolve pending approvals
-  mi proposals [accept|reject <n>] List or resolve queued proposals
-  mi delegations                  Show active standing delegations
   mi loop-discovery [--force] [--dry-run] [--notify] [--select <value>]
                                   Mine Pi sessions for recurring workflow candidates
   mi loop-factory capture <text>  Capture a user-noticed recurring loop
@@ -185,77 +174,11 @@ async function checkCommand(args: string[]) {
   if (!result.ok) process.exitCode = 1;
 }
 
-async function proactiveCheckCommand(args: string[]) {
-  const checkIds = args.length > 0 ? args : undefined;
-  const result = await runMiCheck({ checkIds });
-  console.log(result.message);
-  if (result.skipped.length > 0 && result.notices.length === 0) console.log(`Skipped ${result.skipped.length} duplicate notice(s).`);
-}
-
 async function tickCommand() {
   const result = await runMiTick();
-  for (const item of result.reminders) console.log(`reminder ${item.name}: ${item.status}`);
-  console.log(result.health.message);
-  if (result.dailyBrief) console.log(result.dailyBrief.message);
-  else if (result.skippedDailyBrief) console.log('Daily brief not due.');
-  if (result.weeklyReview?.message) console.log(result.weeklyReview.message);
-  if (result.loopDiscovery && result.loopDiscovery.status !== 'skipped') console.log(result.loopDiscovery.message);
-  if (result.loopFactory && result.loopFactory.status !== 'skipped') console.log(result.loopFactory.message);
-}
-
-async function statusCommand() {
-  const approvals = (await readApprovals()).filter((approval) => approval.status === 'pending');
-  const proposals = queuedProposals(await readProposalQueue());
-  const health = await runMiCheck({ checkIds: ['health-check'] });
-  const delegations = await readDelegations();
-  console.log('Mi status');
-  console.log(`Monitors: ${health.notices.length === 0 ? 'ok' : `${health.notices.length} notice(s)`}`);
-  console.log(`Pending approvals: ${approvals.length}`);
-  console.log(`Queued proposals: ${proposals.length}`);
-  console.log(`Standing delegations: ${delegations.length}`);
-  if (approvals.length > 0) approvals.slice(0, 5).forEach((approval, index) => console.log(`${index + 1}. approval ${approval.id}: ${approval.reason}`));
-  if (proposals.length > 0) proposals.slice(0, 3).forEach((proposal, index) => console.log(`${index + 1}. proposal ${proposal.id}: ${proposal.title}`));
-}
-
-async function proposalsCommand(args: string[]) {
-  const subcommand = args[0] || 'list';
-  if (subcommand === 'list' || subcommand === 'queued') {
-    const proposals = queuedProposals(await readProposalQueue());
-    if (proposals.length === 0) {
-      console.log('No queued proposals.');
-      return;
-    }
-    proposals.forEach((proposal, index) => console.log(`${index + 1}. ${proposal.id} - ${proposal.title}: ${proposal.action}${proposal.detail ? ` (${proposal.detail})` : ''}`));
-    return;
-  }
-  if (subcommand === 'accept' || subcommand === 'start' || subcommand === 'yes') {
-    const selector = args[1];
-    if (!selector) throw new Error('proposal number or id required');
-    const proposal = await acceptProposal(selector);
-    if (!proposal) throw new Error(`proposal not found: ${selector}`);
-    await logEvent('proposal.accepted', { proposalId: proposal.id, action: proposal.action });
-    console.log(`Accepted ${proposal.id}. ${proposal.action}`);
-    return;
-  }
-  if (subcommand === 'reject' || subcommand === 'no') {
-    const selector = args[1];
-    if (!selector) throw new Error('proposal number or id required');
-    const proposal = await resolveProposal(selector, 'rejected');
-    if (!proposal) throw new Error(`proposal not found: ${selector}`);
-    await logEvent('proposal.rejected', { proposalId: proposal.id });
-    console.log(`Rejected ${proposal.id}.`);
-    return;
-  }
-  throw new Error(`unknown proposals command: ${subcommand}`);
-}
-
-async function delegationsCommand() {
-  const delegations = await readDelegations();
-  if (delegations.length === 0) {
-    console.log('No standing delegations configured.');
-    return;
-  }
-  for (const delegation of delegations) console.log(`${delegation.id}\t${delegation.mode}\tbudget ${delegation.dailyBudget}/day\t${delegation.actionClass}\t${delegation.scope}`);
+  for (const item of result.reminders) console.log(`cron ${item.name}: ${item.status}`);
+  console.log(`memory: ${result.memory.status}`);
+  console.log(`iMessage monitor: ${result.imessageMonitor.status}`);
 }
 
 async function approvalsCommand(args: string[]) {
@@ -287,14 +210,6 @@ async function approvalsCommand(args: string[]) {
     return;
   }
   throw new Error(`unknown approvals command: ${subcommand}`);
-}
-
-async function projectStatusCommand(args: string[]) {
-  const outputPath = argValue(args, '--output');
-  const projectsPath = argValue(args, '--projects');
-  const plansReadmePath = argValue(args, '--plans');
-  const result = await generateProjectsStatus({ outputPath, projectsPath, plansReadmePath });
-  console.log(`Wrote ${result.outputPath} for ${result.projects} project(s).`);
 }
 
 async function loopDiscoveryCommand(args: string[]) {
@@ -4266,14 +4181,9 @@ async function main() {
   if (command === 'agents') return miAgentsCommand();
   if (command === 'pi-commands') return piCommandsCommand(args);
   if (command === 'tick') return tickCommand();
-  if (command === 'status') return statusCommand();
   if (command === 'approvals') return approvalsCommand(args);
-  if (command === 'proposals') return proposalsCommand(args);
-  if (command === 'delegations') return delegationsCommand();
-  if (command === 'project-status') return projectStatusCommand(args);
   if (command === 'loop-discovery') return loopDiscoveryCommand(args);
   if (command === 'loop-factory') return loopFactoryCommand(args);
-  if (command === 'check' && (args.length === 0 || ['all', 'pendingApprovals', 'failedCrons', 'dailyBrief', 'pending-approvals', 'approval-reminders', 'failed-crons', 'crons', 'daily-brief', 'brief', 'health-check', 'heartbeat', 'configured-monitor-health', 'projectQuestion', 'project-question', 'question', 'questions', 'ask'].includes(args[0]))) return proactiveCheckCommand(args);
   if (command === 'memory') return memoryCommand(args);
   if (command === 'cron') return cronCommand(args);
   if (command === 'task') return taskCommand(args);

@@ -44,8 +44,6 @@ assert.match(daemonSource, /worker-write-scoped is only allowed under ~\/workflo
 assert.match(daemonSource, /requested === "worker-write-scoped"[\s\S]*return "worker-read"/, 'Mi daemon falls back to read-only worker capability unless a scoped write profile is explicitly allowed');
 assert.match(daemonSource, /capabilityProfile\S*[\s\S]*worker-write-scoped[\s\S]*MI_CAPABILITY_PROFILE/, 'Mi daemon can preserve an explicit scoped worker capability profile');
 assert.doesNotMatch(daemonSource, /env: \{ \.\.\.process\.env, \.\.\.env \}/, 'Mi daemon worker RPC must not pass full process.env');
-assert.match(await readFile(new URL('../src/proactive.ts', import.meta.url), 'utf8'), /capabilityProfile: 'worker-read'/, 'Mi proactive auto-triage must request read-only worker capability explicitly');
-
 assert.match(capabilitySource, /'chat-read'[\s\S]*allowBash: false/, 'Capability profiles must deny bash for chat-read');
 assert.match(capabilitySource, /SAFE_ENV_ALLOWLIST/, 'Capability model must include env allowlisting');
 assert.match(guardSource, /toolName === 'bash'[\s\S]*right: 'execute'[\s\S]*resource: 'tool:\/\/bash'/, 'Capability guard must treat bash as an explicit execute capability');
