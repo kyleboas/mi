@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync, readFileSync } from 'node:fs';
-import { appendFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createReadStream, existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { appendFile, chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -11,12 +11,12 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
-import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
+import { buildImessageCompletionPrompt, IMESSAGE_V2_LIMITS, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
 import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
 import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
-import { miCoordinatorLaunch, miCoordinatorPrompt } from './mi-imessage-coordinator.mjs';
+import { coordinatorDelegatedTask, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
@@ -54,6 +54,9 @@ const imessageThread = process.env.MI_IMESSAGE_THREAD || process.env.MI_PHOTON_T
 const imessageMaxReplyChars = Number(process.env.MI_IMESSAGE_MAX_REPLY_CHARS || 1200);
 const imessageChatTimeoutMs = Number(process.env.MI_IMESSAGE_CHAT_TIMEOUT_MS || 30000);
 const imessageCompletionTimeoutMs = Number(process.env.MI_IMESSAGE_COMPLETION_TIMEOUT_MS || 15000);
+const imessageCoordinatorTimeoutMs = Math.max(1000, Math.min(Number(process.env.MI_IMESSAGE_COORDINATOR_TIMEOUT_MS || 90000), 10 * 60_000));
+const imessageCoordinatorGlobalLimit = Math.max(1, Math.min(Number(process.env.MI_IMESSAGE_COORDINATOR_GLOBAL_LIMIT || 4), 16));
+const imessageCoordinatorThreadLimit = Math.max(1, Math.min(Number(process.env.MI_IMESSAGE_COORDINATOR_THREAD_LIMIT || 1), 4));
 const miGatewayClient = process.env.MI_GATEWAY_CLIENT || path.join(root, 'scripts', 'mi-gateway-client.py');
 let legacyImessageRouting;
 
@@ -82,6 +85,8 @@ const activeJobs = new Map();
 const activeWorkers = new Map();
 const recentNotificationKeys = new Map();
 let backgroundWorkerMonitorInFlight = false;
+let activeCoordinatorCount = 0;
+const activeCoordinatorThreads = new Map();
 const notificationDedupeMs = Number(process.env.MI_WEB_NOTIFICATION_DEDUPE_MS || 2 * 60 * 1000);
 const safePiEnvKeys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'HOSTNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'TMP', 'TEMP', 'PI_PROVIDER', 'PI_MODEL', 'PI_CONFIG_DIR', 'PI_GATEWAY_URL', 'AGENT_GATEWAY_URL'];
 
@@ -100,13 +105,14 @@ function capabilityGuardPath() {
 async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }, rights = ['read']) {
   const dir = path.join(miRuntimeDir, 'capabilities');
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  await chmod(dir, 0o700);
   const file = path.join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
   const createdAt = new Date().toISOString();
   const grant = {
     id: `${profile}-${Date.now().toString(36)}`,
-    resource: `file://${path.resolve(cwd)}`,
+    resource: `file://${realpathSync(cwd)}`,
     rights,
-    constraints: { recursive: true, profile },
+    constraints: { recursive: true, profile, excludedPaths: ['.env', '.git', '.pi', '.config', '.ssh', 'node_modules', 'state', 'secrets', 'credentials', 'config'] },
     principal,
     createdAt,
     expiresAt: new Date(Date.parse(createdAt) + capabilityGrantTtlMs).toISOString(),
@@ -948,8 +954,15 @@ async function saveActiveWorkers() {
 async function loadActiveWorkers() {
   const list = await readJsonFile(webWorkersPath, []);
   activeWorkers.clear();
+  activeCoordinatorCount = 0;
+  activeCoordinatorThreads.clear();
   for (const worker of Array.isArray(list) ? list : []) {
     if (!worker?.id || (!workerIsActive(worker) && !workerIsRecent(worker))) continue;
+    if (worker.coordinator) {
+      worker.coordinatorReserved = true;
+      activeCoordinatorCount += 1;
+      activeCoordinatorThreads.set(worker.threadId, (activeCoordinatorThreads.get(worker.threadId) || 0) + 1);
+    }
     activeWorkers.set(worker.id, worker);
   }
 }
@@ -1319,6 +1332,7 @@ function queueSendJob(threadId, message) {
 
 function taskMatchesWorker(task, worker) {
   return task && (
+    (worker.delegatedTaskId && task.id === worker.delegatedTaskId) ||
     (worker.taskId && task.id === worker.taskId) ||
     (worker.sessionFile && (task.sessionFile === worker.sessionFile || task.actualSessionFile === worker.sessionFile)) ||
     (worker.sessionId && task.sessionId === worker.sessionId) ||
@@ -1438,11 +1452,57 @@ async function monitorBackgroundWorkers() {
     const result = await sendTaskSocketRequest({ type: 'list_tasks' }, 10000);
     tasks = result.tasks || [];
   } catch {
+    // A restored coordinator has no in-memory child. If the daemon cannot be
+    // reached, it cannot report a result later, so close the acknowledgement
+    // with one clear failure instead of leaving it permanently pending.
+    for (const worker of Array.from(activeWorkers.values())) {
+      if (!worker.coordinator || !workerIsActive(worker) || worker.process || worker.formatting) continue;
+      worker.formatting = true;
+      await finishImessageCoordinator(worker, 'The coordinator service was interrupted before it finished. Please try again.', true);
+    }
     return;
   }
   let changed = false;
   for (const worker of Array.from(activeWorkers.values())) {
-    if (!workerIsActive(worker) || worker.formatting || worker.coordinator) continue;
+    if (!workerIsActive(worker) || worker.formatting) continue;
+    if (worker.coordinator) {
+      if (!worker.delegatedTaskId) {
+        // A persisted outer coordinator has no child process after a service
+        // restart. Complete it once with a clear failure instead of leaving an
+        // acknowledgement that can never receive an answer.
+        if (!worker.process) {
+          worker.formatting = true;
+          await finishImessageCoordinator(worker, 'The coordinator was interrupted before it finished. Please try again.', true);
+          changed = true;
+        }
+        continue;
+      }
+      const delegatedTask = tasks.find((entry) => entry?.id === worker.delegatedTaskId);
+      if (!delegatedTask) {
+        // Once the outer Pi turn is gone, a missing persisted daemon task has
+        // no remaining producer. Finish it once rather than keeping the phone
+        // acknowledgement unanswered after a service or daemon restart.
+        if (!worker.process) {
+          worker.formatting = true;
+          await finishImessageCoordinator(worker, 'The delegated worker was interrupted before it finished. Please try again.', true);
+          changed = true;
+        }
+        continue;
+      }
+      worker.status = delegatedTask.status || worker.status;
+      worker.updatedAt = now();
+      worker.sessionFile = delegatedTask.sessionFile || worker.sessionFile;
+      worker.sessionId = delegatedTask.sessionId || worker.sessionId;
+      worker.sessionName = delegatedTask.sessionName || worker.sessionName;
+      changed = true;
+      if (taskDone(delegatedTask)) {
+        worker.formatting = true;
+        await finishImessageCoordinator(worker, delegatedTask.error || delegatedTask.text || 'The delegated worker finished without a usable result.', Boolean(delegatedTask.error));
+      } else {
+        activeWorkers.set(worker.id, worker);
+      }
+      continue;
+    }
     const existingResult = await workerResultSince(worker).catch(() => undefined);
     if (existingResult) {
       // A V2 result with this stable correlation was already formatted and persisted.
@@ -2149,158 +2209,74 @@ async function runImessageChat(message, threadId) {
   });
 }
 
-function safeV2ContextText(value, maxChars) {
-  const text = redactV2Text(value)
-    .replace(/(?:~|\/)(?:home|Users|tmp)\/[A-Za-z0-9_.@/:-]+/g, '[private location]')
-    .split('\n')
-    .filter((line) => !/\b(?:authorization|bearer|token|secret|password|api[_ -]?key)\b/i.test(line))
-    .join('\n')
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
-    .trim();
-  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1)).trim()}…` : text;
-}
-
-async function readV2ContextFile(file, maxChars) {
-  try {
-    const text = safeV2ContextText(await readFile(file, 'utf8'), maxChars);
-    const modified = (await stat(file)).mtime.toISOString();
-    return { text, modified };
-  } catch {
-    return { text: '', modified: '' };
-  }
-}
-
-function safeV2Snapshot(label, entry) {
-  if (!entry.text) return '';
-  try {
-    const value = JSON.parse(entry.text);
-    const source = Array.isArray(value) ? value : [value];
-    const summaries = source.slice(-4).map((item) => {
-      if (!item || typeof item !== 'object') return '';
-      const fields = ['status', 'state', 'ok', 'healthy', 'updatedAt', 'lastRunAt', 'nextRunAt', 'summary']
-        .filter((key) => ['string', 'number', 'boolean'].includes(typeof item[key]))
-        .map((key) => `${key}=${safeV2ContextText(String(item[key]), 140)}`);
-      return fields.join(', ');
-    }).filter(Boolean);
-    return summaries.length ? `${label} (${entry.modified || 'time unknown'}): ${summaries.join(' | ')}` : '';
-  } catch {
-    return `${label} (${entry.modified || 'time unknown'}): ${safeV2ContextText(entry.text, 320)}`;
-  }
-}
-
-function safeV2Approvals(entry) {
-  if (!entry.text) return '';
-  try {
-    const parsed = JSON.parse(entry.text);
-    const approvals = Array.isArray(parsed) ? parsed : Array.isArray(parsed.approvals) ? parsed.approvals : [];
-    const pending = approvals.filter((item) => item?.status === 'pending').slice(-3).map((item) => {
-      const pendingAction = item.v2PendingAction || {};
-      const id = String(pendingAction.confirmationId || item.id || '').replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80);
-      const capability = safeV2ContextText(pendingAction.capability || '', 30);
-      const objective = safeV2ContextText(pendingAction.objective || item.summary || '', 220);
-      return [id && `confirmationId=${id}`, capability && `capability=${capability}`, objective && `request=${objective}`].filter(Boolean).join(', ');
-    }).filter(Boolean);
-    return pending.length ? `Pending confirmations (${entry.modified || 'time unknown'}): ${pending.join(' | ')}` : 'Pending confirmations: none recorded';
-  } catch { return 'Pending confirmations: unavailable'; }
-}
-
-async function v2RelevantProjectExcerpt(message) {
-  const text = String(message || '').toLowerCase();
-  const projectScore = /\b(?:project|repo|branch|pull request|\bpr\b|implementation)\b/.test(text) ? 1 : 0;
-  const goalScore = /\b(?:goal|priority|priorities)\b/.test(text) ? 1 : 0;
-  if (!projectScore && !goalScore) return { text: '', modified: '' };
-  // A tie is ambiguous: do not dump both orientation documents into a foreground turn.
-  if (projectScore === goalScore) return { text: '', modified: '' };
-  return readV2ContextFile(path.join(home, 'pi-docs', projectScore ? 'PROJECTS.md' : 'GOALS.md'), 700);
-}
-
-async function buildImessageV2Context(threadId, message) {
-  const [preferences, memory, tick, health, approvals, project] = await Promise.all([
-    readV2ContextFile(miPreferencesPath, IMESSAGE_V2_LIMITS.preferences),
-    readV2ContextFile(miMemoryPath, IMESSAGE_V2_LIMITS.memory),
-    readV2ContextFile(path.join(root, 'state', 'tick.json'), 500),
-    readV2ContextFile(path.join(root, 'state', 'monitor-health.json'), 500),
-    readV2ContextFile(path.join(root, 'state', 'approvals.json'), 900),
-    v2RelevantProjectExcerpt(message),
-  ]);
-  const messages = (await readMessages(threadId, 12)).filter((entry) => {
-    // Generic daemon reports do not have a stable V2 correlation and are never context.
-    return !(entry.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(entry.source) && !entry.taskId);
-  });
-  const workers = Array.from(activeWorkers.values())
-    .filter((worker) => worker.threadId === threadId && (workerIsActive(worker) || workerIsRecent(worker)))
-    .slice(-5)
-    .map((worker) => `${worker.updatedAt || worker.createdAt || 'time unknown'} | ${safeV2ContextText(worker.status || 'unknown', 40)} | ${safeV2ContextText(worker.subject || worker.name || worker.text || 'work', 160)} | continuation ${workerCorrelationId(worker)}`)
-    .join('\n');
-  const snapshot = [
-    safeV2Snapshot('Recent scheduler health', tick), safeV2Snapshot('Recent monitor health', health),
-    safeV2Approvals(approvals),
-    project.text ? `One relevant orientation excerpt (${project.modified || 'time unknown'}): ${project.text}` : '',
-  ].filter(Boolean).join('\n\n');
-  return buildImessageV2Prompt({
-    timestamp: now(), userMessage: message, preferences: preferences.text, preferencesProvenance: 'bounded preferences', preferencesReadAt: preferences.modified,
-    memory: memory.text, memoryProvenance: 'bounded durable memory', memoryReadAt: memory.modified,
-    threadMessages: messages, threadProvenance: 'recent iMessage records', threadReadAt: now(),
-    workers, workersProvenance: 'active/recent correlated work', workersReadAt: now(), snapshot, snapshotProvenance: 'safe current snapshots', snapshotReadAt: now(),
-  });
-}
-
-const imessageV2UnavailableReply = 'I’m temporarily unable to reach my assistant service. Please try again shortly.';
-const v2NeutralReadAck = 'I’ll check that and get back to you.';
-const v2ScopedWriteAck = 'I’ll make that safe change and get back to you.';
-const v2WorkspaceRoot = path.resolve(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(home, 'workflows'));
-const v2WorkspaceCwd = path.resolve(process.env.MI_IMESSAGE_WORK_CWD || v2WorkspaceRoot);
+const v2WorkspaceRootSetting = String(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(home, 'workflows')).trim();
+const v2WorkspaceCwdSetting = String(process.env.MI_IMESSAGE_WORK_CWD || v2WorkspaceRootSetting).trim();
 
 function v2CanonicalObjective(value) {
   return redactV2Text(String(value || '')).replace(/\s+/g, ' ').trim().slice(0, 4000);
 }
 
-function v2ScopedWorkspace() {
-  if ((v2WorkspaceCwd === v2WorkspaceRoot || v2WorkspaceCwd.startsWith(`${v2WorkspaceRoot}/`)) && existsSync(v2WorkspaceCwd)) return v2WorkspaceCwd;
-  return '';
+function pathInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-function v2ActionPlan(message) {
+function v2ScopedWorkspace() {
+  if (!v2WorkspaceRootSetting || !v2WorkspaceCwdSetting) return undefined;
+  try {
+    const rootPath = realpathSync(v2WorkspaceRootSetting);
+    const cwdPath = realpathSync(v2WorkspaceCwdSetting);
+    if (!statSync(rootPath).isDirectory() || !statSync(cwdPath).isDirectory()) return undefined;
+    // A workspace may be below home but must never be home itself or an
+    // ancestor of home. Real paths prevent a configured symlink escape.
+    if (rootPath === home || pathInside(rootPath, home) || !pathInside(rootPath, cwdPath)) return undefined;
+    return { root: rootPath, cwd: cwdPath };
+  } catch {
+    return undefined;
+  }
+}
+
+function v2RiskClassification(message) {
   const objective = v2CanonicalObjective(message);
   const text = objective.toLowerCase();
-  const asksCoordinator = /\b(?:ask|have)\s+(?:terra|sol|luna|claude)\b/.test(text);
-  const actionable = /\b(fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|install|deploy|wire|adjust|improve|tighten|save|remember|remind|schedule|restart|start|stop|send|publish|merge|delete|buy|purchase|pay|auth|login|credential|secret)\b/.test(text);
-  if (!asksCoordinator && !actionable) return undefined;
-  const risky = /\b(deploy|publish|merge|delete|remove\s+(?:all|the|a)?\s*(?:data|database|account|project)|restart|systemctl|service|send|email|message|post|tweet|purchase|buy|pay|spend|auth|login|credential|token|secret|password|api[_ -]?key|install)\b/.test(text);
-  if (risky) {
-    const neverDelegate = /\b(?:delete|secret|token|password|auth|login|credential|purchase|buy|pay|spend)\b/.test(text);
-    return { objective, capability: 'external', risky: true, actionClass: neverDelegate ? 'never-delegate' : 'confirmed-high-impact' };
-  }
-  if (asksCoordinator) return { objective, capability: 'coordinator', risky: false, cwd: v2ScopedWorkspace() || home };
-  if (/^(?:check|read|inspect|verify|list|find)\b/.test(text)) return { objective, capability: 'read', risky: false, cwd: home };
-  const writes = /\b(fix|implement|update|repair|patch|make|add|create|change|remove|build|wire|adjust|improve|tighten)\b/.test(text);
-  if (!writes) return { objective, capability: 'read', risky: false, cwd: home };
-  const cwd = v2ScopedWorkspace();
-  if (!cwd) return { objective, capability: 'write', risky: true };
-  return { objective, capability: 'write', risky: false, cwd };
+  if (!text) return { kind: 'clarify', objective };
+  const neverDelegate = /(?:\bdelete\b|\berase\b|\bwipe\b|\bpurge\b|\bdestroy\b|\brm\b|\b(?:remove|clear|drop)\s+(?:all\s+)?(?:data|database|account|project)\b|\bformat\s+(?:the\s+)?(?:disk|drive)\b|\bsecret\b|\btoken\b|\bpassword\b|\bpasscode\b|\bcredential\b|\bauth(?:entication)?\b|\blog\s*in\b|\bbuy\b|\bpurchase\b|\bpay\b|\bspend\b|\btransfer\s+(?:money|funds|cash)|\bwire\s+(?:money|funds))/i.test(text);
+  if (neverDelegate) return { kind: 'never-delegate', objective };
+  const needsConfirmation = /(?:\bdeploy\b|\bproduction\b|\brelease\b|\bpublish\b|\bannouncement\b|\bmerge\b|\brestart\b|\bsystemctl\b|\bservice\b|\binstall\b|\bemail\b|\bmail\b|\btweet\b|\bpost\b|\bsend\b|\bmessage\b|\b(?:tell|contact|notify|forward)\b|\btransfer\b|\bupload\b|\bshare\b)/i.test(text);
+  if (needsConfirmation) return { kind: 'confirm', objective, actionClass: 'confirmed-high-impact' };
+  return { kind: 'safe', objective };
 }
 
-function v2Affirmative(message) {
-  return /^(?:yes|yep|yeah|confirm|approve|do it|go ahead|proceed)\b[.! ]*$/i.test(String(message || '').trim());
+function v2LooksLikeAction(message) {
+  const text = v2CanonicalObjective(message).toLowerCase();
+  if (!text || text.startsWith('/skill:')) return false;
+  return /(?:^(?:please\s+)?(?:fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|wire|adjust|improve|tighten|save|remember|remind|schedule|start|stop|run|handle|do|clean|move|copy|rename|configure)\b|\b(?:can you|could you|would you|please)\s+(?:fix|implement|update|repair|patch|make|add|create|change|build|handle|do|clean|move|copy|rename|configure)\b)/i.test(text);
+}
+
+function v2ActionPlan(message, workspace) {
+  const objective = v2CanonicalObjective(message);
+  const text = objective.toLowerCase();
+  const asksCoordinator = /\b(?:ask|have)\s+(?:terra|sol|luna|claude)\b/.test(text) || /^\/skill:advisor\b/.test(text) || /\bask\s+(?:seth|alex|the advisors?)\b/.test(text);
+  const safeRead = /\b(?:read|inspect|check|verify|list|find|research|explain|summarize)\b/.test(text);
+  // Writing is available only for a clear local-work request. A broad phrase
+  // such as “make dinner” or “create an announcement” must not gain project
+  // write tools merely because it contains an old routing verb.
+  const safeWrite = /^(?:please\s+)?(?:fix|implement|update|repair|patch|make|add|create|change|build|wire|adjust|improve|tighten)\b/.test(text)
+    && messageHasLocalWorkTarget(objective);
+  if (!asksCoordinator && !safeRead && !safeWrite) return undefined;
+  return { objective, capability: 'coordinator', cwd: workspace.cwd, workspaceRoot: workspace.root, allowWrite: safeWrite };
 }
 
 function v2Cancellation(message) {
-  return /\b(?:cancel|never mind|nevermind|stop|don['’]t do it)\b/i.test(String(message || ''));
+  return /^\s*(?:cancel(?:\s+(?:it|that|the action))?|never mind|nevermind|don['’]t do it)\s*[.!?]*\s*$/i.test(String(message || ''));
 }
 
 function v2ConfirmationCommand(message) {
   return /^\s*(?:confirm|deny)\s+[a-f0-9]{32}\s*$/i.test(String(message || ''));
 }
 
-function v2ConfirmationQuestion(value) {
-  return String(value || '').trim().replace(/[.!?]+$/, '').trim() + '?';
-}
-
-function v2ConfirmReply(plan, confirmationId) {
-  const detail = plan.capability === 'write'
-    ? 'This would make a change outside the approved work area.'
-    : 'This could make a real change or contact another service.';
-  return `${detail} Reply "confirm ${confirmationId}" to approve or "deny ${confirmationId}" to cancel.`;
+function v2ConfirmReply(_plan, confirmationId) {
+  return `This could make a real change or contact another service. Reply "confirm ${confirmationId}" to approve or "deny ${confirmationId}" to cancel.`;
 }
 
 async function v2PendingAction(threadId) {
@@ -2311,133 +2287,175 @@ async function v2ClearPendingAction(threadId) {
   return clearPendingConfirmation(threadId);
 }
 
-async function v2StartWorker(threadId, message, plan, options = {}) {
-  const isWrite = plan.capability === 'write';
-  const result = await startBackgroundWorker(threadId, plan.objective, {
-    appendUser: options.appendUser === true,
-    ackReply: isWrite ? v2ScopedWriteAck : v2NeutralReadAck,
-    ackSource: 'imessage-v2-task-ack', taskId: true, userSource: 'imessage-v2-user', subject: plan.objective,
-    capabilityProfile: isWrite ? 'worker-write-scoped' : 'worker-read', cwd: plan.cwd || home,
-    allowDuplicate: false, decision: { start: true, reason: isWrite ? 'iMessage V2 scoped write task' : 'iMessage V2 read task' },
-  });
-  return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
+function coordinatorAdapterPath() {
+  return process.env.MI_ORCHESTRATOR_ADAPTER || path.join(root, 'pi', 'extensions', 'mi-orchestrator-adapter.ts');
 }
 
-function coordinatorAssistantText(event) {
-  const content = event?.message?.content;
-  if (typeof content === 'string') return content.trim();
-  if (!Array.isArray(content)) return '';
-  return content.filter((part) => part?.type === 'text' && typeof part.text === 'string').map((part) => part.text).join('\n').trim();
+async function writeCoordinatorPolicyFile({ correlationId, objective, workspace, allowWrite }) {
+  const directory = path.join(miRuntimeDir, 'coordinator-policies');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const file = path.join(directory, `${correlationId}.json`);
+  const policy = {
+    version: 1,
+    correlationId,
+    objective,
+    workspaceRoot: workspace.root,
+    workspaceCwd: workspace.cwd,
+    socketPath: miSocketPath,
+    // The daemon independently limits writes to ~/workflows. This only asks
+    // for a scoped write when the deterministic plan classified it as safe.
+    allowWrite: allowWrite === true,
+  };
+  await writeFile(file, JSON.stringify(policy), { mode: 0o600 });
+  return file;
+}
+
+function reserveCoordinator(threadId) {
+  if (activeCoordinatorCount >= imessageCoordinatorGlobalLimit) return false;
+  const current = activeCoordinatorThreads.get(threadId) || 0;
+  if (current >= imessageCoordinatorThreadLimit) return false;
+  activeCoordinatorCount += 1;
+  activeCoordinatorThreads.set(threadId, current + 1);
+  return true;
+}
+
+function releaseCoordinator(worker) {
+  if (!worker?.coordinator || !worker.coordinatorReserved) return;
+  worker.coordinatorReserved = false;
+  activeCoordinatorCount = Math.max(0, activeCoordinatorCount - 1);
+  const current = activeCoordinatorThreads.get(worker.threadId) || 0;
+  if (current <= 1) activeCoordinatorThreads.delete(worker.threadId);
+  else activeCoordinatorThreads.set(worker.threadId, current - 1);
 }
 
 async function finishImessageCoordinator(worker, findings, isError = false) {
-  if (worker.completedAt) return;
-  const completion = await formatImessageV2Completion(worker, findings, isError);
-  worker.status = isError ? 'error' : 'complete';
-  worker.completedAt = now();
-  worker.updatedAt = now();
-  worker.resultText = completion;
-  await appendThreadMessage(worker.threadId, 'assistant', completion, {
-    unread: false, source: isError ? 'mi-worker-error' : 'mi-worker-result', taskId: workerCorrelationId(worker), generation: 1,
-  });
-  await saveActiveWorkers().catch(() => undefined);
-  await emitTurnEvent(root, { stage: 'terminal', outcome: isError ? 'error' : 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(worker) }).catch(() => undefined);
+  if (worker.completedAt || worker.finishing) return;
+  worker.finishing = true;
+  try {
+    const completion = await formatImessageV2Completion(worker, findings, isError);
+    worker.status = isError ? 'error' : 'complete';
+    worker.completedAt = now();
+    worker.updatedAt = now();
+    worker.resultText = completion;
+    releaseCoordinator(worker);
+    await appendThreadMessage(worker.threadId, 'assistant', completion, {
+      unread: false, source: isError ? 'mi-worker-error' : 'mi-worker-result', taskId: workerCorrelationId(worker), generation: 1,
+    });
+    await Promise.allSettled([
+      worker.coordinatorGrants ? rm(worker.coordinatorGrants, { force: true }) : Promise.resolve(),
+      worker.coordinatorPolicy ? rm(worker.coordinatorPolicy, { force: true }) : Promise.resolve(),
+    ]);
+    await emitTurnEvent(root, { stage: 'terminal', outcome: isError ? 'error' : 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(worker) }).catch(() => undefined);
+  } finally {
+    delete worker.finishing;
+    delete worker.formatting;
+    await saveActiveWorkers().catch(() => undefined);
+  }
 }
 
 async function startImessageCoordinator(threadId, message, plan) {
-  const correlationId = randomUUID();
-  const history = await recentThreadContextForWorker(threadId, message);
-  const guard = capabilityGuardPath();
-  const coordinatorGrants = await writeCapabilityGrantsFile(plan.cwd || home, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read', 'write']);
-  const launch = miCoordinatorLaunch({
-    piCommand: process.env.PI_CMD || 'pi', cwd: plan.cwd || home, runtimeDir: miRuntimeDir, model: workerModel,
-    capabilityGuardPath: existsSync(guard) ? guard : '',
-    env: reducedPiEnv({ MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: coordinatorGrants, MI_CAPABILITY_AUDIT_FILE: path.join(miRuntimeDir, 'capability-audit.jsonl') }),
-  });
-  const worker = {
-    id: `coordinator_${correlationId}`, threadId, taskId: correlationId, correlationId, name: 'iMessage coordinator',
-    status: 'running', text: message, subject: plan.objective, cwd: launch.cwd, imessageV2: true, coordinator: true,
-    createdAt: now(), updatedAt: now(), awaitingResultSince: now(),
-  };
-  const child = spawn(launch.command, launch.args, { cwd: launch.cwd, env: launch.env, stdio: ['pipe', 'pipe', 'pipe'] });
-  // A missing Pi binary can emit before the first awaited state write below.
-  // Attach a listener now so it becomes a correlated failure, not a web crash.
-  let launchFailed = false;
-  child.on('error', () => { launchFailed = true; });
-  worker.process = child;
-  activeWorkers.set(worker.id, worker);
-  await saveActiveWorkers();
-  const reply = 'I’ll ask the team and get back to you.';
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-task-ack', taskId: correlationId });
-  let buffer = '';
-  let finalText = '';
-  let settled = false;
-  const settle = async (isError = false, fallback = '') => {
-    if (settled) return;
-    settled = true;
-    await finishImessageCoordinator(worker, finalText || fallback || 'The coordinator finished without a usable result.', isError);
-  };
-  child.stdout.on('data', (chunk) => {
-    buffer += chunk.toString('utf8');
-    while (buffer.includes('\n')) {
-      const index = buffer.indexOf('\n');
-      const line = buffer.slice(0, index).trim();
-      buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      try {
-        const event = JSON.parse(line);
-        if (event.type === 'message_end') finalText = coordinatorAssistantText(event) || finalText;
-        if (event.type === 'agent_settled') void settle();
-      } catch {}
-    }
-  });
-  child.on('error', () => { void settle(true, 'I could not start the coordinator.'); });
-  child.on('exit', (code) => { if (!settled) void settle(code !== 0, code === 0 ? '' : 'The coordinator stopped before it finished.'); });
-  if (launchFailed) void settle(true, 'I could not start the coordinator.');
-  else child.stdin.end(`${JSON.stringify({ type: 'prompt', id: correlationId, message: miCoordinatorPrompt({ message, context: history, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass }) })}\n`);
-  await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: correlationId }).catch(() => undefined);
-  return { ok: true, reply, handoff: true, taskId: correlationId };
-}
-
-
-async function runImessageV2(message, threadId) {
-  const prompt = await buildImessageV2Context(threadId, message);
-  // This foreground request is context-only. The local client fixes the loopback
-  // endpoint and immutable concierge profile; it never starts an outer Pi process.
-  const result = await invokeMiGateway([{ role: 'user', content: prompt }], {
-    timeoutMs: imessageChatTimeoutMs, outputCap: IMESSAGE_V2_LIMITS.output,
-  });
-  if (result.failure) {
-    console.error('iMessage V2 invocation failed:', JSON.stringify({ category: result.failure }));
-    return { failure: result.failure };
+  if (!reserveCoordinator(threadId)) {
+    return { ok: true, reply: 'I’m already working on that conversation. Please wait for the result.', handoff: false, busy: true };
   }
-  return { decision: parseImessageV2Envelope(result.content) };
+  const correlationId = randomUUID();
+  let worker;
+  try {
+    const workspace = plan.workspace || v2ScopedWorkspace();
+    if (!workspace) throw new Error('Mi needs an existing approved workspace before it can start work.');
+    const history = await recentThreadContextForWorker(threadId, message);
+    const guard = capabilityGuardPath();
+    const adapter = coordinatorAdapterPath();
+    if (!existsSync(guard) || !existsSync(adapter)) throw new Error('Mi coordinator safety tools are unavailable.');
+    const coordinatorGrants = await writeCapabilityGrantsFile(workspace.cwd, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read']);
+    const coordinatorPolicy = await writeCoordinatorPolicyFile({ correlationId, objective: plan.objective, workspace, allowWrite: plan.allowWrite });
+    const launch = miCoordinatorLaunch({
+      piCommand: process.env.PI_CMD || 'pi', cwd: workspace.cwd, runtimeDir: miRuntimeDir, model: workerModel,
+      capabilityGuardPath: guard, capabilityAdapterPath: adapter,
+      env: reducedPiEnv({ MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: coordinatorGrants, MI_CAPABILITY_AUDIT_FILE: path.join(miRuntimeDir, 'capability-audit.jsonl'), MI_COORDINATOR_POLICY_FILE: coordinatorPolicy, MI_SOCKET_PATH: miSocketPath }),
+    });
+    worker = {
+      id: `coordinator_${correlationId}`, threadId, taskId: correlationId, correlationId, name: 'iMessage coordinator',
+      status: 'running', text: message, subject: plan.objective, cwd: launch.cwd, imessageV2: true, coordinator: true, coordinatorReserved: true,
+      coordinatorGrants, coordinatorPolicy, coordinatorState: 'outer-running', createdAt: now(), updatedAt: now(), awaitingResultSince: now(),
+      // A truthy in-memory marker prevents the monitor from treating the short
+      // state-save/ack gap as a service-restart orphan before spawn runs.
+      process: { starting: true },
+    };
+    activeWorkers.set(worker.id, worker);
+    await saveActiveWorkers();
+    const reply = 'I’ll ask the team and get back to you.';
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-task-ack', taskId: correlationId });
+    void runMiCoordinatorRpc({
+      launch,
+      requestId: correlationId,
+      prompt: miCoordinatorPrompt({ message, context: history, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass }),
+      timeoutMs: imessageCoordinatorTimeoutMs,
+      onSpawn: (child) => { worker.process = child; },
+      onEvent: (event) => {
+        const delegatedTaskId = coordinatorDelegatedTask(event);
+        if (!delegatedTaskId || worker.delegatedTaskId) return;
+        worker.delegatedTaskId = delegatedTaskId;
+        worker.coordinatorState = 'delegated';
+        worker.updatedAt = now();
+        void saveActiveWorkers().catch(() => undefined);
+      },
+    }).then(async (result) => {
+      // Reserve completion before deleting the process handle. The monitor may
+      // run between awaits and must not turn a healthy settled turn into a
+      // second restart failure.
+      worker.formatting = true;
+      delete worker.process;
+      if (!result.ok) console.error('iMessage coordinator RPC failed:', result.reason);
+      if (worker.delegatedTaskId) {
+        delete worker.formatting;
+        worker.coordinatorState = 'delegated';
+        worker.updatedAt = now();
+        await saveActiveWorkers().catch(() => undefined);
+        return;
+      }
+      await finishImessageCoordinator(worker, result.text || (result.ok ? 'The coordinator finished without a usable result.' : 'I could not complete that coordinator request. Please try again.'), !result.ok);
+    }).catch(async () => {
+      if (!worker.delegatedTaskId) await finishImessageCoordinator(worker, 'I could not complete that coordinator request. Please try again.', true);
+    });
+    await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: correlationId }).catch(() => undefined);
+    return { ok: true, reply, handoff: true, taskId: correlationId };
+  } catch (error) {
+    if (worker) await finishImessageCoordinator(worker, 'I could not start the coordinator. Please try again.', true);
+    else releaseCoordinator({ coordinator: true, coordinatorReserved: true, threadId });
+    const reply = error instanceof Error && /approved workspace/.test(error.message)
+      ? 'I need an existing approved workspace before I can start that work.'
+      : 'I could not start the coordinator. Please try again.';
+    return { ok: false, reply, handoff: false };
+  }
 }
 
 async function handleImessageV2(threadId, message) {
-  const turnStartedAt = Date.now();
-  await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message }).catch(() => undefined);
+  await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: message }).catch(() => undefined);
   if (v2Cancellation(message)) {
     await v2ClearPendingAction(threadId);
+    const reply = 'Okay, I won’t proceed with that action.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    await appendThreadMessage(threadId, 'assistant', 'Okay, I won’t proceed with that action.', { unread: false, source: 'imessage-v2-confirm-cancelled' });
-    return { ok: true, reply: 'Okay, I won’t proceed with that action.', handoff: false };
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-cancelled' });
+    return { ok: true, reply, handoff: false };
   }
   const pending = await v2PendingAction(threadId);
   if (pending) {
     const confirmation = await classifyConfirmationReply({ threadId, reply: message });
     if (confirmation.kind === 'confirm') {
       const record = confirmation.record;
-      if (record.actionClass === 'never-delegate' || !record.objective) {
-        const reply = 'I have your confirmation, but this action cannot be delegated from iMessage.';
-        await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirmed-blocked' });
+      const workspace = v2ScopedWorkspace();
+      const reply = !workspace
+        ? 'I need an existing approved workspace before I can start that work.'
+        : undefined;
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      if (reply) {
+        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-workspace-refused' });
         return { ok: true, reply, handoff: false, confirmationId: record.id };
       }
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
       return startImessageCoordinator(threadId, record.objective, {
-        objective: record.objective, capability: 'coordinator', cwd: v2ScopedWorkspace() || home,
-        confirmedObjective: record.objective, actionClass: record.actionClass || 'confirmed-high-impact',
+        objective: record.objective, capability: 'coordinator', workspace, confirmedObjective: record.objective,
+        actionClass: record.actionClass || 'confirmed-high-impact', allowWrite: false,
       });
     }
     if (confirmation.kind === 'deny') {
@@ -2453,91 +2471,42 @@ async function handleImessageV2(threadId, message) {
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-missing' });
     return { ok: true, reply, handoff: false };
   }
-  const directPlan = v2ActionPlan(message);
-  if (directPlan) {
-    const directContinuation = !directPlan.risky && /^\s*continue\b/i.test(message)
-      ? v2StableContinuationCandidates(threadId).filter(workerIsActive).at(-1)
-      : undefined;
-    if (directContinuation) {
-      const result = await continueBackgroundWorker(threadId, directContinuation, directPlan.objective, {
-        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
-        ackSource: 'imessage-v2-task-ack', taskId: true, subject: directPlan.objective,
-      });
-      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
-    }
-    if (directPlan.risky) {
-      const safeObjective = /\b(?:token|secret|password|api[_ -]?key|credential)\b/i.test(directPlan.objective) ? undefined : directPlan.objective.slice(0, 240);
-      const pendingAction = await createPendingConfirmation({
-        threadId, summary: safeObjective || 'Requested iMessage action',
-        riskReason: directPlan.actionClass === 'never-delegate' ? 'This action cannot be delegated from iMessage' : 'High-impact iMessage action',
-        objective: safeObjective, actionClass: directPlan.actionClass || 'confirmed-high-impact',
-      });
-      const reply = v2ConfirmReply(directPlan, pendingAction.id);
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
-      return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
-    }
-    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    return startImessageCoordinator(threadId, message, { ...directPlan, capability: 'coordinator', cwd: directPlan.cwd || v2ScopedWorkspace() || home });
-  }
-  // Normal iMessage turns are Pi coordinator turns. The old tool-less V2
-  // foreground is intentionally not a normal route; it remains only as an
-  // invocation fallback for a future coordinator outage policy.
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-  return startImessageCoordinator(threadId, message, { objective: v2CanonicalObjective(message), capability: 'coordinator', cwd: v2ScopedWorkspace() || home });
 
-  const invocation = await runImessageV2(message, threadId);
-  if (invocation.failure) {
+  // This gate intentionally examines every raw current message before any Pi
+  // coordinator or worker can launch. It does not depend on routing verbs.
+  const risk = v2RiskClassification(message);
+  if (risk.kind === 'never-delegate') {
+    const reply = 'I can’t delegate that kind of action from iMessage.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    await appendThreadMessage(threadId, 'assistant', imessageV2UnavailableReply, { unread: false, source: 'imessage-v2-unavailable' });
-    return { ok: false, reply: imessageV2UnavailableReply, handoff: false, temporary: true };
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-refused' });
+    return { ok: true, reply, handoff: false };
   }
-  const decision = invocation.decision;
-  await emitTurnEvent(root, { stage: 'decision', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message, durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
-  if (decision.kind === 'task') {
-    const objective = v2CanonicalObjective(decision.objective);
-    // A model may phrase a safe check without one of our routing verbs. Its
-    // declared read capability still gets the restricted read worker, while
-    // every other capability must pass the deterministic risk gate above.
-    const plan = v2ActionPlan(objective) || (decision.capability === 'read'
-      ? { objective, capability: 'read', risky: false, cwd: home }
-      : undefined);
-    if (plan?.risky || !plan) {
-      const reply = 'What exactly should I act on?';
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
-      return { ok: true, reply, handoff: false };
-    }
-    const namedActive = decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined;
-    const implicitActive = !decision.continueTaskId && /^\s*continue\b/i.test(message)
-      ? v2StableContinuationCandidates(threadId).filter(workerIsActive).at(-1)
-      : undefined;
-    const active = namedActive || implicitActive;
-    if (decision.continueTaskId && !active) {
-      const reply = 'Which earlier task should I continue?';
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
-      return { ok: true, reply, handoff: false };
-    }
-    if (active) {
-      const result = await continueBackgroundWorker(threadId, active, objective, {
-        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
-        ackSource: 'imessage-v2-task-ack', taskId: true, subject: objective,
-      });
-      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
-    }
+  if (risk.kind === 'confirm') {
+    const pendingAction = await createPendingConfirmation({
+      threadId, summary: risk.objective.slice(0, 240), riskReason: 'High-impact iMessage action',
+      objective: risk.objective.slice(0, 240), actionClass: risk.actionClass,
+    });
+    const reply = v2ConfirmReply(risk, pendingAction.id);
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    return plan.capability === 'coordinator'
-      ? startImessageCoordinator(threadId, message, plan)
-      : v2StartWorker(threadId, message, plan);
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
+    return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
   }
-  const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
-  const reply = decision.kind === 'confirm'
-    ? v2ConfirmationQuestion(sanitizeMiConversationText(imessageCleanReply(decision.reply)))
-    : sanitizeMiConversationText(imessageCleanReply(decision.reply));
+  if (v2LooksLikeAction(message) && !v2ActionPlan(message, v2ScopedWorkspace() || { root: '', cwd: '' })) {
+    const reply = 'What exactly should I act on?';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
+    return { ok: true, reply, handoff: false };
+  }
+  const workspace = v2ScopedWorkspace();
+  if (!workspace) {
+    const reply = 'I need an existing approved workspace before I can start that work.';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-workspace-refused' });
+    return { ok: true, reply, handoff: false };
+  }
+  const plan = v2ActionPlan(message, workspace) || { objective: risk.objective, capability: 'coordinator', workspace, allowWrite: false };
   await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source });
-  return { ok: true, reply: redact(reply), handoff: false };
+  return startImessageCoordinator(threadId, message, plan);
 }
 
 async function handle(req, res) {

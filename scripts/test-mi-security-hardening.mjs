@@ -47,6 +47,10 @@ assert.doesNotMatch(daemonSource, /env: \{ \.\.\.process\.env, \.\.\.env \}/, 'M
 assert.match(capabilitySource, /'chat-read'[\s\S]*allowBash: false/, 'Capability profiles must deny bash for chat-read');
 assert.match(capabilitySource, /SAFE_ENV_ALLOWLIST/, 'Capability model must include env allowlisting');
 assert.match(guardSource, /toolName === 'bash'[\s\S]*right: 'execute'[\s\S]*resource: 'tool:\/\/bash'/, 'Capability guard must treat bash as an explicit execute capability');
+assert.match(guardSource, /ALLOWED_MI_EXTENSION_TOOLS[\s\S]*mi_orchestrator_delegate/, 'Capability guard must use an explicit reviewed extension-tool allowlist');
+assert.match(guardSource, /unreviewed extension tool is denied/, 'Capability guard must deny unknown extension tools by default');
+assert.match(guardSource, /global orchestrator controls are not available to Mi/, 'Capability guard must deny unscoped global orchestrator controls');
+assert.match(guardSource, /PROTECTED_PATH_NAMES[\s\S]*credentials[\s\S]*config/, 'Capability guard must exclude credential, configuration, and state paths');
 assert.match(guardSource, /return \{ block: true, reason: decision\.reason \}/, 'Capability guard must block denied tool calls');
 assert.match(guardSource, /appendFileSync\(auditPath/, 'Capability guard must audit allow/deny decisions');
 
