@@ -984,7 +984,7 @@ async function stopTask(request) {
   const sessions = await listPiSessionTasks();
   const task = [...tasks, ...sessions].find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
-  const activeWorker = earlyActiveWorker || (task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) : undefined);
+  const activeWorker = task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) || earlyActiveWorker : earlyActiveWorker;
   const taskStatus = String(task?.status || "").toLowerCase();
   if (task && ["complete", "completed", "done"].includes(taskStatus)) {
     return { text: `${name} is already complete` };
