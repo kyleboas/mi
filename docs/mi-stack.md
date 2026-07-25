@@ -46,4 +46,8 @@ The web installer similarly removes only exact known Mi-owned predecessor drop-i
 
 ## Rollback
 
-A failed install restores the pre-run generated files. After correcting the named stage, rerun the canonical command and then `--check`. V1 source and all tracked modular installers are retained; eval harness files are not removed.
+A failed install restores the pre-run generated files. The production gateway stage also restores its five files as one set if any file write or its readiness check fails. After correcting the named stage, rerun the canonical command and then `--check`.
+
+The gateway-only installer keeps the prior five-file set under `/var/backups/mi-gateway`. Operators who need to restore that set can rerun `scripts/install-mi-subscription-gateway-root.sh --rollback` through the same root boundary and with the same explicit account settings used for install. The command checks that every prior file or absent-file marker exists before changing anything, restarts only after restoring the complete set, and is safe to repeat.
+
+V1 source and all tracked modular installers are retained; eval harness files are not removed.

@@ -23,7 +23,7 @@ mi_gateway_safe_path() {
   value=$1
   label=$2
   case "$value" in
-    ''|*[!A-Za-z0-9_./@+-]*|*//*|*/./*|*/../*|*/.|*/..|*/)
+    ''|*[!A-Za-z0-9_./@+-]*|*@[A-Z0-9_]*@*|*//*|*/./*|*/../*|*/.|*/..|*/)
       echo "Gateway preflight failed: $label must be a normalized absolute path" >&2; exit 1 ;;
     /*) ;;
     *) echo "Gateway preflight failed: $label must be a normalized absolute path" >&2; exit 1 ;;
@@ -95,8 +95,9 @@ mi_gateway_load_config() {
   fi
 
   account=$(mi_gateway_account_line "$MI_GATEWAY_SERVICE_USER") || { echo 'Gateway preflight failed: service user does not exist' >&2; exit 1; }
-  old_ifs=$IFS; IFS=:; set -- $account; IFS=$old_ifs
-  service_uid=$3 service_gid=$4 account_home=$6
+  service_uid=$(printf '%s\n' "$account" | cut -d: -f3)
+  service_gid=$(printf '%s\n' "$account" | cut -d: -f4)
+  account_home=$(printf '%s\n' "$account" | cut -d: -f6)
   [ "$account_home" = "$MI_GATEWAY_SERVICE_HOME" ] || { echo 'Gateway preflight failed: service home does not match the account database' >&2; exit 1; }
   health_account=$(mi_gateway_account_line "$MI_GATEWAY_HEALTH_USER") || { echo 'Gateway preflight failed: health user does not exist' >&2; exit 1; }
   service_group=$(mi_gateway_group_name "$service_gid") || { echo 'Gateway preflight failed: primary service group does not exist' >&2; exit 1; }
@@ -109,8 +110,8 @@ mi_gateway_load_config() {
   mi_gateway_check_owned_directory "$MI_GATEWAY_WORK_DIR" 'gateway work directory' "$service_uid"
   mi_gateway_check_executable "$MI_GATEWAY_PI_BINARY" 'Pi binary' "$service_uid"
   # The health command may belong to its user or root. Find that user's numeric ID.
-  old_ifs=$IFS; IFS=:; set -- $health_account; IFS=$old_ifs
-  mi_gateway_check_executable "$MI_GATEWAY_HEALTH_COMMAND" 'health command' "$3"
+  health_uid=$(printf '%s\n' "$health_account" | cut -d: -f3)
+  mi_gateway_check_executable "$MI_GATEWAY_HEALTH_COMMAND" 'health command' "$health_uid"
 }
 
 mi_gateway_atomic_install() {
@@ -126,27 +127,67 @@ mi_gateway_atomic_install() {
   fi
 }
 
+mi_gateway_validate_dropin_template() {
+  template=$1
+  # Each reviewed token must occur exactly as often as the tracked service file needs it.
+  # This also rejects misspelled, added, and malformed token text before any install path changes.
+  awk '
+    BEGIN {
+      expected["@SERVICE_USER@"] = 1
+      expected["@SERVICE_GROUP@"] = 1
+      expected["@SERVICE_HOME@"] = 2
+      expected["@PI_BINARY@"] = 1
+      expected["@PI_COMMAND_DIR@"] = 1
+      expected["@PI_AGENT_DIR@"] = 2
+      expected["@WORK_DIR@"] = 2
+    }
+    {
+      scan = $0
+      while (match(scan, /@[A-Z][A-Z0-9_]*@/)) {
+        token = substr(scan, RSTART, RLENGTH)
+        if (!(token in expected)) exit 20
+        seen[token]++
+        scan = substr(scan, RSTART + RLENGTH)
+      }
+      residual = $0
+      gsub(/@[A-Z][A-Z0-9_]*@/, "", residual)
+      if (residual ~ /@/) exit 21
+    }
+    END {
+      for (token in expected) if (seen[token] != expected[token]) exit 22
+    }
+  ' "$template" || { echo 'Gateway preflight failed: malformed, missing, duplicate, or unknown drop-in placeholder' >&2; exit 1; }
+}
+
 mi_gateway_render_dropin() {
-  destination=$1
+  template=$1
+  destination=$2
   directory=$(dirname -- "$destination")
   temporary=$(mktemp "$directory/.mi-gateway-dropin.XXXXXX") || exit 1
   chmod 0600 "$temporary"
-  if ! printf '%s\n' \
-    '# Rendered by install-mi-subscription-gateway-root.sh after path and account checks.' \
-    '[Service]' \
-    "User=$MI_GATEWAY_SERVICE_USER" \
-    "Group=$service_group" \
-    "Environment=HOME=$MI_GATEWAY_SERVICE_HOME" \
-    "Environment=MI_GATEWAY_SERVICE_HOME=$MI_GATEWAY_SERVICE_HOME" \
-    "Environment=MI_GATEWAY_PI_BINARY=$MI_GATEWAY_PI_BINARY" \
-    "Environment=MI_GATEWAY_PI_COMMAND_DIR=$MI_GATEWAY_PI_COMMAND_DIR" \
-    "Environment=MI_GATEWAY_PI_AGENT_DIR=$MI_GATEWAY_PI_AGENT_DIR" \
-    "Environment=MI_GATEWAY_WORK_DIR=$MI_GATEWAY_WORK_DIR" \
-    'LoadCredential=' \
-    'LoadCredential=gateway:/etc/agent-secrets/local-agent-gateway.token' \
-    'ProtectHome=read-only' \
-    "ReadWritePaths=$MI_GATEWAY_PI_AGENT_DIR $MI_GATEWAY_WORK_DIR" > "$temporary"; then
-    rm -f "$temporary"; exit 1
+  awk \
+    -v service_user="$MI_GATEWAY_SERVICE_USER" \
+    -v service_group="$service_group" \
+    -v service_home="$MI_GATEWAY_SERVICE_HOME" \
+    -v pi_binary="$MI_GATEWAY_PI_BINARY" \
+    -v pi_command_dir="$MI_GATEWAY_PI_COMMAND_DIR" \
+    -v pi_agent_dir="$MI_GATEWAY_PI_AGENT_DIR" \
+    -v work_dir="$MI_GATEWAY_WORK_DIR" '
+      {
+        gsub(/@SERVICE_USER@/, service_user)
+        gsub(/@SERVICE_GROUP@/, service_group)
+        gsub(/@SERVICE_HOME@/, service_home)
+        gsub(/@PI_BINARY@/, pi_binary)
+        gsub(/@PI_COMMAND_DIR@/, pi_command_dir)
+        gsub(/@PI_AGENT_DIR@/, pi_agent_dir)
+        gsub(/@WORK_DIR@/, work_dir)
+        print
+      }
+    ' "$template" > "$temporary" || { rm -f "$temporary"; exit 1; }
+  if grep -Eq '@[A-Z][A-Z0-9_]*@' "$temporary"; then
+    rm -f "$temporary"
+    echo 'Gateway drop-in rendering left an unexpanded placeholder' >&2
+    exit 1
   fi
   chmod 0644 "$temporary"
   mv -f "$temporary" "$destination"
@@ -154,17 +195,51 @@ mi_gateway_render_dropin() {
 
 mi_gateway_backup() {
   source=$1
-  [ -f "$source" ] || return 0
   backup_dir=$(mi_gateway_path /var/backups/mi-gateway)
   install -d -m 0700 "$backup_dir"
   name=$(basename -- "$source")
-  temporary=$(mktemp "$backup_dir/.${name}.XXXXXX") || exit 1
-  if ! cp -p "$source" "$temporary"; then
-    rm -f "$temporary"
-    echo "Gateway backup failed" >&2
+  previous="$backup_dir/${name}.previous"
+  absent="$backup_dir/${name}.previous.absent"
+  if [ -f "$source" ]; then
+    temporary=$(mktemp "$backup_dir/.${name}.XXXXXX") || exit 1
+    if ! cp -p "$source" "$temporary"; then
+      rm -f "$temporary"
+      echo "Gateway backup failed" >&2
+      exit 1
+    fi
+    mv -f "$temporary" "$previous"
+    rm -f "$absent"
+  else
+    rm -f "$previous"
+    temporary=$(mktemp "$backup_dir/.${name}.absent.XXXXXX") || exit 1
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$absent"
+  fi
+}
+
+mi_gateway_require_previous() {
+  source=$1
+  backup_dir=$(mi_gateway_path /var/backups/mi-gateway)
+  name=$(basename -- "$source")
+  previous="$backup_dir/${name}.previous"
+  absent="$backup_dir/${name}.previous.absent"
+  if { [ -f "$previous" ] && [ -e "$absent" ]; } || { [ ! -f "$previous" ] && [ ! -f "$absent" ]; }; then
+    echo "Gateway rollback preflight failed: no single safe previous state for $name" >&2
     exit 1
   fi
-  mv -f "$temporary" "$backup_dir/${name}.previous"
+}
+
+mi_gateway_restore_previous() {
+  destination=$1
+  backup_dir=$(mi_gateway_path /var/backups/mi-gateway)
+  name=$(basename -- "$destination")
+  previous="$backup_dir/${name}.previous"
+  absent="$backup_dir/${name}.previous.absent"
+  if [ -f "$absent" ]; then
+    rm -f "$destination"
+  else
+    mi_gateway_atomic_install "$previous" "$destination" "$(stat -c %a "$previous")"
+  fi
 }
 
 mi_gateway_restart_and_wait() {

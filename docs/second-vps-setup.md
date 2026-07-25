@@ -42,6 +42,7 @@ Create a dedicated unprivileged user and home with normal operating-system tools
 
 ```bash
 export MI_USER='<mi-user>'
+export MI_GROUP="$(id -gn "$MI_USER")"
 export MI_HOME='<service-home>'
 export MI_ROOT='<mi-root>'
 export MI_WORKSPACE='<workspace-root>'
@@ -53,7 +54,7 @@ Use an app path under the service home for `<mi-root>`. Use a dedicated existing
 As root, create the empty roots with the service user as owner:
 
 ```bash
-install -d -m 0700 -o "$MI_USER" -g "$MI_USER" \
+install -d -m 0700 -o "$MI_USER" -g "$MI_GROUP" \
   "$MI_HOME" "$MI_WORKSPACE" "$MI_GATEWAY_WORK"
 ```
 
@@ -79,10 +80,12 @@ mi --help
 
 ## 4. Install and log in to Pi
 
-Install the Pi package version used by `package.json`, or a separately reviewed compatible version:
+Install the reviewed Earendil Pi fork and version used by the gateway path. Keep these two values visible so a later review can update them together:
 
 ```bash
-npm install -g @mariozechner/pi-coding-agent@0.73.1
+PI_PACKAGE='@earendil-works/pi-coding-agent'
+PI_VERSION='0.80.10'
+npm install -g "$PI_PACKAGE@$PI_VERSION"
 command -v pi
 pi --help
 ```
@@ -196,9 +199,9 @@ sudo systemctl enable --now mi-photon-bridge.service
 Check names and modes without reading private content:
 
 ```bash
-install -d -m 0700 -o "$MI_USER" -g "$MI_USER" \
+install -d -m 0700 -o "$MI_USER" -g "$MI_GROUP" \
   "$MI_ROOT/state" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi"
-chown -R "$MI_USER:$MI_USER" "$MI_ROOT" "$MI_WORKSPACE" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi"
+chown -R "$MI_USER:$MI_GROUP" "$MI_ROOT" "$MI_WORKSPACE" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi"
 chmod 0700 "$MI_WORKSPACE" "$MI_ROOT/state" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi"
 find "$MI_ROOT/state" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi" -type f -exec chmod 0600 {} +
 ```
@@ -269,6 +272,23 @@ Back up only this new instance after it has created its own state. Keep code and
 - do not back up sockets, locks, coordinator policy/session files, or pending confirmations as portable data.
 
 For a code rollback, check out the previous reviewed commit, run `npm ci && npm run build`, reinstall the package, and rerun the stack installer. Its transaction restores generated configuration after a failed stage. Keep broker-managed credentials in place; do not move them into the repository or backup bundle.
+
+The gateway-only installer saves all five replaced files under `/var/backups/mi-gateway` before it writes them. To restore that saved set together, use the same reviewed checkout and account settings used for installation:
+
+```bash
+sudo env \
+  MI_GATEWAY_SERVICE_USER="$MI_USER" \
+  MI_GATEWAY_SERVICE_HOME="$MI_HOME" \
+  MI_GATEWAY_PI_BINARY="$PI_BIN" \
+  MI_GATEWAY_PI_COMMAND_DIR="$PI_COMMAND_DIR" \
+  MI_GATEWAY_PI_AGENT_DIR="$MI_HOME/.pi/agent" \
+  MI_GATEWAY_WORK_DIR="$MI_GATEWAY_WORK" \
+  MI_GATEWAY_HEALTH_COMMAND="$GATEWAY_HEALTH" \
+  MI_GATEWAY_HEALTH_USER="$MI_USER" \
+  "$MI_ROOT/scripts/install-mi-subscription-gateway-root.sh" --rollback
+```
+
+Rollback validates the full saved set before changing a gateway file. It is safe to repeat. It does not read or move broker-managed secrets.
 
 To stop the clean instance without deleting it:
 
