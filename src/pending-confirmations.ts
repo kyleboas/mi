@@ -11,6 +11,8 @@ export type PendingConfirmation = {
   createdAt: string;
   expiresAt: string;
   continuationRef?: string;
+  objective?: string;
+  actionClass?: string;
 };
 
 export type ConfirmationResult =
@@ -29,6 +31,7 @@ const MAX_RECORDS = 100;
 const MAX_TEXT = 240;
 const MAX_THREAD = 160;
 const MAX_REFERENCE = 160;
+const MAX_ACTION_CLASS = 80;
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const MAX_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -59,6 +62,12 @@ function checkReference(value: unknown) {
   return result;
 }
 
+function checkActionClass(value: unknown) {
+  const result = checkText(value, MAX_ACTION_CLASS, 'action class');
+  if (!/^[a-z][a-z0-9_-]*$/u.test(result)) throw new Error('Invalid action class');
+  return result;
+}
+
 function validRecord(value: unknown): value is PendingConfirmation {
   if (!value || typeof value !== 'object') return false;
   const record = value as Partial<PendingConfirmation>;
@@ -70,6 +79,8 @@ function validRecord(value: unknown): value is PendingConfirmation {
     if (typeof record.createdAt !== 'string' || Number.isNaN(Date.parse(record.createdAt))) return false;
     if (typeof record.expiresAt !== 'string' || Number.isNaN(Date.parse(record.expiresAt))) return false;
     if (record.continuationRef !== undefined) checkReference(record.continuationRef);
+    if (record.objective !== undefined) checkText(record.objective, MAX_TEXT, 'objective');
+    if (record.actionClass !== undefined) checkActionClass(record.actionClass);
     return true;
   } catch {
     return false;
@@ -137,11 +148,15 @@ export async function createPendingConfirmation(input: {
   summary: string;
   riskReason: string;
   continuationRef?: string;
+  objective?: string;
+  actionClass?: string;
 }, options: PendingConfirmationOptions = {}): Promise<PendingConfirmation> {
   const threadId = checkThread(input.threadId);
   const summary = checkText(input.summary, MAX_TEXT, 'summary');
   const riskReason = checkText(input.riskReason, MAX_TEXT, 'risk reason');
   const continuationRef = input.continuationRef === undefined ? undefined : checkReference(input.continuationRef);
+  const objective = input.objective === undefined ? undefined : checkText(input.objective, MAX_TEXT, 'objective');
+  const actionClass = input.actionClass === undefined ? undefined : checkActionClass(input.actionClass);
   const now = options.now || new Date();
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   if (!Number.isFinite(ttlMs) || ttlMs <= 0 || ttlMs > MAX_TTL_MS) throw new Error('Invalid confirmation expiry');
@@ -153,6 +168,8 @@ export async function createPendingConfirmation(input: {
       id: randomUUID().replaceAll('-', ''), threadId, summary, riskReason,
       createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
       ...(continuationRef === undefined ? {} : { continuationRef }),
+      ...(objective === undefined ? {} : { objective }),
+      ...(actionClass === undefined ? {} : { actionClass }),
     };
     records.unshift(record);
     await writeState(file, records);

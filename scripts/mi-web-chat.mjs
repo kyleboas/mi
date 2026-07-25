@@ -2256,7 +2256,7 @@ function v2CanonicalObjective(value) {
 }
 
 function v2ScopedWorkspace() {
-  if (v2WorkspaceCwd === v2WorkspaceRoot || v2WorkspaceCwd.startsWith(`${v2WorkspaceRoot}/`)) return v2WorkspaceCwd;
+  if ((v2WorkspaceCwd === v2WorkspaceRoot || v2WorkspaceCwd.startsWith(`${v2WorkspaceRoot}/`)) && existsSync(v2WorkspaceCwd)) return v2WorkspaceCwd;
   return '';
 }
 
@@ -2267,7 +2267,10 @@ function v2ActionPlan(message) {
   const actionable = /\b(fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|install|deploy|wire|adjust|improve|tighten|save|remember|remind|schedule|restart|start|stop|send|publish|merge|delete|buy|purchase|pay|auth|login|credential|secret)\b/.test(text);
   if (!asksCoordinator && !actionable) return undefined;
   const risky = /\b(deploy|publish|merge|delete|remove\s+(?:all|the|a)?\s*(?:data|database|account|project)|restart|systemctl|service|send|email|message|post|tweet|purchase|buy|pay|spend|auth|login|credential|token|secret|password|api[_ -]?key|install)\b/.test(text);
-  if (risky) return { objective, capability: 'external', risky: true };
+  if (risky) {
+    const neverDelegate = /\b(?:delete|secret|token|password|auth|login|credential|purchase|buy|pay|spend)\b/.test(text);
+    return { objective, capability: 'external', risky: true, actionClass: neverDelegate ? 'never-delegate' : 'confirmed-high-impact' };
+  }
   if (asksCoordinator) return { objective, capability: 'coordinator', risky: false, cwd: v2ScopedWorkspace() || home };
   if (/^(?:check|read|inspect|verify|list|find)\b/.test(text)) return { objective, capability: 'read', risky: false, cwd: home };
   const writes = /\b(fix|implement|update|repair|patch|make|add|create|change|remove|build|wire|adjust|improve|tighten)\b/.test(text);
@@ -2283,6 +2286,10 @@ function v2Affirmative(message) {
 
 function v2Cancellation(message) {
   return /\b(?:cancel|never mind|nevermind|stop|don['’]t do it)\b/i.test(String(message || ''));
+}
+
+function v2ConfirmationCommand(message) {
+  return /^\s*(?:confirm|deny)\s+[a-f0-9]{32}\s*$/i.test(String(message || ''));
 }
 
 function v2ConfirmationQuestion(value) {
@@ -2387,7 +2394,7 @@ async function startImessageCoordinator(threadId, message, plan) {
   child.on('error', () => { void settle(true, 'I could not start the coordinator.'); });
   child.on('exit', (code) => { if (!settled) void settle(code !== 0, code === 0 ? '' : 'The coordinator stopped before it finished.'); });
   if (launchFailed) void settle(true, 'I could not start the coordinator.');
-  else child.stdin.end(`${JSON.stringify({ type: 'prompt', id: correlationId, message: miCoordinatorPrompt({ message, context: history }) })}\n`);
+  else child.stdin.end(`${JSON.stringify({ type: 'prompt', id: correlationId, message: miCoordinatorPrompt({ message, context: history, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass }) })}\n`);
   await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: correlationId }).catch(() => undefined);
   return { ok: true, reply, handoff: true, taskId: correlationId };
 }
@@ -2420,10 +2427,18 @@ async function handleImessageV2(threadId, message) {
   if (pending) {
     const confirmation = await classifyConfirmationReply({ threadId, reply: message });
     if (confirmation.kind === 'confirm') {
-      const reply = 'I have your confirmation. This high-impact action remains blocked until its reviewed execution path is available.';
+      const record = confirmation.record;
+      if (record.actionClass === 'never-delegate' || !record.objective) {
+        const reply = 'I have your confirmation, but this action cannot be delegated from iMessage.';
+        await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirmed-blocked' });
+        return { ok: true, reply, handoff: false, confirmationId: record.id };
+      }
       await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirmed' });
-      return { ok: true, reply, handoff: false, confirmationId: confirmation.record.id };
+      return startImessageCoordinator(threadId, record.objective, {
+        objective: record.objective, capability: 'coordinator', cwd: v2ScopedWorkspace() || home,
+        confirmedObjective: record.objective, actionClass: record.actionClass || 'confirmed-high-impact',
+      });
     }
     if (confirmation.kind === 'deny') {
       const reply = 'Okay, I won’t proceed with that action.';
@@ -2431,6 +2446,12 @@ async function handleImessageV2(threadId, message) {
       await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-cancelled' });
       return { ok: true, reply, handoff: false };
     }
+  }
+  if (v2ConfirmationCommand(message)) {
+    const reply = 'I can’t find a pending action for that confirmation.';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-missing' });
+    return { ok: true, reply, handoff: false };
   }
   const directPlan = v2ActionPlan(message);
   if (directPlan) {
@@ -2445,9 +2466,11 @@ async function handleImessageV2(threadId, message) {
       return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
     }
     if (directPlan.risky) {
+      const safeObjective = /\b(?:token|secret|password|api[_ -]?key|credential)\b/i.test(directPlan.objective) ? undefined : directPlan.objective.slice(0, 240);
       const pendingAction = await createPendingConfirmation({
-        threadId, summary: 'Requested iMessage action',
-        riskReason: directPlan.capability === 'write' ? 'Write outside the approved work area' : 'High-impact iMessage action',
+        threadId, summary: safeObjective || 'Requested iMessage action',
+        riskReason: directPlan.actionClass === 'never-delegate' ? 'This action cannot be delegated from iMessage' : 'High-impact iMessage action',
+        objective: safeObjective, actionClass: directPlan.actionClass || 'confirmed-high-impact',
       });
       const reply = v2ConfirmReply(directPlan, pendingAction.id);
       await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
@@ -2455,11 +2478,14 @@ async function handleImessageV2(threadId, message) {
       return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
     }
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    const result = directPlan.capability === 'coordinator'
-      ? await startImessageCoordinator(threadId, message, directPlan)
-      : await v2StartWorker(threadId, message, directPlan);
-    return result;
+    return startImessageCoordinator(threadId, message, { ...directPlan, capability: 'coordinator', cwd: directPlan.cwd || v2ScopedWorkspace() || home });
   }
+  // Normal iMessage turns are Pi coordinator turns. The old tool-less V2
+  // foreground is intentionally not a normal route; it remains only as an
+  // invocation fallback for a future coordinator outage policy.
+  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+  return startImessageCoordinator(threadId, message, { objective: v2CanonicalObjective(message), capability: 'coordinator', cwd: v2ScopedWorkspace() || home });
+
   const invocation = await runImessageV2(message, threadId);
   if (invocation.failure) {
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });

@@ -14,8 +14,11 @@ const root = await mkdtemp(join(tmpdir(), 'mi-pending-confirmations-'));
 const statePath = join(root, 'state', 'pending-confirmations.json');
 const at = (value) => new Date(value);
 try {
-  const first = await createPendingConfirmation({ threadId: 'thread-a', summary: 'Send the approved reply', riskReason: 'This sends an external message', continuationRef: 'resume-1' }, { statePath, now: at('2026-01-01T00:00:00Z') });
-  assert.equal((await readPendingConfirmation('thread-a', { statePath, now: at('2026-01-01T00:01:00Z') })).id, first.id);
+  const first = await createPendingConfirmation({ threadId: 'thread-a', summary: 'Send the approved reply', riskReason: 'This sends an external message', continuationRef: 'resume-1', objective: 'Deploy the garden plan change', actionClass: 'confirmed-high-impact' }, { statePath, now: at('2026-01-01T00:00:00Z') });
+  const storedFirst = await readPendingConfirmation('thread-a', { statePath, now: at('2026-01-01T00:01:00Z') });
+  assert.equal(storedFirst.id, first.id);
+  assert.equal(storedFirst.objective, 'Deploy the garden plan change', 'bounded approved objective persists for one confirmation');
+  assert.equal(storedFirst.actionClass, 'confirmed-high-impact');
   let second = await createPendingConfirmation({ threadId: 'thread-a', summary: 'Send the replacement reply', riskReason: 'This sends an external message' }, { statePath, now: at('2026-01-01T00:02:00Z') });
   assert.notEqual(second.id, first.id);
   assert.equal((await readPendingConfirmation('thread-a', { statePath, now: at('2026-01-01T00:02:01Z') })).id, second.id);
