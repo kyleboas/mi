@@ -34,11 +34,7 @@ Prepare a supported Linux VPS with:
 
 The web installer calls `tailscale status` and `tailscale cert`. The stack readiness check expects `llm-gateway.service`, `mi-photon-bridge.service`, `mi-web-chat.service`, `mi-daemon.service`, and `mi-tick.timer`.
 
-### Important portability stop
-
-The gateway files in this commit contain host-specific absolute account paths in `gateway/start-llm-gateway`, `gateway/wait-for-llm-gateway-health`, `gateway/pi_subscription_handler.py`, and `gateway/llm-gateway.service.d/20-codex-subscription.conf`. Installer variables cover the Mi app, user units, and Photon unit, but they do not rewrite those gateway files.
-
-Do not run the complete production stack on a differently named account until a reviewed code change makes those four gateway files use `<mi-user>`, `<service-home>`, and the new Pi path. Do not work around this with a copied home, copied `.pi` directory, fake account, or symlink to another user's files. After that small port is reviewed, use the commands below. This stop prevents a clean VPS from silently reading the wrong account or failing open.
+The gateway installer renders account paths from explicit settings. It rejects placeholders, relative or unclean paths, symlinks, account-home mismatches, and unexpected owners before changing gateway files or restarting the service.
 
 ## 2. Create a fresh OS user
 
@@ -49,6 +45,7 @@ export MI_USER='<mi-user>'
 export MI_HOME='<service-home>'
 export MI_ROOT='<mi-root>'
 export MI_WORKSPACE='<workspace-root>'
+export MI_GATEWAY_WORK='/var/lib/llm-gateway'
 ```
 
 Use an app path under the service home for `<mi-root>`. Use a dedicated existing directory such as `<service-home>/workflows` for `<workspace-root>`. It must not equal the home directory. Mi checks the real path and refuses a workspace root that is the home or an ancestor of it.
@@ -56,7 +53,8 @@ Use an app path under the service home for `<mi-root>`. Use a dedicated existing
 As root, create the empty roots with the service user as owner:
 
 ```bash
-install -d -m 0700 -o "$MI_USER" -g "$MI_USER" "$MI_HOME" "$MI_WORKSPACE"
+install -d -m 0700 -o "$MI_USER" -g "$MI_USER" \
+  "$MI_HOME" "$MI_WORKSPACE" "$MI_GATEWAY_WORK"
 ```
 
 ## 3. Clone and build
@@ -132,12 +130,14 @@ Pushover is optional. Leave it disabled for the first smoke test.
 
 ## 7. Install the services
 
-After the gateway portability stop above has been fixed and reviewed, run the tracked stack installer with explicit paths. Resolve each command path before sudo:
+Run the tracked stack installer with every account-specific gateway value set. Resolve executable symlinks before sudo; the gateway rejects symlink executables so a package update cannot silently change what it runs:
 
 ```bash
-NODE_BIN="$(command -v node)"
-MI_BIN="$(command -v mi)"
-GATEWAY_HEALTH='<brokered-local-health-command>'
+NODE_BIN="$(readlink -f "$(command -v node)")"
+MI_BIN="$(readlink -f "$(command -v mi)")"
+PI_COMMAND_DIR="$(dirname "$(command -v pi)")"
+PI_BIN="$(readlink -f "$(command -v pi)")"
+GATEWAY_HEALTH="$(readlink -f '<brokered-local-health-command>')"
 
 sudo env \
   MI_STACK_NO_SUDO=1 \
@@ -146,7 +146,14 @@ sudo env \
   MI_SERVICE_USER="$MI_USER" \
   MI_NODE_BIN="$NODE_BIN" \
   MI_BIN="$MI_BIN" \
+  MI_GATEWAY_SERVICE_USER="$MI_USER" \
+  MI_GATEWAY_SERVICE_HOME="$MI_HOME" \
+  MI_GATEWAY_PI_BINARY="$PI_BIN" \
+  MI_GATEWAY_PI_COMMAND_DIR="$PI_COMMAND_DIR" \
+  MI_GATEWAY_PI_AGENT_DIR="$MI_HOME/.pi/agent" \
+  MI_GATEWAY_WORK_DIR="$MI_GATEWAY_WORK" \
   MI_GATEWAY_HEALTH_COMMAND="$GATEWAY_HEALTH" \
+  MI_GATEWAY_HEALTH_USER="$MI_USER" \
   MI_PHOTON_SECRET_ENV="/etc/agent-secrets/projects/<project-name>/photon.secret" \
   "$MI_ROOT/scripts/install-mi-stack.sh"
 ```
@@ -244,7 +251,9 @@ Check units without dumping their environments or secret files:
 systemctl --user status mi-web-chat.service mi-daemon.service mi-tick.timer
 sudo systemctl status mi-photon-bridge.service
 MI_APP_DIR="$MI_ROOT" MI_STACK_HOME="$MI_HOME" MI_SERVICE_USER="$MI_USER" \
-  MI_NODE_BIN="$(command -v node)" MI_GATEWAY_HEALTH_COMMAND='<brokered-local-health-command>' \
+  MI_NODE_BIN="$(readlink -f "$(command -v node)")" \
+  MI_GATEWAY_HEALTH_COMMAND="$(readlink -f '<brokered-local-health-command>')" \
+  MI_GATEWAY_HEALTH_USER="$MI_USER" \
   "$MI_ROOT/scripts/install-mi-stack.sh" --check
 ```
 

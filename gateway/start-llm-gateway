@@ -9,7 +9,12 @@ fi
 
 # Do not load optional provider credentials. The custom Pi provider uses only Pi's
 # built-in subscription storage; this credential authenticates gateway clients.
-export HOME=/home/kyle
+: "${MI_GATEWAY_SERVICE_HOME:?configured gateway service home is required}"
+case "$MI_GATEWAY_SERVICE_HOME" in
+  /*) ;;
+  *) echo "llm-gateway: service home must be absolute" >&2; exit 1 ;;
+esac
+export HOME="$MI_GATEWAY_SERVICE_HOME"
 export LITELLM_MASTER_KEY="$(tr -d '\r\n' < "$CREDENTIALS_DIRECTORY/gateway")"
 unset OPENROUTER_API_KEY CLOUDFLARE_AI_GATEWAY_TOKEN CLOUDFLARE_API_TOKEN \
   CLOUDFLARE_TOKEN CF_API_TOKEN OPENAI_API_KEY OPENAI_BASE_URL LOCAL_LLM_GATEWAY_TOKEN

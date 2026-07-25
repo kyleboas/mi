@@ -5,6 +5,14 @@ set -Eeuo pipefail
 ROOT="${MI_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 TARGET_HOME="${MI_STACK_HOME:-/home/kyle}"
 SYSTEM_ROOT="${MI_SYSTEM_ROOT:-}"
+SERVICE_USER="${MI_SERVICE_USER:-kyle}"
+GATEWAY_SERVICE_USER="${MI_GATEWAY_SERVICE_USER:-$SERVICE_USER}"
+GATEWAY_SERVICE_HOME="${MI_GATEWAY_SERVICE_HOME:-$TARGET_HOME}"
+GATEWAY_PI_BINARY="${MI_GATEWAY_PI_BINARY:-/home/kyle/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js}"
+GATEWAY_PI_COMMAND_DIR="${MI_GATEWAY_PI_COMMAND_DIR:-/home/kyle/.nvm/versions/node/v24.15.0/bin}"
+GATEWAY_PI_AGENT_DIR="${MI_GATEWAY_PI_AGENT_DIR:-$TARGET_HOME/.pi/agent}"
+GATEWAY_WORK_DIR="${MI_GATEWAY_WORK_DIR:-/var/lib/llm-gateway}"
+GATEWAY_HEALTH_USER="${MI_GATEWAY_HEALTH_USER:-$GATEWAY_SERVICE_USER}"
 MODE=install
 case "${1:-}" in
   '') ;;
@@ -95,6 +103,8 @@ $TARGET_HOME/fix-mi-gateway.sh
 $SYSTEM_ROOT/etc/litellm/config.yaml
 $SYSTEM_ROOT/etc/litellm/pi_subscription_handler.py
 $SYSTEM_ROOT/etc/litellm/pi_subscription_eval_handler.py
+$SYSTEM_ROOT/usr/local/libexec/start-llm-gateway
+$SYSTEM_ROOT/usr/local/libexec/wait-for-llm-gateway-health
 $SYSTEM_ROOT/etc/systemd/system/llm-gateway.service.d/20-codex-subscription.conf
 $SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service
 $SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service.d/override.conf
@@ -134,14 +144,28 @@ as_user() {
   if [[ -n "$SYSTEM_ROOT" || ${MI_STACK_NO_RUNUSER:-0} == 1 ]]; then "$@"; else runuser -u "${MI_SERVICE_USER:-kyle}" -- "$@"; fi
 }
 
-run_stage production-gateway env MI_GATEWAY_ROOT="$SYSTEM_ROOT" "$ROOT/scripts/install-mi-subscription-gateway-root.sh"
+run_stage production-gateway env \
+  MI_GATEWAY_ROOT="$SYSTEM_ROOT" \
+  MI_GATEWAY_SERVICE_USER="$GATEWAY_SERVICE_USER" \
+  MI_GATEWAY_SERVICE_HOME="$GATEWAY_SERVICE_HOME" \
+  MI_GATEWAY_PI_BINARY="$GATEWAY_PI_BINARY" \
+  MI_GATEWAY_PI_COMMAND_DIR="$GATEWAY_PI_COMMAND_DIR" \
+  MI_GATEWAY_PI_AGENT_DIR="$GATEWAY_PI_AGENT_DIR" \
+  MI_GATEWAY_WORK_DIR="$GATEWAY_WORK_DIR" \
+  MI_GATEWAY_HEALTH_COMMAND="${MI_GATEWAY_HEALTH_COMMAND:-/home/kyle/bin/llm-gateway-health}" \
+  MI_GATEWAY_HEALTH_USER="$GATEWAY_HEALTH_USER" \
+  "$ROOT/scripts/install-mi-subscription-gateway-root.sh"
 run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR="$TARGET_HOME/.pi/agent" "${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}" "$ROOT/scripts/install-mi-gateway-models.mjs"
 run_stage gateway-client as_user env HOME="$TARGET_HOME" XDG_DATA_HOME="$TARGET_HOME/.local/share" XDG_CONFIG_HOME="$TARGET_HOME/.config" MI_GATEWAY_CLIENT_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-gateway-client.sh"
 run_stage tailscale-web as_user env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" MI_APP_DIR="$ROOT" "$ROOT/scripts/install-mi-web-chat-systemd.sh"
 run_stage user-units as_user env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" MI_APP_DIR="$ROOT" "$ROOT/scripts/install-mi-user-units.sh"
 run_stage photon-loopback env MI_APP_DIR="$ROOT" MI_SYSTEM_ROOT="$SYSTEM_ROOT" "$ROOT/scripts/install-mi-imessage-stack-root.sh"
 run_stage generated-entrypoints env MI_STACK_HOME="$TARGET_HOME" "$ROOT/scripts/install-mi-home-entrypoints.sh"
-run_stage readiness "$ROOT/scripts/check-mi-stack-readiness.sh"
+run_stage readiness env \
+  MI_SERVICE_USER="$SERVICE_USER" \
+  MI_GATEWAY_HEALTH_USER="$GATEWAY_HEALTH_USER" \
+  MI_GATEWAY_HEALTH_COMMAND="${MI_GATEWAY_HEALTH_COMMAND:-/home/kyle/bin/llm-gateway-health}" \
+  "$ROOT/scripts/check-mi-stack-readiness.sh"
 committed=1
 trap - ERR INT TERM
 rm -rf "$backup"

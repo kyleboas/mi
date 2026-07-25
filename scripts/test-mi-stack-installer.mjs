@@ -18,7 +18,10 @@ await chmod(path.join(bin, 'sudo'), 0o700);
 const stageNames = ['production-gateway', 'production-registry', 'gateway-client', 'tailscale-web', 'user-units', 'photon-loopback', 'readiness'];
 const stageLog = path.join(tmp, 'stage-log');
 for (const name of stageNames) {
-  await writeFile(path.join(stages, name), `#!/bin/sh\necho ${name} >> ${JSON.stringify(stageLog)}\n`);
+  const gatewayValues = name === 'production-gateway'
+    ? `printf '%s\\n' "$MI_GATEWAY_SERVICE_USER|$MI_GATEWAY_SERVICE_HOME|$MI_GATEWAY_PI_BINARY|$MI_GATEWAY_PI_COMMAND_DIR|$MI_GATEWAY_PI_AGENT_DIR|$MI_GATEWAY_WORK_DIR|$MI_GATEWAY_HEALTH_USER" > ${JSON.stringify(path.join(tmp, 'gateway-values'))}\n`
+    : '';
+  await writeFile(path.join(stages, name), `#!/bin/sh\necho ${name} >> ${JSON.stringify(stageLog)}\n${gatewayValues}`);
   await chmod(path.join(stages, name), 0o700);
 }
 const env = {
@@ -29,6 +32,14 @@ const env = {
   MI_SYSTEM_ROOT: root,
   MI_STACK_STAGE_COMMAND_DIR: stages,
   MI_STACK_NO_RUNUSER: '1',
+  MI_SERVICE_USER: 'other-user',
+  MI_GATEWAY_SERVICE_USER: 'other-user',
+  MI_GATEWAY_SERVICE_HOME: home,
+  MI_GATEWAY_PI_BINARY: path.join(tmp, 'pi-real'),
+  MI_GATEWAY_PI_COMMAND_DIR: bin,
+  MI_GATEWAY_PI_AGENT_DIR: path.join(home, '.pi/agent'),
+  MI_GATEWAY_WORK_DIR: path.join(tmp, 'gateway-work'),
+  MI_GATEWAY_HEALTH_USER: 'other-health',
 };
 const run = (args = [], extra = {}) => spawnSync('bash', [path.join(repo, 'scripts/install-mi-stack.sh'), ...args], { env: { ...env, ...extra }, encoding: 'utf8' });
 
@@ -42,6 +53,11 @@ result = run();
 assert.equal(result.status, 0, result.stderr);
 assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').length, 1, 'normal install has one sudo boundary');
 assert.deepEqual((await readFile(stageLog, 'utf8')).trim().split('\n'), stageNames, 'fresh orchestration order');
+assert.equal(
+  (await readFile(path.join(tmp, 'gateway-values'), 'utf8')).trim(),
+  `other-user|${home}|${path.join(tmp, 'pi-real')}|${bin}|${path.join(home, '.pi/agent')}|${path.join(tmp, 'gateway-work')}|other-health`,
+  'stack forwards all portable gateway settings',
+);
 assert.equal((await stat(path.join(home, 'install-mi-stack.sh'))).mode & 0o777, 0o700);
 assert.match(await readFile(path.join(home, 'install-mi-stack.sh'), 'utf8'), /MI-GENERATED: install-mi-stack-v1/);
 result = run();
@@ -50,14 +66,18 @@ assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').length, 2, '
 
 // Partial failure restores an existing generated file and removes partial output.
 const mutation = path.join(home, '.local/share/mi/mi-gateway-client.py');
+const gatewayWrapper = path.join(root, 'usr/local/libexec/start-llm-gateway');
 await mkdir(path.dirname(mutation), { recursive: true });
+await mkdir(path.dirname(gatewayWrapper), { recursive: true });
 await writeFile(mutation, 'before\n');
-await writeFile(path.join(stages, 'gateway-client'), `#!/bin/sh\nprintf 'partial\\n' > ${JSON.stringify(mutation)}\nexit 23\n`);
+await writeFile(gatewayWrapper, 'old wrapper\n');
+await writeFile(path.join(stages, 'gateway-client'), `#!/bin/sh\nprintf 'partial\\n' > ${JSON.stringify(mutation)}\nprintf 'new wrapper\\n' > ${JSON.stringify(gatewayWrapper)}\nexit 23\n`);
 await chmod(path.join(stages, 'gateway-client'), 0o700);
 result = run();
 assert.notEqual(result.status, 0);
 assert.match(result.stderr, /stage gateway-client; restoring/);
 assert.equal(await readFile(mutation, 'utf8'), 'before\n', 'atomic rollback restores pre-transaction file');
+assert.equal(await readFile(gatewayWrapper, 'utf8'), 'old wrapper\n', 'rollback restores the gateway wrapper');
 
 // Marker/checksum safety: unknown obsolete wrappers are never deleted.
 const unknown = path.join(home, 'fix-mi-gateway.sh');

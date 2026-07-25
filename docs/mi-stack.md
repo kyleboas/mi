@@ -8,7 +8,9 @@ Run one command as Kyle:
 /home/kyle/install-mi-stack.sh
 ```
 
-The entrypoint performs one sudo transition and coordinates the tracked modular installers. It fails at the first named stage, restores generated configuration files from the transaction snapshot, and leaves credentials and operator-owned overrides untouched. Re-running it is idempotent.
+The entrypoint performs one sudo transition and coordinates the tracked modular installers. It fails at the first named stage, restores generated configuration files from the transaction snapshot, and leaves credentials and operator-owned overrides untouched. Re-running it is idempotent. The reviewed current-host defaults remain Kyle's service account and installed Pi path.
+
+For another account, pass `MI_SERVICE_USER`, `MI_STACK_HOME`, `MI_GATEWAY_SERVICE_USER`, `MI_GATEWAY_SERVICE_HOME`, `MI_GATEWAY_PI_BINARY`, `MI_GATEWAY_PI_COMMAND_DIR`, `MI_GATEWAY_PI_AGENT_DIR`, `MI_GATEWAY_WORK_DIR`, `MI_GATEWAY_HEALTH_COMMAND`, and `MI_GATEWAY_HEALTH_USER` explicitly. The service home must match the account database. Home, Pi command, agent, and work directories must be real account-owned directories. Pi and health commands must be absolute, executable, non-symlink files owned by the selected user or root. See `docs/second-vps-setup.md` for the complete command.
 
 Preview or inspect without mutation or sudo:
 
