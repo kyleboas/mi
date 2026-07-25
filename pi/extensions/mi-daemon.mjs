@@ -976,11 +976,15 @@ async function listAllTasksLocked(options = {}) {
 async function stopTask(request) {
   const requested = [request.taskId, request.id, request.sessionFile, request.actualSessionFile, request.sessionId, request.sessionName, request.name].filter(Boolean).map(String);
   if (requested.length === 0) throw new Error("taskId required");
+  // Mark a live worker before task/session reads. Those reads can wait on a
+  // settling RPC, and a late finish must never publish while stop is pending.
+  const earlyActiveWorker = requested.map((key) => activeWorkers.get(key)).find(Boolean);
+  if (earlyActiveWorker) earlyActiveWorker.expectedStop = true;
   const tasks = await readTasks();
   const sessions = await listPiSessionTasks();
   const task = [...tasks, ...sessions].find((entry) => taskDismissKeys(entry).some((key) => requested.includes(key)));
   const name = task?.sessionName || task?.name || requested[0];
-  const activeWorker = task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) : undefined;
+  const activeWorker = earlyActiveWorker || (task ? workerKeys(task, name).map((key) => activeWorkers.get(key)).find(Boolean) : undefined);
   const taskStatus = String(task?.status || "").toLowerCase();
   if (task && ["complete", "completed", "done"].includes(taskStatus)) {
     return { text: `${name} is already complete` };
