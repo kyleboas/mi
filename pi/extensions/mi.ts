@@ -23,7 +23,9 @@ const INDEX_PATH = join(THREADS_DIR, "index.json");
 const MAIN_THREAD_ID = "main";
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, ".pi", "agent", "mi");
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, "main.sock");
-const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, ".pi", "agent", "extensions", "mi-daemon.mjs");
+// This TUI is opt-in through `pi --extension <reviewed path>`. Its daemon is
+// also a reviewed Mi source file, never a Pi auto-loaded extension.
+const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(MI_ROOT, "pi", "extensions", "mi-daemon.mjs");
 const MI_PI_BRIDGE_DIR = join(MI_RUNTIME_DIR, "pi-bridges");
 const MI_TASKS_DIR = join(HOME, "mi");
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, "preferences.md");

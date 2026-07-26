@@ -17,6 +17,20 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+RUNTIME = tempfile.TemporaryDirectory()
+RUNTIME_ROOT = Path(RUNTIME.name)
+for runtime_dir in (RUNTIME_ROOT / "home", RUNTIME_ROOT / "home" / ".pi" / "agent", RUNTIME_ROOT / "work"):
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+RUNTIME_PI = RUNTIME_ROOT / "pi"
+RUNTIME_PI.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+RUNTIME_PI.chmod(0o700)
+os.environ.update({
+    "MI_GATEWAY_PI_BINARY": str(RUNTIME_PI),
+    "MI_GATEWAY_PI_COMMAND_DIR": str(RUNTIME_ROOT),
+    "MI_GATEWAY_SERVICE_HOME": str(RUNTIME_ROOT / "home"),
+    "MI_GATEWAY_PI_AGENT_DIR": str(RUNTIME_ROOT / "home" / ".pi" / "agent"),
+    "MI_GATEWAY_WORK_DIR": str(RUNTIME_ROOT / "work"),
+})
 
 
 def load_handler():
@@ -72,6 +86,22 @@ def response():
 
 def messages(text="hello"):
     return [{"role": "system", "content": "rules"}, {"role": "user", "content": text}]
+
+
+def test_configuration_validation():
+    env = {**os.environ, "MI_GATEWAY_PI_BINARY": "pi"}
+    result = subprocess.run(
+        [sys.executable, "-c", "import pi_subscription_handler"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "safe absolute path" in result.stderr
+    assert M.PI_COMMAND_DIR in M.PI_ENV["PATH"]
+    assert "/home/kyle" not in repr(M.PI_ENV)
 
 
 def test_serialization():
@@ -311,6 +341,7 @@ def test_proxy_authentication(fake: Path, log: Path):
 
 
 def main():
+    test_configuration_validation()
     test_serialization()
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -84,6 +84,9 @@ try {
   await mkdir(sessionDir, { recursive: true });
   await mkdir(variantDir, { recursive: true });
   await mkdir(miRoot, { recursive: true });
+  const privateExtensions = join(miRoot, 'pi', 'extensions');
+  await mkdir(privateExtensions, { recursive: true });
+  for (const file of ['mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await copyFile(new URL(`../pi/extensions/${file}`, import.meta.url), join(privateExtensions, file));
   await mkdir(join(home, 'mi', 'state'), { recursive: true });
   const startedAt = iso();
   await writeFile(sessionFile, [

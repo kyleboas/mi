@@ -6,6 +6,7 @@ repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=lib-mi-gateway-install.sh
 . "$repo_dir/scripts/lib-mi-gateway-install.sh"
 mi_gateway_require_root
+mi_gateway_load_config
 
 config_source="$repo_dir/gateway/litellm-config.yaml"
 handler_source="$repo_dir/gateway/pi_subscription_handler.py"

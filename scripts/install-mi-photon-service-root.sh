@@ -56,11 +56,7 @@ WantedBy=multi-user.target
 EOF_UNIT
 
 chmod 0644 "$UNIT_PATH"
-if [[ ${MI_PHOTON_NO_SYSTEMD:-0} != 1 ]]; then
-  systemctl daemon-reload
-  systemctl enable mi-photon-bridge.service
-fi
-
-echo "Installed $UNIT_PATH"
-echo "Start with: sudo systemctl start mi-photon-bridge"
+# Files only. An operator must reload and start the Photon bridge separately.
+echo "Installed $UNIT_PATH without activating services"
+echo "Start later with: sudo systemctl start mi-photon-bridge"
 echo "Logs: sudo journalctl -u mi-photon-bridge -f"

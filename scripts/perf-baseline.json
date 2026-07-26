@@ -1,14 +1,15 @@
 {
-  "capturedAt": "2026-07-05T00:00:00.000Z",
-  "notes": "Wall-clock baseline including Node process startup on a 1-CPU/1.9GB VPS. Values must accommodate contention from other processes; tighten after in-process render instrumentation lands.",
-  "metrics": {
-    "coldRender8WallMs": 4000,
-    "render200WallMs": 4000,
-    "hostile40x10WallMs": 3500
+  "version": 2,
+  "capturedAt": "2026-07-25T00:00:00.000Z",
+  "notes": "CPU baselines measure the hermetic child process after one bounded warmup. Wall ceilings remain a smoke check for hangs and unavailable runtime, while CPU medians avoid treating scheduler wait as slower Mi rendering.",
+  "cpuMetrics": {
+    "coldRender8": 2274,
+    "render200": 2708,
+    "hostile40x10": 2193
   },
-  "budgets": {
-    "coldRender8WallMs": 8000,
-    "render200WallMs": 8000,
-    "hostile40x10WallMs": 6000
+  "wallBudgets": {
+    "coldRender8": 8000,
+    "render200": 8000,
+    "hostile40x10": 6000
   }
 }

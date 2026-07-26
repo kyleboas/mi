@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 
@@ -118,7 +119,8 @@ app = await Spectrum({
 });
 
 const knownSpaces = new Map();
-const seen = new Set();
+const seen = new Map();
+const MAX_SEEN = 5000;
 
 function splitList(value) {
   return String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -126,6 +128,42 @@ function splitList(value) {
 
 function senderFor(space, message) {
   return String(message?.sender?.id || space?.phone || message?.space?.phone || '').trim();
+}
+
+const acceptedDeliveryId = /^[A-Za-z0-9._:-]{1,200}$/;
+
+function stableDeliveryId(space, message) {
+  const upstream = [message?.id, message?.messageId, message?.eventId, message?.guid]
+    .map((value) => String(value || '').trim())
+    .find(Boolean);
+  if (upstream && acceptedDeliveryId.test(upstream)) return upstream;
+
+  // Hash stable event metadata and normalized content. The digest is the only
+  // content-derived value retained or sent; plaintext message text never
+  // enters the delivery ID.
+  const normalize = (value) => {
+    if (typeof value === 'string') return value.replace(/\r\n?/g, '\n').trim();
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalize(value[key])]));
+    }
+    return value ?? null;
+  };
+  const stableFields = {
+    version: 2,
+    upstream: upstream || '',
+    spaceId: String(space?.id || message?.space?.id || ''),
+    sender: senderFor(space, message),
+    timestamp: String(message?.timestamp || message?.createdAt || ''),
+    direction: String(message?.direction || ''),
+    content: normalize(message?.content || null),
+  };
+  // Without an upstream ID or timestamp there is no stable event identity.
+  // Process the event rather than suppressing a possibly new message that
+  // happens to have identical content. Stable metadata above still dedups
+  // normal redelivery, and this fallback retains no plaintext.
+  if (!upstream && !stableFields.timestamp) return undefined;
+  return `photon-${createHash('sha256').update(JSON.stringify(stableFields)).digest('hex').slice(0, 32)}`;
 }
 
 function contentTextFor(content) {
@@ -187,12 +225,12 @@ async function miJson(path, init = {}) {
   return data;
 }
 
-async function askImessage(message) {
+async function askImessage(message, deliveryId) {
   const startedAt = Date.now();
   console.log(`imessage send chars=${String(message || '').length}`);
   const data = await miJson('/api/imessage', {
     method: 'POST',
-    body: JSON.stringify({ thread: miThread, message }),
+    body: JSON.stringify({ thread: miThread, message, deliveryId }),
   });
   await emitTurnEvent(root, { stage: 'ack', outcome: data.handoff ? 'ok' : 'skipped', route: 'photon', modelProfile: 'none', turn: String(data.taskId || message), durationMs: Date.now() - startedAt }).catch(() => undefined);
   return { reply: cleanReply(data.reply), handoff: Boolean(data.handoff), taskId: String(data.taskId || '').trim(), startedAt };
@@ -279,10 +317,13 @@ function trackFollowUp(task) {
 
 async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
-  const id = String(message?.id || `${space?.id}:${message?.timestamp || Date.now()}`);
-  if (seen.has(id)) return;
-  seen.add(id);
-  if (seen.size > 5000) seen.clear();
+  const id = stableDeliveryId(space, message);
+  if (id && seen.has(id)) return;
+  if (id) {
+    seen.set(id, Date.now());
+    // Remove only the oldest entry, preserving replay protection for the rest.
+    if (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value);
+  }
 
   const sender = senderFor(space, message);
   const spaceId = String(space?.id || message?.space?.id || '');
@@ -308,7 +349,7 @@ async function handle(space, message) {
     // Do not wrap the Mi call in space.responding(): Photon typing/read-state RPCs
     // can fail with upstream connection drops before Mi is even asked. Typing is
     // cosmetic and best-effort; replies must continue without it.
-    const result = await askImessage(body);
+    const result = await askImessage(body, id);
     const ackSent = await send(space, result.reply);
     await stopTypingNow();
     if (result.handoff && ackSent) {

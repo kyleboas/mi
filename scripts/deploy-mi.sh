@@ -10,77 +10,53 @@ if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --o
   exit 1
 fi
 
+# Mi runs from this reviewed tree. Never copy Mi files into Pi's global
+# auto-load directory.
+for file in pi/extensions/mi-daemon.mjs pi/extensions/mi-capability-guard.ts pi/extensions/mi-orchestrator-adapter.ts pi/extensions/mi.ts; do
+  [[ -f "$file" ]] || { echo "Missing reviewed Mi file: $file" >&2; exit 1; }
+done
+
 npm test
 
-install -d -m 700 "$HOME/.pi/agent/extensions"
-DEPLOY_DIR="$HOME/.pi/agent/extensions"
-BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mi-deploy-backup.XXXXXX")"
-rollback_deploy() {
-  echo "Mi deploy canary failed; rolling back previous deployed extension files." >&2
-  for file in mi.ts mi-daemon.mjs mi-capability-guard.ts; do
-    if [ -f "$BACKUP_DIR/$file" ]; then
-      install -m "$(stat -c '%a' "$BACKUP_DIR/$file")" "$BACKUP_DIR/$file" "$DEPLOY_DIR/$file"
-    else
-      rm -f "$DEPLOY_DIR/$file"
-    fi
-  done
-  restart_user_unit mi-daemon.service || true
-  restart_user_unit mi-web-chat.service || true
-}
-for file in mi.ts mi-daemon.mjs mi-capability-guard.ts; do
-  if [ -f "$DEPLOY_DIR/$file" ]; then cp -p "$DEPLOY_DIR/$file" "$BACKUP_DIR/$file"; fi
-done
-install -m 600 pi/extensions/mi.ts "$DEPLOY_DIR/mi.ts"
-if [ -f pi/extensions/auto-compact-cost.ts ]; then
-  install -m 600 pi/extensions/auto-compact-cost.ts "$DEPLOY_DIR/auto-compact-cost.ts"
-fi
-install -m 700 pi/extensions/mi-daemon.mjs "$DEPLOY_DIR/mi-daemon.mjs"
-if [ -f pi/extensions/mi-capability-guard.ts ]; then
-  install -m 600 pi/extensions/mi-capability-guard.ts "$DEPLOY_DIR/mi-capability-guard.ts"
-fi
+# Run canaries before restarting services. A failed canary changes no deployed
+# files; roll back by checking out the prior reviewed commit before activation.
+MI_AUTO_ACTIONS_ENABLED=false \
+MI_IMESSAGE_MONITOR_ENABLED=false \
+MI_DAILY_BRIEF=false \
+MI_QUESTIONS_ENABLED=false \
+MI_LOOP_FACTORY_ENABLED=false \
+PUSHOVER_USER= \
+PUSHOVER_TOKEN= \
+node scripts/test-mi-tick.mjs
+
+MI_AUTO_ACTIONS_ENABLED=false \
+MI_IMESSAGE_MONITOR_ENABLED=false \
+MI_DAILY_BRIEF=false \
+MI_QUESTIONS_ENABLED=false \
+MI_LOOP_FACTORY_ENABLED=false \
+PUSHOVER_USER= \
+PUSHOVER_TOKEN= \
+MI_ROOT="$ROOT" \
+MI_DAEMON_SYSTEMD=0 \
+node dist/src/cli.js tick
 
 restart_user_unit() {
   local unit="$1"
-  if systemctl --user list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit"; then
-    systemctl --user restart "$unit"
+  # A deploy refreshes only a unit that was already running. try-restart keeps
+  # this true even if it stops between the check and the command.
+  if systemctl --user is-active --quiet "$unit"; then
+    systemctl --user try-restart "$unit"
   fi
 }
 
 restart_user_unit mi-daemon.service
 restart_user_unit mi-web-chat.service
 restart_user_unit mi-flue.service
-restart_user_unit mi-tick.timer
-
-if ! MI_AUTO_ACTIONS_ENABLED=false \
-  MI_IMESSAGE_MONITOR_ENABLED=false \
-  MI_DAILY_BRIEF=false \
-  MI_QUESTIONS_ENABLED=false \
-  MI_LOOP_FACTORY_ENABLED=false \
-  PUSHOVER_USER= \
-  PUSHOVER_TOKEN= \
-  node scripts/test-mi-tick.mjs; then
-  rollback_deploy
-  exit 1
+# A deploy does not wake scheduled or outbound work unless an operator makes a
+# separate, explicit choice and supplies both safety values.
+if [[ ${MI_DEPLOY_ACTIVATE_TIMER:-0} == 1 ]]; then
+  [[ -n ${MI_PROACTIVE_IMESSAGE_NOTIFY+x} && -n ${MI_IMESSAGE_MONITOR_ENABLED+x} ]] || { echo 'Timer activation requires explicit notice and monitor values.' >&2; exit 1; }
+  restart_user_unit mi-tick.timer
 fi
 
-if ! MI_AUTO_ACTIONS_ENABLED=false \
-  MI_IMESSAGE_MONITOR_ENABLED=false \
-  MI_DAILY_BRIEF=false \
-  MI_QUESTIONS_ENABLED=false \
-  MI_LOOP_FACTORY_ENABLED=false \
-  PUSHOVER_USER= \
-  PUSHOVER_TOKEN= \
-  node dist/src/cli.js tick; then
-  rollback_deploy
-  exit 1
-fi
-
-if systemctl --user is-active --quiet mi-daemon.service 2>/dev/null; then
-  if ! node dist/src/cli.js task list >/dev/null; then
-    rollback_deploy
-    exit 1
-  fi
-fi
-
-rm -rf "$BACKUP_DIR"
-echo "Mi deploy complete."
+echo "Mi deploy complete. Mi execution files remain under $ROOT/pi/extensions."

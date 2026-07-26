@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync, readFileSync } from 'node:fs';
-import { appendFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFileSync, createReadStream, existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { appendFile, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -11,13 +11,31 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
-import { buildImessageCompletionPrompt, buildImessageV2Prompt, IMESSAGE_V2_LIMITS, parseImessageV2Envelope, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
-import { createApproval, logEvent, readApprovals, resolveApproval, writeApprovals } from '../dist/src/state.js';
+import { buildImessageCompletionPrompt, IMESSAGE_V2_LIMITS, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
+import { logEvent } from '../dist/src/state.js';
+import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
 import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
+import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
+import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
+// Check these immediately before a process can spawn. Keeping this lazy lets
+// read-only web status checks report a missing daemon instead of starting one.
+let reviewedMiPaths;
+function reviewedPrivateMiPaths() {
+  reviewedMiPaths ||= reviewedMiExtensionPaths({
+    root,
+    daemonPath: process.env.MI_DAEMON_PATH,
+    capabilityGuardPath: process.env.MI_CAPABILITY_GUARD,
+    capabilityAdapterPath: process.env.MI_CAPABILITY_ADAPTER,
+    requireDaemon: true,
+    requireGuard: true,
+    requireAdapter: true,
+  });
+  return reviewedMiPaths;
+}
 const stateDir = path.join(root, 'state', 'threads');
 const host = process.env.MI_WEB_HOST || '127.0.0.1';
 const port = Number(process.env.MI_WEB_PORT || 8787);
@@ -25,6 +43,9 @@ const httpsPort = Number(process.env.MI_WEB_HTTPS_PORT || 0);
 const tlsCertPath = process.env.MI_WEB_TLS_CERT || '';
 const tlsKeyPath = process.env.MI_WEB_TLS_KEY || '';
 const maxMessageChars = Number(process.env.MI_WEB_MAX_MESSAGE_CHARS || 4000);
+const coordinatorObjectiveMaxChars = Math.max(240, Math.min(Number(process.env.MI_COORDINATOR_OBJECTIVE_MAX_CHARS || 4000), 16 * 1024));
+const confirmationObjectiveMaxChars = 240;
+const coordinatorArtifactMaxAgeMs = Math.max(24 * 60 * 60_000, Math.min(Number(process.env.MI_COORDINATOR_ARTIFACT_MAX_AGE_MS || 7 * 24 * 60 * 60_000), 90 * 24 * 60 * 60_000));
 const maxUploadBytes = Number(process.env.MI_WEB_MAX_UPLOAD_BYTES || 12 * 1024 * 1024);
 const uploadDir = process.env.MI_WEB_UPLOAD_DIR || path.join(root, 'state', 'web-uploads');
 const contextRecentLimit = Number(process.env.MI_WEB_CONTEXT_MESSAGES || 20);
@@ -38,7 +59,7 @@ const miPreferencesPath = path.join(home, 'mi', 'preferences.md');
 const miMemoryPath = path.join(home, 'mi', 'memory.md');
 const miRuntimeDir = process.env.MI_RUNTIME_DIR || path.join(home, '.pi', 'agent', 'mi');
 const miSocketPath = process.env.MI_SOCKET_PATH || path.join(miRuntimeDir, 'main.sock');
-const miDaemonPath = process.env.MI_DAEMON_PATH || path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
+// The daemon path is checked against the reviewed private Mi tree before use.
 const miDaemonSystemdUnit = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const miDaemonHost = process.env.MI_DAEMON_HOST || path.join(home, 'bin', 'mi-daemon-host');
 const workerModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';
@@ -52,6 +73,9 @@ const imessageThread = process.env.MI_IMESSAGE_THREAD || process.env.MI_PHOTON_T
 const imessageMaxReplyChars = Number(process.env.MI_IMESSAGE_MAX_REPLY_CHARS || 1200);
 const imessageChatTimeoutMs = Number(process.env.MI_IMESSAGE_CHAT_TIMEOUT_MS || 30000);
 const imessageCompletionTimeoutMs = Number(process.env.MI_IMESSAGE_COMPLETION_TIMEOUT_MS || 15000);
+const imessageCoordinatorTimeoutMs = Math.max(1000, Math.min(Number(process.env.MI_IMESSAGE_COORDINATOR_TIMEOUT_MS || 90000), 10 * 60_000));
+const imessageCoordinatorGlobalLimit = Math.max(1, Math.min(Number(process.env.MI_IMESSAGE_COORDINATOR_GLOBAL_LIMIT || 4), 16));
+const imessageCoordinatorThreadLimit = Math.max(1, Math.min(Number(process.env.MI_IMESSAGE_COORDINATOR_THREAD_LIMIT || 1), 4));
 const miGatewayClient = process.env.MI_GATEWAY_CLIENT || path.join(root, 'scripts', 'mi-gateway-client.py');
 let legacyImessageRouting;
 
@@ -75,10 +99,15 @@ const loopFactoryWorkflowsDir = process.env.MI_LOOP_FACTORY_WORKFLOWS_DIR || pat
 
 let sendQueue = Promise.resolve();
 const imessageThreadQueues = new Map();
+const imessageDeliveryResponses = new Map();
+const IMESSAGE_DELIVERY_RESPONSE_TTL_MS = 10 * 60 * 1000;
+const MAX_IMESSAGE_DELIVERY_RESPONSES = 1000;
 const activeJobs = new Map();
 const activeWorkers = new Map();
 const recentNotificationKeys = new Map();
 let backgroundWorkerMonitorInFlight = false;
+let activeCoordinatorCount = 0;
+const activeCoordinatorThreads = new Map();
 const notificationDedupeMs = Number(process.env.MI_WEB_NOTIFICATION_DEDUPE_MS || 2 * 60 * 1000);
 const safePiEnvKeys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'HOSTNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'TMP', 'TEMP', 'PI_PROVIDER', 'PI_MODEL', 'PI_CONFIG_DIR', 'PI_GATEWAY_URL', 'AGENT_GATEWAY_URL'];
 
@@ -91,18 +120,19 @@ function reducedPiEnv(extra = {}) {
 }
 
 function capabilityGuardPath() {
-  return process.env.MI_CAPABILITY_GUARD || path.join(root, 'pi', 'extensions', 'mi-capability-guard.ts');
+  return reviewedPrivateMiPaths().capabilityGuardPath;
 }
 
-async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }) {
+async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }, rights = ['read']) {
   const dir = path.join(miRuntimeDir, 'capabilities');
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  await chmod(dir, 0o700);
   const file = path.join(dir, `${profile}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
   const createdAt = new Date().toISOString();
   const grant = {
     id: `${profile}-${Date.now().toString(36)}`,
-    resource: `file://${path.resolve(cwd)}`,
-    rights: ['read'],
+    resource: `file://${realpathSync(cwd)}`,
+    rights,
     constraints: { recursive: true, profile },
     principal,
     createdAt,
@@ -126,6 +156,31 @@ async function withImessageThreadQueue(threadId, fn) {
     release();
     if (imessageThreadQueues.get(key) === queued) imessageThreadQueues.delete(key);
   }
+}
+
+function validImessageDeliveryId(value) {
+  const id = String(value || '').trim();
+  return /^[A-Za-z0-9._:-]{1,200}$/.test(id) ? id : '';
+}
+
+async function withImessageDelivery(threadId, deliveryId, fn) {
+  const id = validImessageDeliveryId(deliveryId);
+  if (!id) return fn();
+  const now = Date.now();
+  for (const [entryKey, entry] of imessageDeliveryResponses) {
+    if (now - entry.createdAt >= IMESSAGE_DELIVERY_RESPONSE_TTL_MS) imessageDeliveryResponses.delete(entryKey);
+  }
+  const key = `${safeThreadId(threadId)}:${id}`;
+  const existing = imessageDeliveryResponses.get(key);
+  if (existing) return existing.response;
+  const response = await fn();
+  imessageDeliveryResponses.set(key, { createdAt: Date.now(), response });
+  // Map order is insertion order, so evict the oldest entries first. This
+  // keeps replay protection bounded even when delivery IDs never repeat.
+  while (imessageDeliveryResponses.size > MAX_IMESSAGE_DELIVERY_RESPONSES) {
+    imessageDeliveryResponses.delete(imessageDeliveryResponses.keys().next().value);
+  }
+  return response;
 }
 
 function now() {
@@ -517,8 +572,17 @@ async function waitForMiDaemonHealth(timeoutMs = 5000) {
   return false;
 }
 
+function recordDaemonStartSpawn(command) {
+  // This opt-in hook is only used by the isolated behavior test. It records
+  // attempted side effects, including failed executable lookups.
+  if (process.env.MI_WEB_CHAT_TEST_SPAWN_LOG) {
+    try { appendFileSync(process.env.MI_WEB_CHAT_TEST_SPAWN_LOG, `${command}\n`); } catch {}
+  }
+}
+
 function runQuiet(command, args, timeoutMs = 10000) {
   return new Promise((resolve) => {
+    recordDaemonStartSpawn(command);
     const child = spawn(command, args, { stdio: 'ignore' });
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
@@ -544,10 +608,14 @@ async function startMiDaemonWithSystemd() {
 }
 
 async function startMiDaemon() {
+  // Validate every reviewed private path before mkdir, systemctl, a helper,
+  // or a fallback child process can make a side effect.
+  const privatePaths = reviewedPrivateMiPaths();
   await mkdir(path.dirname(miSocketPath), { recursive: true });
   if (await startMiDaemonWithSystemd()) return;
   if (existsSync(miDaemonHost) && await runQuiet(miDaemonHost, [], 30000) && await waitForMiDaemonHealth(5000)) return;
-  const child = spawn(process.execPath, [miDaemonPath], {
+  recordDaemonStartSpawn(process.execPath);
+  const child = spawn(process.execPath, [privatePaths.daemonPath], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir },
@@ -630,7 +698,7 @@ async function runLoopDiscoveryCli(args, timeoutMs = 60000) {
   const miBin = process.env.MI_BIN || (existsSync(localTsx) ? localTsx : 'mi');
   const cliArgs = miBin === localTsx ? [path.join(root, 'src', 'cli.ts'), 'loop-discovery', ...args] : ['loop-discovery', ...args];
   return await new Promise((resolve) => {
-    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_DISCOVERY_STATE_PATH: loopDiscoveryStatePath, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: miDaemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_DISCOVERY_STATE_PATH: loopDiscoveryStatePath, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: reviewedPrivateMiPaths().daemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
@@ -687,7 +755,7 @@ async function runLoopFactoryCli(args, timeoutMs = 60000) {
   const miBin = process.env.MI_BIN || (existsSync(localTsx) ? localTsx : 'mi');
   const cliArgs = miBin === localTsx ? [path.join(root, 'src', 'cli.ts'), 'loop-factory', ...args] : ['loop-factory', ...args];
   return await new Promise((resolve) => {
-    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_FACTORY_STATE_PATH: loopFactoryStatePath, MI_LOOP_FACTORY_NOTES_PATH: loopFactoryNotesPath, MI_LOOP_FACTORY_WORKFLOWS_DIR: loopFactoryWorkflowsDir, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: miDaemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_FACTORY_STATE_PATH: loopFactoryStatePath, MI_LOOP_FACTORY_NOTES_PATH: loopFactoryNotesPath, MI_LOOP_FACTORY_WORKFLOWS_DIR: loopFactoryWorkflowsDir, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: reviewedPrivateMiPaths().daemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
@@ -917,15 +985,24 @@ function messageLooksLikeWorkerFollowup(message, worker) {
 }
 
 async function saveActiveWorkers() {
-  const keep = Array.from(activeWorkers.values()).filter((worker) => workerIsActive(worker) || workerIsRecent(worker));
+  const keep = Array.from(activeWorkers.values())
+    .filter((worker) => workerIsActive(worker) || workerIsRecent(worker))
+    .map(({ process: _process, ...worker }) => worker);
   await writeJsonFile(webWorkersPath, keep);
 }
 
 async function loadActiveWorkers() {
   const list = await readJsonFile(webWorkersPath, []);
   activeWorkers.clear();
+  activeCoordinatorCount = 0;
+  activeCoordinatorThreads.clear();
   for (const worker of Array.isArray(list) ? list : []) {
     if (!worker?.id || (!workerIsActive(worker) && !workerIsRecent(worker))) continue;
+    if (worker.coordinator) {
+      worker.coordinatorReserved = true;
+      activeCoordinatorCount += 1;
+      activeCoordinatorThreads.set(worker.threadId, (activeCoordinatorThreads.get(worker.threadId) || 0) + 1);
+    }
     activeWorkers.set(worker.id, worker);
   }
 }
@@ -1078,7 +1155,8 @@ async function startBackgroundWorker(threadId, message, options = {}) {
   let workerPrompt = await buildBackgroundWorkerPrompt(threadId, message, decision);
   if (options.taskId === true) workerPrompt = `${workerPrompt}\n\n${workerCompletionInstruction()}`;
   const startedAt = now();
-  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: home, message: workerPrompt, lastInput: message, background: true, reportToMain: options.taskId !== true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
+  const workerCwd = options.cwd || home;
+  const result = await sendTaskSocketRequest({ type: 'run_worker', name, cwd: workerCwd, message: workerPrompt, lastInput: message, background: true, reportToMain: options.taskId !== true, model: workerModel, capabilityProfile: options.capabilityProfile || 'worker-read', allowDuplicate: options.allowDuplicate === true }, 30000);
   const worker = {
     id: result.taskId || result.sessionId || result.sessionFile || `worker_${Date.now().toString(36)}`,
     threadId,
@@ -1090,6 +1168,7 @@ async function startBackgroundWorker(threadId, message, options = {}) {
     status: 'running',
     text: message,
     subject: options.subject || '',
+    cwd: workerCwd,
     imessageV2: options.taskId === true,
     correlationId: options.correlationId || (options.taskId === true ? randomUUID() : undefined),
     createdAt: startedAt,
@@ -1291,8 +1370,14 @@ function queueSendJob(threadId, message) {
   return job;
 }
 
+function coordinatorTaskIds(worker) {
+  const ids = Array.isArray(worker?.delegatedTaskIds) ? worker.delegatedTaskIds : [];
+  return [...new Set([worker?.delegatedTaskId, ...ids].filter((id) => typeof id === 'string' && id.length > 0))];
+}
+
 function taskMatchesWorker(task, worker) {
   return task && (
+    (coordinatorTaskIds(worker).includes(task.id)) ||
     (worker.taskId && task.id === worker.taskId) ||
     (worker.sessionFile && (task.sessionFile === worker.sessionFile || task.actualSessionFile === worker.sessionFile)) ||
     (worker.sessionId && task.sessionId === worker.sessionId) ||
@@ -1412,11 +1497,64 @@ async function monitorBackgroundWorkers() {
     const result = await sendTaskSocketRequest({ type: 'list_tasks' }, 10000);
     tasks = result.tasks || [];
   } catch {
+    // A restored coordinator has no in-memory child. If the daemon cannot be
+    // reached, it cannot report a result later, so close the acknowledgement
+    // with one clear failure instead of leaving it permanently pending.
+    for (const worker of Array.from(activeWorkers.values())) {
+      if (!worker.coordinator || !workerIsActive(worker) || worker.process || worker.formatting) continue;
+      worker.formatting = true;
+      await finishImessageCoordinator(worker, 'The coordinator service was interrupted before it finished. Please try again.', true);
+    }
     return;
   }
   let changed = false;
   for (const worker of Array.from(activeWorkers.values())) {
     if (!workerIsActive(worker) || worker.formatting) continue;
+    if (worker.coordinator) {
+      const delegatedTaskIds = coordinatorTaskIds(worker);
+      if (delegatedTaskIds.length === 0) {
+        // A persisted outer coordinator has no child process after a service
+        // restart. Complete it once with a clear failure instead of leaving an
+        // acknowledgement that can never receive an answer.
+        if (!worker.process) {
+          worker.formatting = true;
+          await finishImessageCoordinator(worker, 'The coordinator was interrupted before it finished. Please try again.', true);
+          changed = true;
+        }
+        continue;
+      }
+      const delegatedTasks = delegatedTaskIds.map((taskId) => tasks.find((entry) => entry?.id === taskId));
+      if (delegatedTasks.some((task) => !task)) {
+        // Once the outer Pi turn is gone, a missing persisted daemon task has
+        // no remaining producer. Finish it once rather than keeping the phone
+        // acknowledgement unanswered after a service or daemon restart.
+        if (!worker.process) {
+          worker.formatting = true;
+          await finishImessageCoordinator(worker, 'A delegated worker was interrupted before it finished. Please try again.', true);
+          changed = true;
+        }
+        continue;
+      }
+      const completeTasks = delegatedTasks.filter(Boolean);
+      const newest = completeTasks.at(-1);
+      worker.status = newest?.status || worker.status;
+      worker.updatedAt = now();
+      worker.sessionFile = newest?.sessionFile || worker.sessionFile;
+      worker.sessionId = newest?.sessionId || worker.sessionId;
+      worker.sessionName = newest?.sessionName || worker.sessionName;
+      changed = true;
+      if (completeTasks.every(taskDone)) {
+        worker.formatting = true;
+        const findings = completeTasks.map((task) => {
+          const label = task.name || task.sessionName || 'Delegated worker';
+          return `${label}: ${task.error || task.text || 'finished without a usable result.'}`;
+        }).join('\n\n');
+        await finishImessageCoordinator(worker, findings, completeTasks.every((task) => Boolean(task.error)));
+      } else {
+        activeWorkers.set(worker.id, worker);
+      }
+      continue;
+    }
     const existingResult = await workerResultSince(worker).catch(() => undefined);
     if (existingResult) {
       // A V2 result with this stable correlation was already formatted and persisted.
@@ -2083,7 +2221,7 @@ async function runImessageChat(message, threadId) {
   const prompt = `${persona}${memory}${history}\n\nReply to this iMessage naturally.\n\nUser message:\n${message}`;
   const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
   const guard = capabilityGuardPath();
-  const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
+  const guardArgs = ['--no-extensions', '--extension', guard];
   const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage', type: 'imessage', displayName: 'Mi iMessage' });
   const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
   const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
@@ -2123,235 +2261,414 @@ async function runImessageChat(message, threadId) {
   });
 }
 
-function safeV2ContextText(value, maxChars) {
-  const text = redactV2Text(value)
-    .replace(/(?:~|\/)(?:home|Users|tmp)\/[A-Za-z0-9_.@/:-]+/g, '[private location]')
-    .split('\n')
-    .filter((line) => !/\b(?:authorization|bearer|token|secret|password|api[_ -]?key)\b/i.test(line))
-    .join('\n')
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
-    .trim();
-  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1)).trim()}…` : text;
-}
-
-async function readV2ContextFile(file, maxChars) {
-  try {
-    const text = safeV2ContextText(await readFile(file, 'utf8'), maxChars);
-    const modified = (await stat(file)).mtime.toISOString();
-    return { text, modified };
-  } catch {
-    return { text: '', modified: '' };
-  }
-}
-
-function safeV2Snapshot(label, entry) {
-  if (!entry.text) return '';
-  try {
-    const value = JSON.parse(entry.text);
-    const source = Array.isArray(value) ? value : [value];
-    const summaries = source.slice(-4).map((item) => {
-      if (!item || typeof item !== 'object') return '';
-      const fields = ['status', 'state', 'ok', 'healthy', 'updatedAt', 'lastRunAt', 'nextRunAt', 'summary']
-        .filter((key) => ['string', 'number', 'boolean'].includes(typeof item[key]))
-        .map((key) => `${key}=${safeV2ContextText(String(item[key]), 140)}`);
-      return fields.join(', ');
-    }).filter(Boolean);
-    return summaries.length ? `${label} (${entry.modified || 'time unknown'}): ${summaries.join(' | ')}` : '';
-  } catch {
-    return `${label} (${entry.modified || 'time unknown'}): ${safeV2ContextText(entry.text, 320)}`;
-  }
-}
-
-function safeV2Approvals(entry) {
-  if (!entry.text) return '';
-  try {
-    const parsed = JSON.parse(entry.text);
-    const approvals = Array.isArray(parsed) ? parsed : Array.isArray(parsed.approvals) ? parsed.approvals : [];
-    const pending = approvals.filter((item) => item?.status === 'pending').slice(-3).map((item) => {
-      const pendingAction = item.v2PendingAction || {};
-      const id = String(pendingAction.confirmationId || item.id || '').replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80);
-      const capability = safeV2ContextText(pendingAction.capability || '', 30);
-      const objective = safeV2ContextText(pendingAction.objective || item.summary || '', 220);
-      return [id && `confirmationId=${id}`, capability && `capability=${capability}`, objective && `request=${objective}`].filter(Boolean).join(', ');
-    }).filter(Boolean);
-    return pending.length ? `Pending confirmations (${entry.modified || 'time unknown'}): ${pending.join(' | ')}` : 'Pending confirmations: none recorded';
-  } catch { return 'Pending confirmations: unavailable'; }
-}
-
-async function v2RelevantProjectExcerpt(message) {
-  const text = String(message || '').toLowerCase();
-  const projectScore = /\b(?:project|repo|branch|pull request|\bpr\b|implementation)\b/.test(text) ? 1 : 0;
-  const goalScore = /\b(?:goal|priority|priorities)\b/.test(text) ? 1 : 0;
-  if (!projectScore && !goalScore) return { text: '', modified: '' };
-  // A tie is ambiguous: do not dump both orientation documents into a foreground turn.
-  if (projectScore === goalScore) return { text: '', modified: '' };
-  return readV2ContextFile(path.join(home, 'pi-docs', projectScore ? 'PROJECTS.md' : 'GOALS.md'), 700);
-}
-
-async function buildImessageV2Context(threadId, message) {
-  const [preferences, memory, tick, health, approvals, project] = await Promise.all([
-    readV2ContextFile(miPreferencesPath, IMESSAGE_V2_LIMITS.preferences),
-    readV2ContextFile(miMemoryPath, IMESSAGE_V2_LIMITS.memory),
-    readV2ContextFile(path.join(root, 'state', 'tick.json'), 500),
-    readV2ContextFile(path.join(root, 'state', 'monitor-health.json'), 500),
-    readV2ContextFile(path.join(root, 'state', 'approvals.json'), 900),
-    v2RelevantProjectExcerpt(message),
-  ]);
-  const messages = (await readMessages(threadId, 12)).filter((entry) => {
-    // Generic daemon reports do not have a stable V2 correlation and are never context.
-    return !(entry.role === 'assistant' && ['mi-worker-result', 'mi-worker-error'].includes(entry.source) && !entry.taskId);
-  });
-  const workers = Array.from(activeWorkers.values())
-    .filter((worker) => worker.threadId === threadId && (workerIsActive(worker) || workerIsRecent(worker)))
-    .slice(-5)
-    .map((worker) => `${worker.updatedAt || worker.createdAt || 'time unknown'} | ${safeV2ContextText(worker.status || 'unknown', 40)} | ${safeV2ContextText(worker.subject || worker.name || worker.text || 'work', 160)} | continuation ${workerCorrelationId(worker)}`)
-    .join('\n');
-  const snapshot = [
-    safeV2Snapshot('Recent scheduler health', tick), safeV2Snapshot('Recent monitor health', health),
-    safeV2Approvals(approvals),
-    project.text ? `One relevant orientation excerpt (${project.modified || 'time unknown'}): ${project.text}` : '',
-  ].filter(Boolean).join('\n\n');
-  return buildImessageV2Prompt({
-    timestamp: now(), userMessage: message, preferences: preferences.text, preferencesProvenance: 'bounded preferences', preferencesReadAt: preferences.modified,
-    memory: memory.text, memoryProvenance: 'bounded durable memory', memoryReadAt: memory.modified,
-    threadMessages: messages, threadProvenance: 'recent iMessage records', threadReadAt: now(),
-    workers, workersProvenance: 'active/recent correlated work', workersReadAt: now(), snapshot, snapshotProvenance: 'safe current snapshots', snapshotReadAt: now(),
-  });
-}
-
-const imessageV2UnavailableReply = 'I’m temporarily unable to reach my assistant service. Please try again shortly.';
-const v2TaskCapabilities = new Set(['read', 'write', 'execute', 'external']);
-const v2NeutralReadAck = 'I’ll check that and get back to you.';
+const v2WorkspaceRootSetting = String(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(home, 'workflows')).trim();
+const v2WorkspaceCwdSetting = String(process.env.MI_IMESSAGE_WORK_CWD || v2WorkspaceRootSetting).trim();
 
 function v2CanonicalObjective(value) {
-  return redactV2Text(String(value || '')).replace(/\s+/g, ' ').trim().slice(0, 4000);
+  // This is the exact bounded form that can be displayed and stored. Do not
+  // slice it: callers must refuse an objective that does not fit a store.
+  return redactV2Text(String(value || '')).replace(/\s+/g, ' ').trim();
 }
 
-function v2ReadOnlyObjective(objective) {
+function objectiveFitsCoordinatorPolicy(objective) {
+  return objective.length > 0 && objective.length <= coordinatorObjectiveMaxChars;
+}
+
+function directAdvisorSelections(message) {
+  const text = v2CanonicalObjective(message).toLowerCase();
+  const skill = /^\/skill:advisor\b/.test(text);
+  const asksAll = /\bask\s+(?:the\s+)?advisors?\b|\bseth\s+(?:and|&)\s+(?:alex|hormozi)\b|\b(?:alex|hormozi)\s+(?:and|&)\s+seth\b/.test(text);
+  const asksSeth = /\bask\s+seth\b|\bwhat\s+would\s+seth\b/.test(text) || (skill && /\bseth\b/.test(text));
+  const asksAlex = /\bask\s+(?:alex|hormozi)\b|\bwhat\s+would\s+(?:alex|hormozi)\b/.test(text) || (skill && /\b(?:alex|hormozi)\b/.test(text));
+  if (asksAll || (asksSeth && asksAlex)) return ['Seth', 'Alex'];
+  if (asksSeth) return ['Seth'];
+  if (asksAlex) return ['Alex'];
+  // The advisor skill says a direct invocation without a named person may use
+  // its multi-advisor mode when independent lenses help. Use that safe,
+  // deterministic mode instead of silently choosing an identity.
+  return skill ? ['Seth', 'Alex'] : [];
+}
+
+function pathInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function v2ScopedWorkspace() {
+  if (!v2WorkspaceRootSetting || !v2WorkspaceCwdSetting) return undefined;
+  try {
+    const rootPath = realpathSync(v2WorkspaceRootSetting);
+    const cwdPath = realpathSync(v2WorkspaceCwdSetting);
+    if (!statSync(rootPath).isDirectory() || !statSync(cwdPath).isDirectory()) return undefined;
+    // A workspace may be below home but must never be home itself or an
+    // ancestor of home. Real paths prevent a configured symlink escape.
+    if (rootPath === home || pathInside(rootPath, home) || !pathInside(rootPath, cwdPath)) return undefined;
+    return { root: rootPath, cwd: cwdPath };
+  } catch {
+    return undefined;
+  }
+}
+
+function v2RiskClassification(message) {
+  const objective = v2CanonicalObjective(message);
   const text = objective.toLowerCase();
-  if (!/\b(read|inspect|check|verify|report|summari[sz]e|status|list|find|grep|package|readme)\b/.test(text)) return false;
-  return !/\b(restart|systemctl|service|deploy|publish|merge|delete|write|edit|install|send|message|email|http|curl|network|token|secret|password|key)\b/.test(text);
+  if (!text) return { kind: 'clarify', objective };
+  const neverDelegate = /(?:\bdelete\b|\berase\b|\bwipe\b|\bpurge\b|\bdestroy\b|\brm\b|\b(?:remove|clear|drop)\s+(?:all\s+)?(?:data|database|account|project)\b|\bformat\s+(?:the\s+)?(?:disk|drive)\b|\bsecret\b|\btoken\b|\bpassword\b|\bpasscode\b|\bcredential\b|\bauth(?:entication)?\b|\blog\s*in\b|\bbuy\b|\bpurchase\b|\bpay\b|\bspend\b|\btransfer\s+(?:money|funds|cash)|\bwire\s+(?:money|funds))/i.test(text);
+  if (neverDelegate) return { kind: 'never-delegate', objective };
+  const needsConfirmation = /(?:\bdeploy\b|\bproduction\b|\brelease\b|\bpublish\b|\bannouncement\b|\bmerge\b|\brestart\b|\bsystemctl\b|\bservice\b|\binstall\b|\bemail\b|\bmail\b|\btweet\b|\bpost\b|\bsend\b|\bmessage\b|\b(?:tell|contact|notify|forward)\b|\btransfer\b|\bupload\b|\bshare\b)/i.test(text);
+  if (needsConfirmation) return { kind: 'confirm', objective, actionClass: 'confirmed-high-impact' };
+  return { kind: 'safe', objective };
 }
 
-function v2Affirmative(message) {
-  return /^(?:yes|yep|yeah|confirm|approve|do it|go ahead|proceed)\b[.! ]*$/i.test(String(message || '').trim());
+function v2LooksLikeAction(message) {
+  const text = v2CanonicalObjective(message).toLowerCase();
+  if (!text || text.startsWith('/skill:')) return false;
+  return /(?:^(?:please\s+)?(?:fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|wire|adjust|improve|tighten|save|remember|remind|schedule|start|stop|run|handle|do|clean|move|copy|rename|configure)\b|\b(?:can you|could you|would you|please)\s+(?:fix|implement|update|repair|patch|make|add|create|change|build|handle|do|clean|move|copy|rename|configure)\b)/i.test(text);
+}
+
+function v2ActionPlan(message, workspace) {
+  const objective = v2CanonicalObjective(message);
+  const text = objective.toLowerCase();
+  const advisorSelections = directAdvisorSelections(objective);
+  const asksCoordinator = /\b(?:ask|have)\s+(?:terra|sol|luna|claude)\b/.test(text) || advisorSelections.length > 0;
+  const safeRead = /\b(?:read|inspect|check|verify|list|find|research|explain|summarize)\b/.test(text);
+  // Writing is available only for a clear local-work request. A broad phrase
+  // such as “make dinner” or “create an announcement” must not gain project
+  // write tools merely because it contains an old routing verb.
+  const safeWrite = /^(?:please\s+)?(?:fix|implement|update|repair|patch|make|add|create|change|build|wire|adjust|improve|tighten)\b/.test(text)
+    && messageHasLocalWorkTarget(objective);
+  if (!asksCoordinator && !safeRead && !safeWrite) return undefined;
+  return { objective, capability: 'coordinator', cwd: workspace.cwd, workspaceRoot: workspace.root, allowWrite: safeWrite, advisorSelections };
 }
 
 function v2Cancellation(message) {
-  return /\b(?:cancel|never mind|nevermind|stop|don['’]t do it)\b/i.test(String(message || ''));
+  return /^\s*(?:cancel(?:\s+(?:it|that|the action))?|never mind|nevermind|don['’]t do it)\s*[.!?]*\s*$/i.test(String(message || ''));
 }
 
-function v2ConfirmationQuestion(value) {
-  return String(value || '').trim().replace(/[.!?]+$/, '').trim() + '?';
+function v2ConfirmationCommand(message) {
+  return /^\s*(?:confirm|deny)\s+[a-f0-9]{32}\s*$/i.test(String(message || ''));
 }
 
-async function v2CreatePendingAction(threadId, objective, capability) {
-  const approval = await createApproval('Confirm this pending iMessage action.', 'iMessage V2 non-read action requires explicit confirmation.');
-  const approvals = await readApprovals();
-  const pending = approvals.find((item) => item.id === approval.id);
-  if (pending) {
-    pending.v2PendingAction = { threadId, objective, capability, confirmationId: approval.id, consumedAt: undefined };
-    await writeApprovals(approvals);
-  }
-  return approval.id;
+function v2ConfirmReply(plan, confirmationId) {
+  return [
+    `Action class: ${plan.actionClass || 'confirmed-high-impact'}.`,
+    `Exact objective: ${plan.objective}`,
+    `This could make a real change or contact another service. Reply "confirm ${confirmationId}" to approve or "deny ${confirmationId}" to cancel.`,
+  ].join('\n\n');
 }
 
 async function v2PendingAction(threadId) {
-  const approvals = await readApprovals();
-  return approvals.find((item) => item.status === 'pending' && item.v2PendingAction?.threadId === threadId && !item.v2PendingAction?.consumedAt);
+  return readPendingConfirmation(threadId);
 }
 
 async function v2ClearPendingAction(threadId) {
-  const pending = await v2PendingAction(threadId);
-  if (pending) await resolveApproval(pending.id, 'rejected', 'cancelled');
+  return clearPendingConfirmation(threadId);
 }
 
+function coordinatorAdapterPath() {
+  return reviewedPrivateMiPaths().capabilityAdapterPath;
+}
 
-async function runImessageV2(message, threadId) {
-  const prompt = await buildImessageV2Context(threadId, message);
-  // This foreground request is context-only. The local client fixes the loopback
-  // endpoint and immutable concierge profile; it never starts an outer Pi process.
-  const result = await invokeMiGateway([{ role: 'user', content: prompt }], {
-    timeoutMs: imessageChatTimeoutMs, outputCap: IMESSAGE_V2_LIMITS.output,
-  });
-  if (result.failure) {
-    console.error('iMessage V2 invocation failed:', JSON.stringify({ category: result.failure }));
-    return { failure: result.failure };
+async function writeCoordinatorPolicyFile({ correlationId, objective, workspace, allowWrite, advisorSelections = [] }) {
+  if (!objectiveFitsCoordinatorPolicy(objective)) throw new Error('The exact objective is too long to store safely.');
+  const directory = path.join(miRuntimeDir, 'coordinator-policies');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const file = path.join(directory, `${correlationId}.json`);
+  const policy = {
+    version: 1,
+    correlationId,
+    objective,
+    workspaceRoot: workspace.root,
+    workspaceCwd: workspace.cwd,
+    socketPath: miSocketPath,
+    // The daemon independently limits writes to ~/workflows. This only asks
+    // for a scoped write when the deterministic plan classified it as safe.
+    allowWrite: allowWrite === true,
+    advisorSelections: [...new Set(advisorSelections)].filter((advisor) => advisor === 'Seth' || advisor === 'Alex'),
+    advisorTaskIds: [],
+  };
+  await writeFile(file, JSON.stringify(policy), { mode: 0o600 });
+  return file;
+}
+
+function addCoordinatorTaskIds(worker, taskIds) {
+  const existing = coordinatorTaskIds(worker);
+  const accepted = [...new Set([...existing, ...taskIds])].filter((taskId) => /^[A-Za-z0-9._:-]{1,200}$/.test(String(taskId)));
+  worker.delegatedTaskIds = accepted;
+  worker.delegatedTaskId = accepted[0]; // retain the old field for restored records
+  if (accepted.length) worker.coordinatorState = 'delegated';
+  return accepted;
+}
+
+async function coordinatorPolicyTaskIds(file) {
+  try {
+    const raw = JSON.parse(await readFile(file, 'utf8'));
+    return Array.isArray(raw?.advisorTaskIds)
+      ? raw.advisorTaskIds.filter((taskId) => typeof taskId === 'string' && /^[A-Za-z0-9._:-]{1,200}$/.test(taskId))
+      : [];
+  } catch {
+    return [];
   }
-  return { decision: parseImessageV2Envelope(result.content) };
+}
+
+async function cleanupCoordinatorArtifacts() {
+  const nowMs = Date.now();
+  const activePolicies = new Set(Array.from(activeWorkers.values())
+    .filter((worker) => worker?.coordinator && workerIsActive(worker))
+    .map((worker) => worker.coordinatorPolicy)
+    .filter(Boolean));
+  const policyDirectory = path.join(miRuntimeDir, 'coordinator-policies');
+  let policies = [];
+  try { policies = await readdir(policyDirectory, { withFileTypes: true }); } catch {}
+  for (const entry of policies) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const file = path.join(policyDirectory, entry.name);
+    if (activePolicies.has(file)) continue;
+    const details = await stat(file).catch(() => undefined);
+    if (details && nowMs - details.mtimeMs > coordinatorArtifactMaxAgeMs) await rm(file, { force: true }).catch(() => undefined);
+  }
+  // A transcript may not contain the policy correlation, so never remove any
+  // session transcript while any coordinator or its delegated work is active.
+  // When none is active, remove only individually old files; fresh files and
+  // directories stay.
+  if (Array.from(activeWorkers.values()).some((worker) => worker?.coordinator && workerIsActive(worker))) return;
+  const sessionDirectory = path.join(miRuntimeDir, 'imessage-coordinator-sessions');
+  const removeOldFiles = async (directory) => {
+    let entries = [];
+    try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) await removeOldFiles(file);
+      else if (entry.isFile()) {
+        const details = await stat(file).catch(() => undefined);
+        if (details && nowMs - details.mtimeMs > coordinatorArtifactMaxAgeMs) await rm(file, { force: true }).catch(() => undefined);
+      }
+    }
+  };
+  await removeOldFiles(sessionDirectory);
+}
+
+function reserveCoordinator(threadId) {
+  if (activeCoordinatorCount >= imessageCoordinatorGlobalLimit) return false;
+  const current = activeCoordinatorThreads.get(threadId) || 0;
+  if (current >= imessageCoordinatorThreadLimit) return false;
+  activeCoordinatorCount += 1;
+  activeCoordinatorThreads.set(threadId, current + 1);
+  return true;
+}
+
+function releaseCoordinator(worker) {
+  if (!worker?.coordinator || !worker.coordinatorReserved) return;
+  worker.coordinatorReserved = false;
+  activeCoordinatorCount = Math.max(0, activeCoordinatorCount - 1);
+  const current = activeCoordinatorThreads.get(worker.threadId) || 0;
+  if (current <= 1) activeCoordinatorThreads.delete(worker.threadId);
+  else activeCoordinatorThreads.set(worker.threadId, current - 1);
+}
+
+async function finishImessageCoordinator(worker, findings, isError = false) {
+  if (worker.completedAt || worker.finishing) return;
+  worker.finishing = true;
+  try {
+    const completion = await formatImessageV2Completion(worker, findings, isError);
+    worker.status = isError ? 'error' : 'complete';
+    worker.completedAt = now();
+    worker.updatedAt = now();
+    worker.resultText = completion;
+    releaseCoordinator(worker);
+    await appendThreadMessage(worker.threadId, 'assistant', completion, {
+      unread: false, source: isError ? 'mi-worker-error' : 'mi-worker-result', taskId: workerCorrelationId(worker), generation: 1,
+    });
+    // Coordinators append outside queueSendJob, so use the same normal path
+    // that worker and web completions use instead of silently skipping alerts.
+    await notifyUser(completion, worker.threadId).catch(() => undefined);
+    await Promise.allSettled([
+      worker.coordinatorGrants ? rm(worker.coordinatorGrants, { force: true }) : Promise.resolve(),
+      worker.coordinatorPolicy ? rm(worker.coordinatorPolicy, { force: true }) : Promise.resolve(),
+    ]);
+    await emitTurnEvent(root, { stage: 'terminal', outcome: isError ? 'error' : 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(worker) }).catch(() => undefined);
+  } finally {
+    delete worker.finishing;
+    delete worker.formatting;
+    await saveActiveWorkers().catch(() => undefined);
+  }
+}
+
+async function startImessageCoordinator(threadId, message, plan) {
+  if (!reserveCoordinator(threadId)) {
+    return { ok: true, reply: 'I’m already working on that conversation. Please wait for the result.', handoff: false, busy: true };
+  }
+  const correlationId = randomUUID();
+  let worker;
+  try {
+    const workspace = plan.workspace || v2ScopedWorkspace();
+    if (!workspace) throw new Error('Mi needs an existing approved workspace before it can start work.');
+    if (!objectiveFitsCoordinatorPolicy(plan.objective || '')) throw new Error('The exact objective is too long to store safely.');
+    await cleanupCoordinatorArtifacts();
+    const history = await recentThreadContextForWorker(threadId, message);
+    const guard = capabilityGuardPath();
+    const adapter = coordinatorAdapterPath();
+    const reviewed = reviewedPrivateMiPaths();
+    if (guard !== reviewed.capabilityGuardPath || adapter !== reviewed.capabilityAdapterPath) throw new Error('Mi coordinator safety tools are unavailable.');
+    const coordinatorGrants = await writeCapabilityGrantsFile(workspace.cwd, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read']);
+    const coordinatorPolicy = await writeCoordinatorPolicyFile({ correlationId, objective: plan.objective, workspace, allowWrite: plan.allowWrite, advisorSelections: plan.advisorSelections });
+    const launch = miCoordinatorLaunch({
+      piCommand: process.env.PI_CMD || 'pi', cwd: workspace.cwd, runtimeDir: miRuntimeDir, model: workerModel,
+      capabilityGuardPath: guard, capabilityAdapterPath: adapter,
+      env: reducedPiEnv({ MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: coordinatorGrants, MI_CAPABILITY_AUDIT_FILE: path.join(miRuntimeDir, 'capability-audit.jsonl'), MI_COORDINATOR_POLICY_FILE: coordinatorPolicy, MI_SOCKET_PATH: miSocketPath }),
+    });
+    worker = {
+      id: `coordinator_${correlationId}`, threadId, taskId: correlationId, correlationId, name: 'iMessage coordinator',
+      status: 'running', text: message, subject: plan.objective, cwd: launch.cwd, imessageV2: true, coordinator: true, coordinatorReserved: true,
+      coordinatorGrants, coordinatorPolicy, coordinatorState: 'outer-running', delegatedTaskIds: [], createdAt: now(), updatedAt: now(), awaitingResultSince: now(),
+      // A truthy in-memory marker prevents the monitor from treating the short
+      // state-save/ack gap as a service-restart orphan before spawn runs.
+      process: { starting: true },
+    };
+    activeWorkers.set(worker.id, worker);
+    await saveActiveWorkers();
+    const reply = 'I’ll ask the team and get back to you.';
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-task-ack', taskId: correlationId });
+    void runMiCoordinatorRpc({
+      launch,
+      requestId: correlationId,
+      prompt: miCoordinatorPrompt({ message, context: history, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass, advisorSelections: plan.advisorSelections }),
+      timeoutMs: imessageCoordinatorTimeoutMs,
+      onSpawn: (child) => { worker.process = child; },
+      onEvent: (event) => {
+        const delegatedTaskIds = coordinatorDelegatedTasks(event);
+        if (delegatedTaskIds.length === 0) return;
+        addCoordinatorTaskIds(worker, delegatedTaskIds);
+        worker.updatedAt = now();
+        void saveActiveWorkers().catch(() => undefined);
+      },
+    }).then(async (result) => {
+      // Reserve completion before deleting the process handle. The monitor may
+      // run between awaits and must not turn a healthy settled turn into a
+      // second restart failure.
+      worker.formatting = true;
+      delete worker.process;
+      if (!result.ok) console.error('iMessage coordinator RPC failed:', result.reason);
+      // Direct advisor workers start inside the reviewed adapter before the
+      // coordinator speaks, so their IDs arrive through the scoped policy.
+      addCoordinatorTaskIds(worker, await coordinatorPolicyTaskIds(coordinatorPolicy));
+      if (coordinatorTaskIds(worker).length) {
+        delete worker.formatting;
+        worker.coordinatorState = 'delegated';
+        worker.updatedAt = now();
+        await saveActiveWorkers().catch(() => undefined);
+        return;
+      }
+      await finishImessageCoordinator(worker, result.text || (result.ok ? 'The coordinator finished without a usable result.' : 'I could not complete that coordinator request. Please try again.'), !result.ok);
+    }).catch(async () => {
+      delete worker.process;
+      addCoordinatorTaskIds(worker, await coordinatorPolicyTaskIds(coordinatorPolicy));
+      if (coordinatorTaskIds(worker).length) {
+        worker.coordinatorState = 'delegated';
+        worker.updatedAt = now();
+        await saveActiveWorkers().catch(() => undefined);
+        return;
+      }
+      await finishImessageCoordinator(worker, 'I could not complete that coordinator request. Please try again.', true);
+    });
+    await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: correlationId }).catch(() => undefined);
+    return { ok: true, reply, handoff: true, taskId: correlationId };
+  } catch (error) {
+    if (worker) await finishImessageCoordinator(worker, 'I could not start the coordinator. Please try again.', true);
+    else releaseCoordinator({ coordinator: true, coordinatorReserved: true, threadId });
+    const reply = error instanceof Error && /approved workspace/.test(error.message)
+      ? 'I need an existing approved workspace before I can start that work.'
+      : error instanceof Error && /exact objective is too long/.test(error.message)
+        ? `Please send a shorter request. I can store and confirm up to ${coordinatorObjectiveMaxChars} characters exactly.`
+        : 'I could not start the coordinator. Please try again.';
+    return { ok: false, reply, handoff: false };
+  }
 }
 
 async function handleImessageV2(threadId, message) {
-  const turnStartedAt = Date.now();
-  await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message }).catch(() => undefined);
+  await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: message }).catch(() => undefined);
   if (v2Cancellation(message)) {
     await v2ClearPendingAction(threadId);
+    const reply = 'Okay, I won’t proceed with that action.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    await appendThreadMessage(threadId, 'assistant', 'Okay, I won’t proceed with that action.', { unread: false, source: 'imessage-v2-confirm-cancelled' });
-    return { ok: true, reply: 'Okay, I won’t proceed with that action.', handoff: false };
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-cancelled' });
+    return { ok: true, reply, handoff: false };
   }
-  const invocation = await runImessageV2(message, threadId);
-  if (invocation.failure) {
-    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    await appendThreadMessage(threadId, 'assistant', imessageV2UnavailableReply, { unread: false, source: 'imessage-v2-unavailable' });
-    return { ok: false, reply: imessageV2UnavailableReply, handoff: false, temporary: true };
-  }
-  const decision = invocation.decision;
-  await emitTurnEvent(root, { stage: 'decision', outcome: 'ok', route: 'v2', modelProfile: 'mi-concierge', turn: message, durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
-  if (decision.kind === 'task') {
-    const objective = v2CanonicalObjective(decision.objective);
-    const capability = v2TaskCapabilities.has(decision.capability) ? decision.capability : undefined;
-    const pending = await v2PendingAction(threadId);
-    const approved = Boolean(pending && v2Affirmative(message) && decision.confirmationId === pending.id &&
-      pending.v2PendingAction?.confirmationId === decision.confirmationId && pending.v2PendingAction?.objective === objective &&
-      pending.v2PendingAction?.capability === capability);
-    if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
-      if (!approved) {
-        const reply = 'What exactly should I act on?';
-        await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
-        return { ok: true, reply, handoff: false };
+  const pending = await v2PendingAction(threadId);
+  if (pending) {
+    const confirmation = await classifyConfirmationReply({ threadId, reply: message });
+    if (confirmation.kind === 'confirm') {
+      const record = confirmation.record;
+      const workspace = v2ScopedWorkspace();
+      const reply = !workspace
+        ? 'I need an existing approved workspace before I can start that work.'
+        : undefined;
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      if (reply) {
+        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-workspace-refused' });
+        return { ok: true, reply, handoff: false, confirmationId: record.id };
       }
-      await resolveApproval(pending.id, 'approved', 'bound confirmation accepted');
-    }
-    if (capability !== 'read' || !v2ReadOnlyObjective(objective)) {
-      const reply = 'That action is approved, but this channel can only dispatch read-only checks.';
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
-      return { ok: true, reply, handoff: false };
-    }
-    const explicit = v2ExplicitCorrelation(message, threadId);
-    if (explicit.invalid || (decision.continueTaskId && !activeWorkerForV2Continuation(threadId, decision.continueTaskId))) {
-      const reply = 'Which earlier task should I continue?';
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
-      return { ok: true, reply, handoff: false };
-    }
-    const active = explicit.worker || (decision.continueTaskId ? activeWorkerForV2Continuation(threadId, decision.continueTaskId) : undefined);
-    if (active) {
-      const result = await continueBackgroundWorker(threadId, active, objective, {
-        threadMessage: message, userSource: 'imessage-v2-user', ackReply: v2NeutralReadAck,
-        ackSource: 'imessage-v2-task-ack', taskId: true, subject: objective,
+      return startImessageCoordinator(threadId, record.objective, {
+        objective: record.objective, capability: 'coordinator', workspace, confirmedObjective: record.objective,
+        actionClass: record.actionClass || 'confirmed-high-impact', allowWrite: false,
       });
-      await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(result.worker), durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
-      return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
     }
-    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-    const result = await startBackgroundWorker(threadId, objective, {
-      appendUser: false, ackReply: v2NeutralReadAck, ackSource: 'imessage-v2-task-ack', taskId: true,
-      userSource: 'imessage-v2-user', subject: objective, capabilityProfile: 'worker-read', allowDuplicate: true,
-      decision: { start: true, reason: 'iMessage V2 read-only task gate' },
-    });
-    await emitTurnEvent(root, { stage: 'task-start', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: workerCorrelationId(result.worker), durationMs: Date.now() - turnStartedAt }).catch(() => undefined);
-    return { ok: true, reply: redact(result.reply), handoff: true, taskId: workerCorrelationId(result.worker) };
+    if (confirmation.kind === 'deny') {
+      const reply = 'Okay, I won’t proceed with that action.';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-cancelled' });
+      return { ok: true, reply, handoff: false };
+    }
   }
-  const source = decision.kind === 'confirm' ? 'imessage-v2-confirm' : 'imessage-v2-reply';
-  const reply = decision.kind === 'confirm'
-    ? v2ConfirmationQuestion(sanitizeMiConversationText(imessageCleanReply(decision.reply)))
-    : sanitizeMiConversationText(imessageCleanReply(decision.reply));
+  if (v2ConfirmationCommand(message)) {
+    const reply = 'I can’t find a pending action for that confirmation.';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-missing' });
+    return { ok: true, reply, handoff: false };
+  }
+
+  // This gate intentionally examines every raw current message before any Pi
+  // coordinator or worker can launch. It does not depend on routing verbs.
+  const risk = v2RiskClassification(message);
+  if (risk.kind === 'never-delegate') {
+    const reply = 'I can’t delegate that kind of action from iMessage.';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-refused' });
+    return { ok: true, reply, handoff: false };
+  }
+  if (risk.kind === 'confirm') {
+    if (!objectiveFitsCoordinatorPolicy(risk.objective) || risk.objective.length > confirmationObjectiveMaxChars) {
+      const reply = `Please send a shorter request. I cannot safely store this exact action for confirmation; the limit is ${confirmationObjectiveMaxChars} characters.`;
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-too-long' });
+      return { ok: true, reply, handoff: false };
+    }
+    const pendingAction = await createPendingConfirmation({
+      threadId, summary: risk.objective, riskReason: 'High-impact iMessage action',
+      objective: risk.objective, actionClass: risk.actionClass,
+    });
+    const reply = v2ConfirmReply(risk, pendingAction.id);
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
+    return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
+  }
+  if (v2LooksLikeAction(message) && !v2ActionPlan(message, v2ScopedWorkspace() || { root: '', cwd: '' })) {
+    const reply = 'What exactly should I act on?';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
+    return { ok: true, reply, handoff: false };
+  }
+  const workspace = v2ScopedWorkspace();
+  if (!workspace) {
+    const reply = 'I need an existing approved workspace before I can start that work.';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-workspace-refused' });
+    return { ok: true, reply, handoff: false };
+  }
+  const plan = v2ActionPlan(message, workspace) || { objective: risk.objective, capability: 'coordinator', workspace, allowWrite: false, advisorSelections: [] };
   await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source });
-  return { ok: true, reply: redact(reply), handoff: false };
+  return startImessageCoordinator(threadId, message, plan);
 }
 
 async function handle(req, res) {
@@ -2429,9 +2746,13 @@ async function handle(req, res) {
       if (Array.from(message).length > maxMessageChars) return sendJson(res, 400, { ok: false, error: `message too long; max ${maxMessageChars} chars` });
       const threadId = safeThreadId(body.thread || imessageThread);
 
+      const deliveryId = body.deliveryId || body.messageId || req.headers['x-mi-message-id'];
       return await withImessageThreadQueue(threadId, async () => {
       // V2 is deliberately first: all legacy iMessage regex routing remains below as an immediate rollback path.
-      if (imessageV2Enabled) return sendJson(res, 200, await handleImessageV2(threadId, message));
+      if (imessageV2Enabled) {
+        const result = await withImessageDelivery(threadId, deliveryId, () => handleImessageV2(threadId, message));
+        return sendJson(res, 200, result);
+      }
       const {
         imessageAskFirstReply, imessageIsBareUrl, imessageLooksLikePriorWorkStatusQuestion,
         imessagePriorWorkStatusReply, imessageWorkAck, imessageWorkDecision,
@@ -2526,22 +2847,33 @@ async function handle(req, res) {
   }
 }
 
-await ensureMainThread();
-await loadActiveWorkers();
-setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
-void monitorBackgroundWorkers().catch(() => undefined);
-const server = http.createServer(handle);
-server.listen(port, host, () => {
-  console.log(`Mi web chat listening on http://${host}:${port}`);
-});
-
-if (httpsPort && tlsCertPath && tlsKeyPath) {
-  const tls = {
-    cert: await readFile(tlsCertPath, 'utf8'),
-    key: await readFile(tlsKeyPath, 'utf8'),
-  };
-  const secureServer = https.createServer(tls, handle);
-  secureServer.listen(httpsPort, host, () => {
-    console.log(`Mi web chat listening on https://${host}:${httpsPort}`);
+if (process.env.MI_WEB_CHAT_TEST_START_DAEMON === '1') {
+  // Keep the daemon-start behavior test in this process so it observes actual
+  // imports and path checks instead of matching source text.
+  try {
+    await startMiDaemon();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+} else {
+  await ensureMainThread();
+  await loadActiveWorkers();
+  setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
+  void monitorBackgroundWorkers().catch(() => undefined);
+  const server = http.createServer(handle);
+  server.listen(port, host, () => {
+    console.log(`Mi web chat listening on http://${host}:${port}`);
   });
+
+  if (httpsPort && tlsCertPath && tlsKeyPath) {
+    const tls = {
+      cert: await readFile(tlsCertPath, 'utf8'),
+      key: await readFile(tlsKeyPath, 'utf8'),
+    };
+    const secureServer = https.createServer(tls, handle);
+    secureServer.listen(httpsPort, host, () => {
+      console.log(`Mi web chat listening on https://${host}:${httpsPort}`);
+    });
+  }
 }

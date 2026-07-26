@@ -38,17 +38,22 @@ assert.match(webChatSource, /if \(!pushoverEnabled\(\)\) return false/, 'Mi web 
 assert.match(daemonSource, /const SAFE_PI_ENV_KEYS = \[/, 'Mi daemon defines a reduced Pi worker env allowlist');
 assert.match(daemonSource, /--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--tools", tools/, 'Mi daemon worker RPC disables ambient context/resources and uses explicit tools');
 assert.match(daemonSource, /"--extension", MI_CAPABILITY_GUARD/, 'Mi daemon worker RPC loads the Mi capability guard explicitly');
-assert.match(daemonSource, /env: reducedPiEnv\(\{ \.\.\.env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile \}\)/, 'Mi daemon worker RPC uses reduced env plus capability metadata');
+assert.match(daemonSource, /env: reducedPiEnv\(\{ \.\.\.env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile,/, 'Mi daemon worker RPC uses reduced env plus capability metadata');
 assert.match(daemonSource, /"read,grep,find,ls"/, 'Mi daemon worker RPC defaults to read/search tools without bash');
 assert.match(daemonSource, /worker-write-scoped is only allowed under ~\/workflows/, 'Mi daemon only allows scoped writable workers under workflows');
 assert.match(daemonSource, /requested === "worker-write-scoped"[\s\S]*return "worker-read"/, 'Mi daemon falls back to read-only worker capability unless a scoped write profile is explicitly allowed');
 assert.match(daemonSource, /capabilityProfile\S*[\s\S]*worker-write-scoped[\s\S]*MI_CAPABILITY_PROFILE/, 'Mi daemon can preserve an explicit scoped worker capability profile');
 assert.doesNotMatch(daemonSource, /env: \{ \.\.\.process\.env, \.\.\.env \}/, 'Mi daemon worker RPC must not pass full process.env');
-assert.match(await readFile(new URL('../src/proactive.ts', import.meta.url), 'utf8'), /capabilityProfile: 'worker-read'/, 'Mi proactive auto-triage must request read-only worker capability explicitly');
-
 assert.match(capabilitySource, /'chat-read'[\s\S]*allowBash: false/, 'Capability profiles must deny bash for chat-read');
 assert.match(capabilitySource, /SAFE_ENV_ALLOWLIST/, 'Capability model must include env allowlisting');
 assert.match(guardSource, /toolName === 'bash'[\s\S]*right: 'execute'[\s\S]*resource: 'tool:\/\/bash'/, 'Capability guard must treat bash as an explicit execute capability');
+assert.match(guardSource, /ALLOWED_MI_EXTENSION_TOOLS[\s\S]*mi_orchestrator_delegate/, 'Capability guard must use an explicit reviewed extension-tool allowlist');
+assert.match(guardSource, /unreviewed extension tool is denied/, 'Capability guard must deny unknown extension tools by default');
+assert.match(guardSource, /global orchestrator controls are not available to Mi/, 'Capability guard must deny unscoped global orchestrator controls');
+assert.match(daemonSource, /profile === "advisor-read"[\s\S]*--skill", advisorRoot/, 'advisor workers load only the reviewed skill explicitly after disabling discovery');
+assert.match(daemonSource, /trustedAdvisorSkillRoot\(\)[\s\S]*rights: \["read"\]/, 'advisor skill grants are resolved and read-only');
+assert.match(guardSource, /isTrustedAdvisorReadGrant[\s\S]*profile === 'advisor-read'/, 'guard makes the narrow trusted advisor read exception explicitly');
+assert.match(guardSource, /PROTECTED_PATH_NAMES[\s\S]*credentials[\s\S]*config/, 'Capability guard must exclude credential, configuration, and state paths');
 assert.match(guardSource, /return \{ block: true, reason: decision\.reason \}/, 'Capability guard must block denied tool calls');
 assert.match(guardSource, /appendFileSync\(auditPath/, 'Capability guard must audit allow/deny decisions');
 

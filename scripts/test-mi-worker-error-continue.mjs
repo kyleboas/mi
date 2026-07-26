@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,9 @@ const finalText = 'Worker recovered after the first error and finished.';
 await mkdir(home, { recursive: true });
 await mkdir(runtime, { recursive: true });
 await mkdir(miRoot, { recursive: true });
+const privateExtensions = join(miRoot, 'pi', 'extensions');
+await mkdir(privateExtensions, { recursive: true });
+for (const file of ['mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await copyFile(new URL(`../pi/extensions/${file}`, import.meta.url), join(privateExtensions, file));
 await writeFile(sessionFile, '');
 await writeFile(runCountFile, '0');
 await writeFile(fakePi, `#!/usr/bin/env node

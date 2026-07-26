@@ -17,7 +17,8 @@ Type=oneshot
 ExecStart=${MI_BIN} tick
 WorkingDirectory=/home/${USER_NAME}/assistant
 Environment=HOME=/home/${USER_NAME}
-Environment=MI_PROACTIVE_IMESSAGE_NOTIFY=${MI_PROACTIVE_IMESSAGE_NOTIFY:-true}
+Environment=MI_PROACTIVE_IMESSAGE_NOTIFY=false
+Environment=MI_IMESSAGE_MONITOR_ENABLED=false
 Environment=MI_PHOTON_NOTIFY_PORT=${MI_PHOTON_NOTIFY_PORT:-8788}
 Nice=5
 IOSchedulingClass=best-effort
@@ -39,10 +40,13 @@ UNIT
 
 chown "${USER_NAME}:${USER_NAME}" "${UNIT_DIR}/${SERVICE_NAME}.service" "${UNIT_DIR}/${SERVICE_NAME}.timer"
 sudo -u "${USER_NAME}" XDG_RUNTIME_DIR="/run/user/$(id -u "${USER_NAME}")" systemctl --user daemon-reload
-sudo -u "${USER_NAME}" XDG_RUNTIME_DIR="/run/user/$(id -u "${USER_NAME}")" systemctl --user enable --now "${SERVICE_NAME}.timer"
+if [[ ${MI_TICK_ACTIVATE_TIMER:-0} == 1 ]]; then
+  [[ -n ${MI_PROACTIVE_IMESSAGE_NOTIFY+x} && -n ${MI_IMESSAGE_MONITOR_ENABLED+x} ]] || { echo 'Timer activation requires explicit notice and monitor values.' >&2; exit 1; }
+  sudo -u "${USER_NAME}" XDG_RUNTIME_DIR="/run/user/$(id -u "${USER_NAME}")" systemctl --user enable --now "${SERVICE_NAME}.timer"
+fi
 loginctl enable-linger "${USER_NAME}" >/dev/null 2>&1 || true
 
-echo "Installed ${SERVICE_NAME}.timer for ${USER_NAME}."
+echo "Installed ${SERVICE_NAME}.timer for ${USER_NAME} without starting it."
 echo "Retire older units if present:"
 echo "  systemctl disable --now mi-cron-tick.timer mi-cron-tick.service || true"
 echo "  systemctl mask mi-cron-tick.timer mi-cron-tick.service || true"

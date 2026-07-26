@@ -41,10 +41,14 @@ function redactCompletionText(value) {
   return redactV2Text(value)
     .replace(/(?:~|\/)(?:home|Users|tmp)\/[A-Za-z0-9_.@/:-]+/g, '[private path]')
     .replace(/\b(?:task|thread|session|correlation)[ _-]?(?:id)?\s*[:=]\s*[A-Za-z0-9._:-]{6,}\b/gi, '[private id]')
-    .replace(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi, '[private id]');
+    .replace(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi, '[private id]')
+    // Advisor workers may echo a label such as `Seth-advisor-1a2b3c4d`
+    // without the word "correlation". Strip that private correlation prefix
+    // before the final gate so it cannot reach iMessage.
+    .replace(/\b(?:coordinator|advisor(?:[-_ ](?:seth|alex|hormozi))?|seth|alex|hormozi)[-_ :/]+[0-9a-f]{8,}(?:-[0-9a-f]+)*\b/gi, '[private id]');
 }
 
-const COMPLETION_INTERNAL_TERMS = /\b(?:photon|pi|worker|daemon|routing|route|handoff|prompt|json|ya?ml|tools?|tooling|internal(?:s)?|diagnostic(?:s)?|objective|task\s*id|thread\s*id|session\s*id|correlation|gateway|system message|instructions?)\b/i;
+const COMPLETION_INTERNAL_TERMS = /\b(?:photon|pi|worker|daemon|routing|route|handoff|prompt|json|ya?ml|tools?|tooling|internal(?:s)?|diagnostic(?:s)?|objective|task\s*id|thread\s*id|session\s*id|correlation|advisor\s+(?:worker|lane|result|completion)|gateway|system message|instructions?)\b/i;
 
 function completionEchoesObjective(text, objective) {
   const output = bounded(text, MAX_COMPLETION_OUTPUT).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();

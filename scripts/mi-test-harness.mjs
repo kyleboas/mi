@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile, appendFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile, appendFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -27,6 +27,13 @@ export async function createHermeticMiEnv(prefix = 'mi-test-') {
   const bin = join(root, 'bin');
   await mkdir(home, { recursive: true, mode: 0o700 });
   await mkdir(miRoot, { recursive: true, mode: 0o700 });
+  const privateExtensions = join(miRoot, 'pi', 'extensions');
+  await mkdir(privateExtensions, { recursive: true, mode: 0o700 });
+  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-reviewed-paths.mjs']) {
+    await copyFile(repoPath('pi', 'extensions', file), join(privateExtensions, file));
+  }
+  await mkdir(join(miRoot, 'scripts'), { recursive: true, mode: 0o700 });
+  await copyFile(repoPath('scripts', 'mi-worker-completion.mjs'), join(miRoot, 'scripts', 'mi-worker-completion.mjs'));
   await mkdir(runtime, { recursive: true, mode: 0o700 });
   await mkdir(bin, { recursive: true, mode: 0o700 });
   await mkdir(join(home, 'mi'), { recursive: true, mode: 0o700 });
@@ -42,7 +49,7 @@ export async function createHermeticMiEnv(prefix = 'mi-test-') {
     MI_SOCKET_PATH: join(runtime, 'main.sock'),
     MI_DAEMON_SYSTEMD: '0',
     MI_DAEMON_HOST: join(root, 'missing-daemon-host'),
-    MI_DAEMON_PATH: join(root, 'missing-daemon.mjs'),
+    MI_DAEMON_PATH: join(miRoot, 'pi', 'extensions', 'mi-daemon.mjs'),
     MI_DAILY_BRIEF: 'false',
     MI_TICK_DAILY_BRIEF: 'false',
     MI_IMESSAGE_MONITOR_ENABLED: 'false',

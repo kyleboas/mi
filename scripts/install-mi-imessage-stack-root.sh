@@ -30,11 +30,7 @@ if [[ -f "$PHOTON_OVERRIDE" ]]; then
   fi
 fi
 
-if [[ ${MI_PHOTON_NO_SYSTEMD:-0} != 1 ]]; then
-  systemctl daemon-reload
-  systemctl restart mi-photon-bridge.service
-fi
-
-echo "Installed and restarted Mi iMessage bridge."
+# Files only. Do not reload or restart Photon as part of installation.
+echo "Installed Mi iMessage bridge files without activating services."
 echo "Status: sudo systemctl status mi-photon-bridge"
 echo "Logs:   sudo journalctl -u mi-photon-bridge -f"

@@ -96,7 +96,7 @@ const server = net.createServer((socket) => {
       selectedTaskStatus = 'paused';
       selectedTaskNeedsUser = true;
       selectedTaskNeedsUserReason = 'stopped by Escape';
-      selectedTaskProgress = 'stopped by Escape; needs User input';
+      selectedTaskProgress = 'stopped by Escape; needs input';
       socket.end(JSON.stringify({ ok: true, text: 'Stopped selected task; moved to needs input' }) + '\n');
       return;
     }
@@ -214,7 +214,7 @@ const typedReplyPlain = stripAnsi(typedReplyRun.stdout);
 let requests = (await readFile(requestLog, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 assert.ok(requests.some((request) => request.type === 'continue_worker' && request.taskId === 'task-selected' && request.message === 'please continue selected task'), 'plain typed input should reply to selected task');
 assert.match(typedReplyPlain, /paused/, 'Esc after typed reply should render task as paused');
-assert.match(typedReplyPlain, /stopped by Escape; needs User input/, 'Esc after typed reply should render needs-input reason');
+assert.match(typedReplyPlain, /stopped by Escape; needs input/, 'Esc after typed reply should render needs-input reason');
 
 // /resume is a mi agents command: it opens a session picker, then Enter adds the selected pi session as a task without opening pi.
 await runAgentsAndSend([

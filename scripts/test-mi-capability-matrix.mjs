@@ -24,14 +24,10 @@ const coverage = {
     compact: ['test-mi-cli-surfaces.mjs'],
     agents: ['test-mi-agent-e2e.mjs', 'test-mi-agent-render-snapshot.mjs'],
     tick: ['test-mi-tick.mjs'],
-    'project-status': ['test-mi-project-status.mjs'],
-    status: ['test-mi-approvals-status.mjs'],
     approvals: ['test-mi-approvals-status.mjs'],
-    proposals: ['test-mi-approvals-status.mjs'],
-    delegations: ['test-mi-approvals-status.mjs'],
     'loop-discovery': ['test-mi-loop-discovery.mjs'],
     'loop-factory': ['test-mi-loop-factory.mjs'],
-    check: ['test-mi-cli-surfaces.mjs', 'test-mi-proactive-check.mjs'],
+    check: ['test-mi-cli-surfaces.mjs'],
     cron: ['test-mi-cli-surfaces.mjs'],
     task: ['test-mi-cli-surfaces.mjs', 'test-mi-daemon-pi-session-e2e.mjs'],
     make: ['test-mi-cli-surfaces.mjs'],
@@ -91,7 +87,7 @@ function actualCliCommands(source) {
     found.add(match[1]);
     found.add(match[2]);
   }
-  for (const alias of ['--once', 'raw', 'pi', 'pi-commands', 'ui', 'chat', 'open', 'ask', 'inbox', 'threads', 'temp', 'compact', 'agents', 'tick', 'project-status', 'status', 'approvals', 'proposals', 'delegations', 'loop-discovery', 'loop-factory', 'check', 'cron', 'task', 'make', 'run', 'edit', 'logs']) {
+  for (const alias of ['--once', 'raw', 'pi', 'pi-commands', 'ui', 'chat', 'open', 'ask', 'inbox', 'threads', 'temp', 'compact', 'agents', 'tick', 'approvals', 'loop-discovery', 'loop-factory', 'check', 'cron', 'task', 'make', 'run', 'edit', 'logs']) {
     if (main.includes(`command === '${alias}'`)) found.add(alias);
   }
   found.delete('help');
