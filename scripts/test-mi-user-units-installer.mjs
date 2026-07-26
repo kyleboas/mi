@@ -184,9 +184,8 @@ try {
     assert.equal(spawnSync('test', ['-e', path.join(isolated, '.config', 'systemd', 'user')]).status, 1);
   }
 
-  // The exact reviewed legacy daemon and resource-limit drop-in are migrated
-  // without activation. The auto-load path is accepted only as this complete
-  // known bundle; an absent drop-in directory fails before mutation.
+  // Environment-derived legacy lookalikes are rejected. The one-time live
+  // migration is covered separately by the exact canonical-byte regression.
   const legacyPath = path.join(unitDir, 'mi-daemon.service');
   const legacyDropin = path.join(unitDir, 'mi-daemon.service.d');
   // Keep this fixture independently pinned to the observed legacy bytes.
@@ -204,14 +203,12 @@ try {
   await chmod(legacyDropin, 0o755);
   await writeFile(path.join(legacyDropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n');
   await chmod(path.join(legacyDropin, 'resource-limits.conf'), 0o644);
-  const callsBeforeLegacyMigration = await file(calls);
+  const callsBeforeLegacyRejection = await file(calls);
+  const beforeAlternateBundle = await readFile(legacyPath);
   result = run(home);
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(await file(calls), callsBeforeLegacyMigration, 'legacy migration does not start or reload units');
-  assert.match(await file(legacyPath), /Description=Mi background task daemon/);
-  assert.doesNotMatch(await file(legacyPath), /\.pi\/agent\/extensions/);
-  result = run(home);
-  assert.equal(result.status, 0, `safe hardened rerun succeeds: ${result.stderr}`);
+  assert.notEqual(result.status, 0, 'alternate path-rendered legacy bundle is rejected');
+  assert.deepEqual(await readFile(legacyPath), beforeAlternateBundle, 'alternate legacy rejection preserves bytes');
+  assert.equal(await file(calls), callsBeforeLegacyRejection, 'alternate legacy rejection does not activate units');
 
   for (const changedLegacy of [
     legacyDaemon(home).replace('task/socket worker supervisor', 'changed daemon'),
@@ -303,33 +300,30 @@ try {
   assert.match(result.stderr, /must be a boolean/);
   assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => file(path.join(unitDir, name)))), old);
 
-  // An explicit failing command after the first replacement restores files,
-  // including the exact legacy daemon, present drop-ins, and leaves no
-  // installer temporary folders. Repeating the same rollback is safe.
-  await writeFile(legacyPath, legacyDaemon(home));
+  // An explicit failing command after the first replacement restores current
+  // hardened files and an existing empty hardened drop-in directory. The
+  // exact legacy bundle rollback is covered by the canonical-byte regression.
+  await rm(unitDir, { recursive: true, force: true });
+  result = run(home);
+  assert.equal(result.status, 0, result.stderr);
   const dropin = path.join(unitDir, 'mi-daemon.service.d');
   await mkdir(dropin, { recursive: true });
-  await chmod(dropin, 0o755);
-  await writeFile(path.join(dropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n');
-  await chmod(path.join(dropin, 'resource-limits.conf'), 0o644);
+  await chmod(dropin, 0o700);
   const failingBin = path.join(temp, 'failing-bin');
   const mvCount = path.join(temp, 'mv-count');
   const rollbackTmp = path.join(temp, 'rollback-tmp');
   await mkdir(failingBin);
   await mkdir(rollbackTmp);
-  await writeFile(path.join(failingBin, 'mv'), `#!/bin/sh\nn=0; [ -f ${JSON.stringify(mvCount)} ] && n=$(cat ${JSON.stringify(mvCount)})\nn=$((n + 1)); echo "$n" > ${JSON.stringify(mvCount)}\n[ "$n" -eq 5 ] && exit 91\nexec /bin/mv "$@"\n`);
+  await writeFile(path.join(failingBin, 'mv'), `#!/bin/sh\nn=0; [ -f ${JSON.stringify(mvCount)} ] && n=$(cat ${JSON.stringify(mvCount)})\nn=$((n + 1)); echo "$n" > ${JSON.stringify(mvCount)}\n[ "$n" -eq 2 ] && exit 91\nexec /bin/mv "$@"\n`);
   await chmod(path.join(failingBin, 'mv'), 0o700);
   const beforeFailure = await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name))));
-  const beforeFailureDropin = await readFile(path.join(dropin, 'resource-limits.conf'));
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await rm(mvCount, { force: true });
     result = run(home, { PATH: `${failingBin}:${process.env.PATH}`, TMPDIR: rollbackTmp });
     assert.notEqual(result.status, 0);
-    assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name)))), beforeFailure, 'rollback restores every legacy unit byte-for-byte');
-    assert.deepEqual(await readdir(dropin), ['resource-limits.conf'], 'rollback restores the complete legacy drop-in directory');
-    assert.deepEqual(await readFile(path.join(dropin, 'resource-limits.conf')), beforeFailureDropin, 'rollback restores legacy drop-in bytes');
-    assert.equal((await stat(dropin)).mode & 0o777, 0o755, 'rollback restores legacy drop-in directory mode');
-    assert.equal((await stat(path.join(dropin, 'resource-limits.conf'))).mode & 0o777, 0o644, 'rollback restores legacy drop-in file mode');
+    assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name)))), beforeFailure, 'rollback restores every hardened unit byte-for-byte');
+    assert.deepEqual(await readdir(dropin), [], 'rollback restores the complete hardened drop-in directory');
+    assert.equal((await stat(dropin)).mode & 0o777, 0o700, 'rollback restores hardened drop-in directory mode');
   }
   assert.deepEqual(await readdir(rollbackTmp), [], 'rollback removes temporary folders');
 

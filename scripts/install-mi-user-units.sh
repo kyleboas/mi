@@ -132,22 +132,6 @@ for entry in "${path_entries[@]}"; do
   SERVICE_PATH+="${SERVICE_PATH:+:}$entry"
 done
 
-# The reviewed pre-hardening daemon used this exact private runtime location
-# and PATH. These migration bytes must not inherit caller-provided values.
-LEGACY_RUNTIME_DIR="$HOME_DIR/.pi/agent/mi"
-LEGACY_NODE_BIN="$HOME_DIR/.nvm/versions/node/v24.15.0/bin/node"
-LEGACY_NODE_DIR="${LEGACY_NODE_BIN%/*}"
-require_safe_path "$LEGACY_RUNTIME_DIR" legacy-runtime-directory
-require_safe_path "$LEGACY_NODE_BIN" legacy-node-binary
-LEGACY_SERVICE_PATH="$HOME_DIR/.local/bin:$LEGACY_NODE_DIR:/usr/local/bin:/usr/bin:/bin"
-IFS=: read -r -a path_entries <<< "$LEGACY_SERVICE_PATH"
-LEGACY_SERVICE_PATH=""
-for entry in "${path_entries[@]}"; do
-  require_safe_path "$entry" legacy-PATH
-  [[ ":$LEGACY_SERVICE_PATH:" == *":$entry:"* ]] && continue
-  LEGACY_SERVICE_PATH+="${LEGACY_SERVICE_PATH:+:}$entry"
-done
-
 PROACTIVE_NOTICE="${MI_PROACTIVE_IMESSAGE_NOTIFY:-false}"
 MONITOR_ENABLED="${MI_IMESSAGE_MONITOR_ENABLED:-false}"
 case "$PROACTIVE_NOTICE" in true|false|1|0|yes|no|on|off) ;; *) fail 'MI_PROACTIVE_IMESSAGE_NOTIFY must be a boolean' ;; esac
@@ -308,37 +292,19 @@ if command -v systemd-analyze >/dev/null && [[ ${MI_USER_UNITS_SKIP_SYSTEMD_VERI
   systemd-analyze verify "$stage/mi-daemon.service" "$stage/mi-tick.service" "$stage/mi-tick.timer" >/dev/null
 fi
 
-# This is the one older daemon unit we can safely replace. It used Pi's
-# automatic extension folder, but every value must still be the value derived
-# above for this selected service account. Any edit, extra directive, or other
-# auto-load unit remains unsafe and is rejected.
-# This is the one older daemon unit we can safely replace. Render the expected
-# bytes into an owner-only regular file: command substitution would discard
-# trailing newlines and cannot represent NUL bytes, so it is never suitable
-# for recognizing a privileged migration input.
-legacy_daemon_unit="$stage/legacy-mi-daemon.service"
-cat > "$legacy_daemon_unit" <<EOF
-[Unit]
-Description=Mi daemon (task/socket worker supervisor)
-After=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$ROOT
-ExecStart=$LEGACY_NODE_BIN $HOME_DIR/.pi/agent/extensions/mi-daemon.mjs
-Restart=on-failure
-RestartSec=5
-Environment=MI_SOCKET_PATH=$LEGACY_RUNTIME_DIR/main.sock
-Environment=MI_RUNTIME_DIR=$LEGACY_RUNTIME_DIR
-Environment=MI_ROOT=$ROOT
-Environment=PATH=$LEGACY_SERVICE_PATH
-PrivateTmp=true
-ProtectSystem=full
-
-[Install]
-WantedBy=default.target
-EOF
-chmod 600 "$legacy_daemon_unit"
+# This one-time migration is pinned to the reviewed live bundle. Generating an
+# expected unit from the installer's current environment is not an identity
+# check: matching bytes can still be rejected when any rendered input differs
+# in the real stack invocation. Exact hashes make the sole accepted bytes
+# independent of caller configuration while the file/type/owner/mode checks
+# below keep the migration fail closed.
+readonly LEGACY_DAEMON_SHA256='40d4ac150ab908f1935b954ac30624b678f7ca67e7fd1464287cbb33064fb375'
+readonly LEGACY_DAEMON_DROPIN_SHA256='aaed2d6c33eda381c1c950aad6baf566ccdd28304525333be0f5598c09eed7bc'
+sha256_file() {
+  local output
+  output="$(sha256sum -- "$1")"
+  printf '%s\n' "${output%% *}"
+}
 
 assert_safe_existing_file() {
   local target="$1" label="$2" mode owner
@@ -357,32 +323,19 @@ assert_safe_existing_directory() {
   (( (8#$mode & 8#022) == 0 )) || fail "$label is writable by group or other: $target"
 }
 is_known_legacy_daemon_unit() {
-  local target="$1" expected_size actual_size
-  # This historical migration is intentionally pinned to one reviewed Node
-  # binary. Do not let current installer overrides influence accepted bytes.
-  canonical_executable "$LEGACY_NODE_BIN" legacy-node-binary >/dev/null
+  local target="$1"
   assert_safe_existing_file "$target" 'legacy daemon unit'
-  expected_size="$(stat -c '%s' -- "$legacy_daemon_unit")"
-  actual_size="$(stat -c '%s' -- "$target")"
-  [[ "$actual_size" == "$expected_size" ]] && cmp -s -- "$legacy_daemon_unit" "$target"
+  # The hash embeds these reviewed paths, but also pin the replacement target:
+  # the same old bytes copied into another account must not authorize migration.
+  [[ "$HOME_DIR" == /home/kyle && "$ROOT" == /home/kyle/assistant && "${EUID:-$(id -u)}" == 1000 ]]
+  [[ "$NODE_BIN" == /home/kyle/.nvm/versions/node/v24.15.0/bin/node ]]
+  [[ "$(sha256_file "$target")" == "$LEGACY_DAEMON_SHA256" ]]
 }
-# The reviewed legacy daemon was accompanied by this one resource-limit
-# drop-in. Migration accepts only the complete bundle, including exact types,
-# modes, and bytes, rather than attempting to parse untrusted systemd input.
-legacy_daemon_dropin_dir="$stage/legacy-mi-daemon.service.d"
-legacy_daemon_dropin="$legacy_daemon_dropin_dir/resource-limits.conf"
-mkdir -m 755 -- "$legacy_daemon_dropin_dir"
-cat > "$legacy_daemon_dropin" <<'EOF'
-[Service]
-MemoryMax=600M
-MemoryHigh=450M
-CPUQuota=75%
-Environment=NODE_OPTIONS=--max-old-space-size=384
-OOMPolicy=stop
-EOF
-chmod 644 "$legacy_daemon_dropin"
+# The reviewed legacy daemon was accompanied by exactly one resource-limit
+# drop-in. Migration accepts only that complete bundle, including exact types,
+# modes, ownership, filename, and bytes.
 assert_known_legacy_daemon_dropins() {
-  local target="$UNIT_DIR/mi-daemon.service.d" expected="$legacy_daemon_dropin" mode
+  local target="$UNIT_DIR/mi-daemon.service.d" mode
   local entries
   validate_unit_target "$target"
   assert_safe_existing_directory "$target" 'legacy daemon drop-in directory'
@@ -395,7 +348,7 @@ assert_known_legacy_daemon_dropins() {
   assert_safe_existing_file "${entries[0]}" 'legacy daemon drop-in file'
   mode="$(stat -c '%a' -- "${entries[0]}")"
   [[ "$mode" == 644 ]] || fail "legacy daemon drop-in file has an unexpected mode: ${entries[0]}"
-  cmp -s -- "$expected" "${entries[0]}" || fail "legacy daemon drop-in file has unexpected contents: ${entries[0]}"
+  [[ "$(sha256_file "${entries[0]}")" == "$LEGACY_DAEMON_DROPIN_SHA256" ]] || fail "legacy daemon drop-in file has unexpected contents: ${entries[0]}"
 }
 assert_known_hardened_daemon_dropins() {
   local target="$UNIT_DIR/mi-daemon.service.d" mode
