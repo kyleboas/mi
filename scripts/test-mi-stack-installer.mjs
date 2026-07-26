@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -28,11 +28,11 @@ await writeFile(path.join(bin, 'sudo'), `#!/bin/bash\necho sudo >> ${JSON.string
 await writeFile(path.join(bin, 'systemctl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(systemctlCalls)}\nexit 0\n`);
 await chmod(path.join(bin, 'sudo'), 0o700);
 await chmod(path.join(bin, 'systemctl'), 0o700);
-const stageNames = ['production-gateway', 'production-registry', 'gateway-client', 'tailscale-web', 'user-units', 'photon-loopback', 'readiness'];
-const userStages = new Set(['production-registry', 'gateway-client', 'tailscale-web', 'user-units']);
+const stageNames = ['production-gateway', 'gateway-client', 'production-registry', 'tailscale-web', 'user-units', 'photon-loopback', 'generated-entrypoints', 'readiness'];
+const userStages = new Set(['gateway-client', 'production-registry', 'tailscale-web', 'user-units']);
 const stageLog = path.join(tmp, 'stage-log');
 const stageEnvLog = path.join(tmp, 'stage-env-log');
-for (const name of stageNames) {
+for (const name of stageNames.filter((name) => name !== 'generated-entrypoints')) {
   const gatewayValues = name === 'production-gateway'
     ? `printf '%s\\n' "$MI_GATEWAY_NO_SYSTEMD|$MI_GATEWAY_SERVICE_USER|$MI_GATEWAY_SERVICE_HOME|$MI_GATEWAY_PI_BINARY|$MI_GATEWAY_PI_COMMAND_DIR|$MI_GATEWAY_PI_AGENT_DIR|$MI_GATEWAY_WORK_DIR|$MI_GATEWAY_HEALTH_COMMAND|$MI_GATEWAY_HEALTH_USER" > ${JSON.stringify(path.join(tmp, 'gateway-values'))}\n`
     : '';
@@ -72,14 +72,34 @@ assert.equal(beforeServiceState, initialServiceState, 'fixture captures inactive
 
 let result = run(['--dry-run']);
 assert.equal(result.status, 0, result.stderr);
-assert.match(result.stdout, /production-gateway[\s\S]*readiness/);
+assert.deepEqual(result.stdout.trim().split('\n').slice(1).map((line) => line.trim()), stageNames, 'dry-run lists the exact dependency order');
 assert.equal(spawnSync('test', ['-e', path.join(home, 'install-mi-stack.sh')]).status, 1, 'dry-run does not mutate');
 assert.equal(spawnSync('test', ['-e', sudoCount]).status, 1, 'dry-run does not cross sudo boundary');
+
+// Cleanup is armed before the transaction directory. A failure at either
+// setup checkpoint leaves no stack transaction directory or changed targets.
+const transactionTmp = path.join(tmp, 'stack-transaction-tmp');
+const setupRegistry = path.join(home, '.pi/agent');
+await mkdir(transactionTmp);
+await mkdir(setupRegistry, { recursive: true });
+await writeFile(path.join(setupRegistry, 'settings.json'), '{"enabledModels":["other/model"]}\n');
+await writeFile(path.join(setupRegistry, 'models.json'), '{"providers":{"other":{"models":[{"id":"model"}]}}}\n');
+const setupSettingsBefore = await readFile(path.join(setupRegistry, 'settings.json'));
+const setupModelsBefore = await readFile(path.join(setupRegistry, 'models.json'));
+for (const setupStep of ['after-temp', 'after-manifest']) {
+  result = run([], { MI_STACK_NO_SUDO: '1', MI_STACK_FAIL_SETUP: setupStep, TMPDIR: transactionTmp });
+  assert.notEqual(result.status, 0, `injected ${setupStep} failure stops the stack`);
+  assert.deepEqual(await readFile(path.join(setupRegistry, 'settings.json')), setupSettingsBefore, `${setupStep} leaves settings byte-for-byte unchanged`);
+  assert.deepEqual(await readFile(path.join(setupRegistry, 'models.json')), setupModelsBefore, `${setupStep} leaves models byte-for-byte unchanged`);
+  assert.deepEqual((await readdir(transactionTmp)).filter((name) => name.startsWith('mi-stack-rollback.')), [], `${setupStep} leaves no stack transaction directory`);
+}
+assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'setup failures preserve service state byte-for-byte');
+assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'setup failures make no systemctl call');
 
 result = run();
 assert.equal(result.status, 0, result.stderr);
 assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').length, 1, 'normal install has one sudo boundary');
-assert.deepEqual((await readFile(stageLog, 'utf8')).trim().split('\n'), stageNames, 'fresh orchestration order');
+assert.deepEqual((await readFile(stageLog, 'utf8')).trim().split('\n'), stageNames.filter((name) => name !== 'generated-entrypoints'), 'fresh replacement-stage order');
 assert.equal(
   (await readFile(path.join(tmp, 'gateway-values'), 'utf8')).trim(),
   `1|other-user|${home}|${path.join(tmp, 'pi-real')}|${bin}|${path.join(home, '.pi/agent')}|${path.join(tmp, 'gateway-work')}|${path.join(tmp, 'other-health-command')}|other-health`,
@@ -105,6 +125,80 @@ assert.equal(result.status, 0, result.stderr);
 assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').length, 2, 'idempotent rerun still uses only one boundary per run');
 assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'idempotent stack install preserves active and enabled service states byte-for-byte');
 assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'idempotent stack install makes no systemctl call');
+
+// A clean registry starts without the gateway provider. The real client stage
+// creates coding-main before the real production stage adds mi-concierge.
+const registryHome = path.join(tmp, 'registry-home');
+const registryRoot = path.join(tmp, 'registry-root');
+const registryStages = path.join(tmp, 'registry-stages');
+const registryDir = path.join(registryHome, '.pi/agent');
+await Promise.all([mkdir(registryHome), mkdir(registryRoot), mkdir(registryStages), mkdir(registryDir, { recursive: true })]);
+await writeFile(path.join(registryDir, 'settings.json'), JSON.stringify({ enabledModels: ['other/model'] }));
+await writeFile(path.join(registryDir, 'models.json'), JSON.stringify({ providers: { other: { models: [{ id: 'model' }] } } }));
+for (const name of stageNames.filter((name) => !['gateway-client', 'production-registry'].includes(name))) {
+  await writeFile(path.join(registryStages, name), '#!/bin/sh\nexit 0\n');
+  await chmod(path.join(registryStages, name), 0o700);
+}
+result = run([], { MI_STACK_HOME: registryHome, MI_SYSTEM_ROOT: registryRoot, MI_STACK_STAGE_COMMAND_DIR: registryStages });
+assert.equal(result.status, 0, result.stderr);
+assert.ok(result.stdout.indexOf('Mi stack stage: gateway-client') < result.stdout.indexOf('Mi stack stage: production-registry'), 'gateway baseline stage runs before production aliases');
+const cleanSettings = JSON.parse(await readFile(path.join(registryDir, 'settings.json'), 'utf8'));
+const cleanModels = JSON.parse(await readFile(path.join(registryDir, 'models.json'), 'utf8'));
+assert.ok(cleanSettings.enabledModels.includes('vps-gateway/coding-main'), 'client stage creates the baseline model setting');
+assert.ok(cleanSettings.enabledModels.includes('vps-gateway/mi-concierge'), 'production stage adds the production alias setting');
+assert.ok(cleanModels.providers['vps-gateway'].models.some((model) => model.id === 'coding-main'), 'client stage creates the baseline model');
+assert.ok(cleanModels.providers['vps-gateway'].models.some((model) => model.id === 'mi-concierge'), 'production stage adds the production alias');
+assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'clean registry install preserves service state byte-for-byte');
+assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'clean registry install makes no systemctl call');
+
+// Invalid source data cannot be turned into a baseline. The alias stage never
+// runs, so its fail-closed registry checks remain the final guard.
+const invalidHome = path.join(tmp, 'invalid-registry-home');
+const invalidRoot = path.join(tmp, 'invalid-registry-root');
+const invalidStages = path.join(tmp, 'invalid-registry-stages');
+const invalidDir = path.join(invalidHome, '.pi/agent');
+const productionReached = path.join(tmp, 'invalid-production-reached');
+await Promise.all([mkdir(invalidHome), mkdir(invalidRoot), mkdir(invalidStages), mkdir(invalidDir, { recursive: true })]);
+await writeFile(path.join(invalidDir, 'settings.json'), '{}\n');
+await writeFile(path.join(invalidDir, 'models.json'), '{"providers":{}}\n');
+for (const name of stageNames.filter((name) => !['gateway-client', 'production-registry'].includes(name))) {
+  await writeFile(path.join(invalidStages, name), '#!/bin/sh\nexit 0\n');
+  await chmod(path.join(invalidStages, name), 0o700);
+}
+await writeFile(path.join(invalidStages, 'production-registry'), `#!/bin/sh\nprintf reached > ${JSON.stringify(productionReached)}\n`);
+await chmod(path.join(invalidStages, 'production-registry'), 0o700);
+result = run([], { MI_STACK_HOME: invalidHome, MI_SYSTEM_ROOT: invalidRoot, MI_STACK_STAGE_COMMAND_DIR: invalidStages });
+assert.notEqual(result.status, 0);
+assert.match(result.stderr, /stage gateway-client; restoring/);
+assert.equal(spawnSync('test', ['-e', productionReached]).status, 1, 'production aliases do not run when the client cannot establish its baseline');
+assert.deepEqual(await readFile(path.join(invalidDir, 'settings.json')), Buffer.from('{}\n'), 'invalid settings stay exact after failed baseline setup');
+assert.deepEqual(await readFile(path.join(invalidDir, 'models.json')), Buffer.from('{"providers":{}}\n'), 'invalid models stay exact after failed baseline setup');
+assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'failed baseline setup preserves service state byte-for-byte');
+assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'failed baseline setup makes no systemctl call');
+
+// A failure after both registry stages restores their exact original bytes.
+const rollbackHome = path.join(tmp, 'registry-rollback-home');
+const rollbackRoot = path.join(tmp, 'registry-rollback-root');
+const rollbackStages = path.join(tmp, 'registry-rollback-stages');
+const rollbackDir = path.join(rollbackHome, '.pi/agent');
+await Promise.all([mkdir(rollbackHome), mkdir(rollbackRoot), mkdir(rollbackStages), mkdir(rollbackDir, { recursive: true })]);
+const rollbackSettingsBefore = Buffer.from('{\n  "enabledModels": ["other/model"]\n}\n');
+const rollbackModelsBefore = Buffer.from('{\n  "providers": {"other": {"models": [{"id": "model"}]}}\n}\n');
+await writeFile(path.join(rollbackDir, 'settings.json'), rollbackSettingsBefore);
+await writeFile(path.join(rollbackDir, 'models.json'), rollbackModelsBefore);
+for (const name of stageNames.filter((name) => !['gateway-client', 'production-registry', 'tailscale-web'].includes(name))) {
+  await writeFile(path.join(rollbackStages, name), '#!/bin/sh\nexit 0\n');
+  await chmod(path.join(rollbackStages, name), 0o700);
+}
+await writeFile(path.join(rollbackStages, 'tailscale-web'), `#!/bin/sh\nprintf 'changed\\n' > ${JSON.stringify(path.join(rollbackDir, 'settings.json'))}\nprintf 'changed\\n' > ${JSON.stringify(path.join(rollbackDir, 'models.json'))}\nexit 24\n`);
+await chmod(path.join(rollbackStages, 'tailscale-web'), 0o700);
+result = run([], { MI_STACK_HOME: rollbackHome, MI_SYSTEM_ROOT: rollbackRoot, MI_STACK_STAGE_COMMAND_DIR: rollbackStages });
+assert.notEqual(result.status, 0);
+assert.match(result.stderr, /stage tailscale-web; restoring/);
+assert.deepEqual(await readFile(path.join(rollbackDir, 'settings.json')), rollbackSettingsBefore, 'post-registry failure restores settings byte-for-byte');
+assert.deepEqual(await readFile(path.join(rollbackDir, 'models.json')), rollbackModelsBefore, 'post-registry failure restores models byte-for-byte');
+assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'post-registry rollback preserves service state byte-for-byte');
+assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'post-registry rollback makes no systemctl call');
 
 // Partial failure restores an existing generated file and removes partial output.
 const mutation = path.join(home, '.local/share/mi/mi-gateway-client.py');

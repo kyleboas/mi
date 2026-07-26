@@ -21,7 +21,7 @@ Preview or inspect without mutation or sudo:
 
 The check reports fixed expected values only: the two production aliases, Photon loopback URL, TLS path shape, helper path, and PATH shape. It also checks that the daemon uses its reviewed private extension path and sandbox settings. It does not dump process environments, registry contents, host DNS names, prompts, or credentials. Gateway readiness uses the existing authenticated local health helper.
 
-Production install restores `coding-main` (implicit high) and `mi-concierge` (medium), removes installed `mi-eval-*` aliases and overlay state, and preserves unrelated Pi registry providers/models/settings. Evaluation remains an explicit separate cycle:
+Production install first writes the tracked non-secret `coding-main` baseline through the gateway-client stage, then adds `mi-concierge` (medium). It removes installed `mi-eval-*` aliases and overlay state, and preserves unrelated Pi registry providers/models/settings. The production alias stage fails instead of guessing a missing baseline. Evaluation remains an explicit separate cycle:
 
 ```bash
 sudo /home/kyle/install-mi-model-eval-gateway.sh

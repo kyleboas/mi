@@ -160,7 +160,7 @@ sudo env \
   "$MI_ROOT/scripts/install-mi-stack.sh"
 ```
 
-The script installs the production gateway and Pi registry, brokered gateway client, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It writes files only: it does not reload, enable, start, stop, or restart those services. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
+The script installs the production gateway, then the brokered gateway client and its non-secret `coding-main` Pi registry baseline, then the production Pi aliases, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It writes files only: it does not reload, enable, start, stop, or restart those services. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
 
 ```bash
 MI_APP_DIR="$MI_ROOT" "$MI_ROOT/scripts/install-mi-stack.sh" --dry-run

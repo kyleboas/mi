@@ -158,7 +158,7 @@ The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:
 
 `vps-gateway/mi-concierge` is Mi V2's production-only foreground route. The authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical implicit-high route for every other gateway client. These are the only durable production aliases; tracked production callers do not require `coding-fast`. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
 
-The gateway and non-secret production Pi registry are installed as stages of the canonical stack operation. The tracked modular scripts remain internal implementation and test units.
+The canonical stack first installs the gateway client and its non-secret `coding-main` Pi registry baseline, then installs the production `mi-concierge` alias. The alias stage fails closed if that baseline cannot be established. The tracked modular scripts remain internal implementation and test units.
 
 #### Decision-only model evaluation
 

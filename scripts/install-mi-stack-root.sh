@@ -21,7 +21,7 @@ case "${1:-}" in
   *) echo 'Usage: install-mi-stack-root.sh [--check|--dry-run]' >&2; exit 2 ;;
 esac
 
-stages=(production-gateway production-registry gateway-client tailscale-web user-units photon-loopback generated-entrypoints readiness)
+stages=(production-gateway gateway-client production-registry tailscale-web user-units photon-loopback generated-entrypoints readiness)
 if [[ "$MODE" == dry-run ]]; then
   printf 'Mi stack dry-run (no changes):\n'
   printf '  %s\n' "${stages[@]}"
@@ -108,10 +108,52 @@ require_stack_path "$STACK_NODE_BIN" MI_NODE_BIN
 TARGET_XDG_CONFIG_HOME="$TARGET_HOME/.config"
 TARGET_XDG_DATA_HOME="$TARGET_HOME/.local/share"
 TARGET_SERVICE_PATH="${STACK_NODE_BIN%/*}:/usr/local/bin:/usr/bin:/bin"
+case "${MI_STACK_FAIL_SETUP:-}" in ''|after-temp|after-manifest) ;; *) echo 'Mi stack preflight failed: MI_STACK_FAIL_SETUP must name a supported setup step' >&2; exit 1 ;; esac
 
-backup="$(mktemp -d "${TMPDIR:-/tmp}/mi-stack-rollback.XXXXXX")"
+# Arm one cleanup path before creating the owner-only transaction root. This
+# covers a failed mktemp, manifest creation, or snapshot before any stage runs.
+transaction=''
+backup=''
+manifest=''
+committed=0
+rolled_back=0
+current_stage=preflight
+cleanup() {
+  [[ -n "$transaction" && -d "$transaction" ]] && rm -rf -- "$transaction" || true
+}
+rollback() {
+  [[ "$rolled_back" == 0 ]] || return 0
+  rolled_back=1
+  if [[ -n "$manifest" && -f "$manifest" ]]; then
+    echo "Mi stack failed at stage $current_stage; restoring generated configuration" >&2
+    while IFS=$'\t' read -r state key path; do
+      rm -rf -- "$path" || true
+      [[ "$state" == present ]] && { mkdir -p "$(dirname "$path")" && cp -a -- "$backup/$key" "$path"; } || true
+    done < "$manifest"
+  fi
+  # This transaction is files-only. Restoring files must not reload, enable,
+  # start, stop, or restart a gateway, Photon, web, daemon, or timer service.
+  cleanup
+}
+on_exit() {
+  local status=$?
+  trap - EXIT ERR INT TERM HUP
+  if [[ "$committed" == 1 ]]; then cleanup; else rollback; fi
+  exit "$status"
+}
+trap on_exit EXIT
+trap 'exit 1' ERR
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+transaction="$(mktemp -d "${TMPDIR:-/tmp}/mi-stack-rollback.XXXXXX")"
+chmod 700 "$transaction"
+backup="$transaction"
+[[ ${MI_STACK_FAIL_SETUP:-} != after-temp ]] || { echo 'Mi stack injected failure after transaction temporary directory creation' >&2; exit 1; }
 manifest="$backup/manifest"
 : > "$manifest"
+[[ ${MI_STACK_FAIL_SETUP:-} != after-manifest ]] || { echo 'Mi stack injected failure after transaction manifest creation' >&2; exit 1; }
 backup_path() {
   local path="$1" key
   key=$(printf '%s' "$path" | sha256sum | cut -d' ' -f1)
@@ -143,21 +185,6 @@ $SYSTEM_ROOT/etc/systemd/system/llm-gateway.service.d/20-codex-subscription.conf
 $SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service
 $SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service.d/override.conf
 PATHS
-committed=0
-rollback() {
-  local status=$?
-  (( committed == 1 )) && return
-  echo "Mi stack failed at stage ${current_stage:-preflight}; restoring generated configuration" >&2
-  while IFS=$'\t' read -r state key path; do
-    rm -rf -- "$path"
-    [[ "$state" == present ]] && { mkdir -p "$(dirname "$path")"; cp -a -- "$backup/$key" "$path"; }
-  done < "$manifest"
-  # This transaction is files-only. Restoring files must not reload, enable,
-  # start, stop, or restart a gateway, Photon, web, daemon, or timer service.
-  rm -rf "$backup"
-  exit "$status"
-}
-trap rollback ERR INT TERM
 
 run_stage() {
   current_stage="$1"; shift
@@ -208,8 +235,14 @@ run_stage production-gateway env \
   MI_GATEWAY_HEALTH_COMMAND="${MI_GATEWAY_HEALTH_COMMAND:-/home/kyle/bin/llm-gateway-health}" \
   MI_GATEWAY_HEALTH_USER="$GATEWAY_HEALTH_USER" \
   "$ROOT/scripts/install-mi-subscription-gateway-root.sh"
+# The gateway client writes the tracked coding-main registry baseline. The
+# production stage then adds only aliases and remains fail-closed without it.
+run_stage gateway-client as_user env \
+  MI_GATEWAY_CLIENT_NO_SYSTEMD=1 \
+  MI_GATEWAY_CONFIG_DIR="$TARGET_HOME/.pi/agent" \
+  MI_GATEWAY_NODE_BIN="$STACK_NODE_BIN" \
+  "$ROOT/scripts/install-mi-gateway-client.sh"
 run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR="$TARGET_HOME/.pi/agent" "$STACK_NODE_BIN" "$ROOT/scripts/install-mi-gateway-models.mjs"
-run_stage gateway-client as_user env MI_GATEWAY_CLIENT_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-gateway-client.sh"
 # A staged install writes reviewed units only. It never starts web, Photon,
 # daemon, or tick work; activation is a separate operator step.
 run_stage tailscale-web as_user env MI_APP_DIR="$ROOT" MI_WEB_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-web-chat-systemd.sh"
@@ -223,6 +256,6 @@ run_stage readiness env \
   MI_GATEWAY_HEALTH_COMMAND="${MI_GATEWAY_HEALTH_COMMAND:-/home/kyle/bin/llm-gateway-health}" \
   "$ROOT/scripts/check-mi-stack-readiness.sh"
 committed=1
-trap - ERR INT TERM
-rm -rf "$backup"
+cleanup
+trap - EXIT ERR INT TERM HUP
 echo 'Mi stack install complete'

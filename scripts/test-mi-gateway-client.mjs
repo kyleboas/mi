@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile, chmod } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile, chmod } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,24 @@ const helper = join(root, 'scripts', 'mi-gateway-client.py');
 const home = await mkdtemp(join(tmpdir(), 'mi-gateway-client-'));
 await mkdir(join(home, '.config', 'agent'), { recursive: true, mode: 0o700 });
 await writeFile(join(home, '.config', 'agent', 'gateway.token'), 'test-token-never-print', { mode: 0o600 });
+
+// The files-only client installer owns the tracked coding-main baseline. It
+// must make it before production aliases depend on it, without contacting a
+// gateway or activating a service.
+const registry = join(home, '.pi', 'agent');
+await mkdir(registry, { recursive: true });
+await writeFile(join(registry, 'settings.json'), JSON.stringify({ enabledModels: ['other/model'] }));
+await writeFile(join(registry, 'models.json'), JSON.stringify({ providers: { other: { models: [{ id: 'model' }] } } }));
+const install = spawnSync('bash', [join(root, 'scripts', 'install-mi-gateway-client.sh')], {
+  env: { ...process.env, HOME: home, XDG_DATA_HOME: join(home, '.local', 'share'), MI_GATEWAY_CONFIG_DIR: registry, MI_GATEWAY_NODE_BIN: process.execPath },
+  encoding: 'utf8',
+});
+assert.equal(install.status, 0, install.stderr);
+const installedSettings = JSON.parse(await readFile(join(registry, 'settings.json'), 'utf8'));
+const installedModels = JSON.parse(await readFile(join(registry, 'models.json'), 'utf8'));
+assert.ok(installedSettings.enabledModels.includes('vps-gateway/coding-main'));
+assert.ok(installedModels.providers['vps-gateway'].models.some((model) => model.id === 'coding-main'));
+assert.equal(await readFile(join(home, '.local', 'share', 'mi', 'mi-gateway-client.py'), 'utf8'), await readFile(helper, 'utf8'));
 
 let mode = 'ok';
 let seen;
