@@ -300,6 +300,14 @@ fi
 # below keep the migration fail closed.
 readonly LEGACY_DAEMON_SHA256='40d4ac150ab908f1935b954ac30624b678f7ca67e7fd1464287cbb33064fb375'
 readonly LEGACY_DAEMON_DROPIN_SHA256='aaed2d6c33eda381c1c950aad6baf566ccdd28304525333be0f5598c09eed7bc'
+# The reviewed live tick bundle: an old NVM `mi tick` base with a proactive
+# notice and a one-minute timer, plus the two staged drop-ins that force the v2
+# path, both notice switches off, and a five-minute interval. The replacement
+# bases carry the safe switches directly, so the drop-ins become obsolete.
+readonly LEGACY_TICK_SERVICE_SHA256='84bc7112f6eca73c81e392e0f7716107f2e6d240524825fab8db105e5366e464'
+readonly LEGACY_TICK_TIMER_SHA256='34931c182422d14de7fe5526a8e8e621e7b990ba1fe4d622f2e18f5af2674723'
+readonly LEGACY_TICK_SERVICE_DROPIN_SHA256='b77c29ea99903d3e27ec9ab21a1328c5182a21bfb4163d9861a184346713a8dd'
+readonly LEGACY_TICK_TIMER_DROPIN_SHA256='fb4a14fe38ed9b1bec2974409c421286296cd549031112805848603aa33bec15'
 sha256_file() {
   local output
   output="$(sha256sum -- "$1")"
@@ -322,67 +330,162 @@ assert_safe_existing_directory() {
   [[ "$owner" == "${EUID:-$(id -u)}" ]] || fail "$label has an unsafe owner: $target"
   (( (8#$mode & 8#022) == 0 )) || fail "$label is writable by group or other: $target"
 }
+# The hashes embed the reviewed paths, but also pin the replacement target: the
+# same old bytes copied into another account, or replaced from another Node or
+# Mi runtime, must not authorize migration. Every clause returns explicitly so
+# the pin still holds when `set -e` is suspended by the calling condition.
+is_reviewed_live_account() {
+  [[ "$HOME_DIR" == /home/kyle ]] || return 1
+  [[ "$ROOT" == /home/kyle/assistant ]] || return 1
+  [[ "${EUID:-$(id -u)}" == 1000 ]] || return 1
+  [[ "$NODE_BIN" == /home/kyle/.nvm/versions/node/v24.15.0/bin/node ]] || return 1
+  [[ "$MI_BIN" == /home/kyle/.nvm/versions/node/v24.15.0/bin/mi ]] || return 1
+}
 is_known_legacy_daemon_unit() {
   local target="$1"
   assert_safe_existing_file "$target" 'legacy daemon unit'
-  # The hash embeds these reviewed paths, but also pin the replacement target:
-  # the same old bytes copied into another account must not authorize migration.
-  [[ "$HOME_DIR" == /home/kyle && "$ROOT" == /home/kyle/assistant && "${EUID:-$(id -u)}" == 1000 ]]
-  [[ "$NODE_BIN" == /home/kyle/.nvm/versions/node/v24.15.0/bin/node ]]
-  [[ "$(sha256_file "$target")" == "$LEGACY_DAEMON_SHA256" ]]
+  is_reviewed_live_account || return 1
+  [[ "$(sha256_file "$target")" == "$LEGACY_DAEMON_SHA256" ]] || return 1
 }
-# The reviewed legacy daemon was accompanied by exactly one resource-limit
-# drop-in. Migration accepts only that complete bundle, including exact types,
-# modes, ownership, filename, and bytes.
-assert_known_legacy_daemon_dropins() {
-  local target="$UNIT_DIR/mi-daemon.service.d" mode
+# A published bundle keeps an empty owner-only drop-in directory, so accept
+# only that shape beside an already hardened base.
+assert_known_hardened_dropins() {
+  local target="$1" label="$2" mode
   local entries
+  if [[ ! -e "$target" && ! -L "$target" ]]; then return 0; fi
   validate_unit_target "$target"
-  assert_safe_existing_directory "$target" 'legacy daemon drop-in directory'
+  assert_safe_existing_directory "$target" "$label"
   mode="$(stat -c '%a' -- "$target")"
-  [[ "$mode" == 755 ]] || fail "legacy daemon drop-in directory has an unexpected mode: $target"
+  [[ "$mode" == 700 ]] || fail "$label has an unexpected mode: $target"
   shopt -s nullglob dotglob
   entries=("$target"/*)
   shopt -u nullglob dotglob
-  [[ "${#entries[@]}" == 1 && "${entries[0]}" == "$target/resource-limits.conf" ]] || fail "refusing unknown legacy daemon drop-in bundle: $target"
-  assert_safe_existing_file "${entries[0]}" 'legacy daemon drop-in file'
-  mode="$(stat -c '%a' -- "${entries[0]}")"
-  [[ "$mode" == 644 ]] || fail "legacy daemon drop-in file has an unexpected mode: ${entries[0]}"
-  [[ "$(sha256_file "${entries[0]}")" == "$LEGACY_DAEMON_DROPIN_SHA256" ]] || fail "legacy daemon drop-in file has unexpected contents: ${entries[0]}"
+  [[ "${#entries[@]}" == 0 ]] || fail "refusing unknown $label bundle: $target"
 }
 assert_known_hardened_daemon_dropins() {
-  local target="$UNIT_DIR/mi-daemon.service.d" mode
+  assert_known_hardened_dropins "$UNIT_DIR/mi-daemon.service.d" 'hardened daemon drop-in directory'
+}
+# Each reviewed legacy drop-in directory holds exactly one reviewed file. Their
+# directory and file modes differ per bundle, so pin every one of them exactly.
+assert_known_legacy_dropin_dir() {
+  local target="$1" dir_mode="$2" name="$3" file_mode="$4" expected_sha="$5" label="$6" mode
   local entries
-  [[ ! -e "$target" && ! -L "$target" ]] && return 0
   validate_unit_target "$target"
-  assert_safe_existing_directory "$target" 'hardened daemon drop-in directory'
+  assert_safe_existing_directory "$target" "$label directory"
   mode="$(stat -c '%a' -- "$target")"
-  [[ "$mode" == 700 ]] || fail "hardened daemon drop-in directory has an unexpected mode: $target"
+  [[ "$mode" == "$dir_mode" ]] || fail "$label directory has an unexpected mode: $target"
   shopt -s nullglob dotglob
   entries=("$target"/*)
   shopt -u nullglob dotglob
-  [[ "${#entries[@]}" == 0 ]] || fail "refusing unknown hardened daemon drop-in bundle: $target"
+  [[ "${#entries[@]}" == 1 && "${entries[0]}" == "$target/$name" ]] || fail "refusing unknown $label bundle: $target"
+  assert_safe_existing_file "${entries[0]}" "$label file"
+  mode="$(stat -c '%a' -- "${entries[0]}")"
+  [[ "$mode" == "$file_mode" ]] || fail "$label file has an unexpected mode: ${entries[0]}"
+  [[ "$(sha256_file "${entries[0]}")" == "$expected_sha" ]] || fail "$label file has unexpected contents: ${entries[0]}"
+}
+assert_known_legacy_daemon_dropins() {
+  assert_known_legacy_dropin_dir "$UNIT_DIR/mi-daemon.service.d" 755 resource-limits.conf 644 \
+    "$LEGACY_DAEMON_DROPIN_SHA256" 'legacy daemon drop-in'
+}
+is_known_legacy_tick_service() {
+  local target="$1"
+  assert_safe_existing_file "$target" 'legacy tick service'
+  is_reviewed_live_account || return 1
+  [[ "$(sha256_file "$target")" == "$LEGACY_TICK_SERVICE_SHA256" ]] || return 1
+}
+# The reviewed legacy tick base identifies a bundle of four members. Migration
+# accepts only that complete bundle: exact types, owner, modes, filenames, and
+# bytes. Nothing here parses or trusts unit content.
+assert_known_legacy_tick_bundle() {
+  local service="$UNIT_DIR/mi-tick.service" timer="$UNIT_DIR/mi-tick.timer" mode
+  mode="$(stat -c '%a' -- "$service")"
+  [[ "$mode" == 644 ]] || fail "legacy tick service has an unexpected mode: $service"
+  validate_unit_target "$timer"
+  assert_safe_existing_file "$timer" 'legacy tick timer'
+  mode="$(stat -c '%a' -- "$timer")"
+  [[ "$mode" == 644 ]] || fail "legacy tick timer has an unexpected mode: $timer"
+  [[ "$(sha256_file "$timer")" == "$LEGACY_TICK_TIMER_SHA256" ]] || fail "legacy tick timer has unexpected contents: $timer"
+  assert_known_legacy_dropin_dir "$UNIT_DIR/mi-tick.service.d" 700 90-mi-staged-activation.conf 600 \
+    "$LEGACY_TICK_SERVICE_DROPIN_SHA256" 'legacy tick service drop-in'
+  assert_known_legacy_dropin_dir "$UNIT_DIR/mi-tick.timer.d" 755 50-interval.conf 644 \
+    "$LEGACY_TICK_TIMER_DROPIN_SHA256" 'legacy tick timer drop-in'
 }
 legacy_daemon=0
+legacy_tick=0
+# Accepting a unit prints its migration marker rather than assigning a variable,
+# because each predicate runs in a subshell so one rejection cannot hide the
+# remaining ones.
 assert_replaceable_unit() {
   local target="$1" stage_file="$2"
   validate_unit_target "$target"
-  [[ ! -e "$target" && ! -L "$target" ]] && return 0
-  assert_safe_existing_file "$target" 'existing unit'
-  if [[ "$target" == "$UNIT_DIR/mi-daemon.service" ]] && is_known_legacy_daemon_unit "$target"; then
-    legacy_daemon=1
-    assert_known_legacy_daemon_dropins
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    # An absent tick base under leftover drop-ins is an incomplete bundle: the
+    # tick migration publishes both bases together, so refuse to write a base
+    # beneath overrides that were never reviewed against it.
+    assert_replaceable_dropins "$target"
     return 0
   fi
+  assert_safe_existing_file "$target" 'existing unit'
+  if [[ "$target" == "$UNIT_DIR/mi-daemon.service" ]] && is_known_legacy_daemon_unit "$target"; then
+    assert_known_legacy_daemon_dropins
+    printf 'legacy-daemon\n'
+    return 0
+  fi
+  if [[ "$target" == "$UNIT_DIR/mi-tick.service" ]] && is_known_legacy_tick_service "$target"; then
+    assert_known_legacy_tick_bundle
+    printf 'legacy-tick\n'
+    return 0
+  fi
+  # The timer was already accepted byte for byte as a member of that bundle.
+  if [[ "$target" == "$UNIT_DIR/mi-tick.timer" && "$legacy_tick" == 1 ]]; then return 0; fi
   if [[ "$target" == "$UNIT_DIR/mi-daemon.service" ]] && grep -Fq '.pi/agent/extensions' -- "$target"; then
     fail "refusing contaminated Pi auto-load unit: $target"
   fi
   cmp -s -- "$stage_file" "$target" || fail "refusing to replace altered or unrelated unit: $target"
-  [[ "$target" != "$UNIT_DIR/mi-daemon.service" ]] || assert_known_hardened_daemon_dropins
+  assert_replaceable_dropins "$target"
 }
-assert_replaceable_unit "$UNIT_DIR/mi-daemon.service" "$stage/mi-daemon.service"
-assert_replaceable_unit "$UNIT_DIR/mi-tick.service" "$stage/mi-tick.service"
-assert_replaceable_unit "$UNIT_DIR/mi-tick.timer" "$stage/mi-tick.timer"
+assert_replaceable_dropins() {
+  case "$1" in
+    "$UNIT_DIR/mi-daemon.service") assert_known_hardened_daemon_dropins ;;
+    "$UNIT_DIR/mi-tick.service")
+      assert_known_hardened_dropins "$UNIT_DIR/mi-tick.service.d" 'hardened tick service drop-in directory' ;;
+    "$UNIT_DIR/mi-tick.timer")
+      assert_known_hardened_dropins "$UNIT_DIR/mi-tick.timer.d" 'hardened tick timer drop-in directory' ;;
+  esac
+}
+# Collect every rejection instead of returning at the first one. A serial
+# preflight hides later blockers behind the first, so an operator learns about
+# them one failed run at a time; the whole bundle is reported together here.
+# Each predicate runs in a command substitution, whose subshell resets the
+# inherited traps, so a rejection can neither roll back nor exit this run. A
+# signal is still fatal rather than a blocker: it is not a fact about a unit.
+preflight_blockers=()
+preflight_unit() {
+  local target="$1" stage_file="$2" marks='' status=0 message mark
+  marks="$(assert_replaceable_unit "$target" "$stage_file" 2>"$transaction/preflight.err")" || status=$?
+  if (( status == 0 )); then
+    for mark in $marks; do
+      case "$mark" in
+        legacy-daemon) legacy_daemon=1 ;;
+        legacy-tick) legacy_tick=1 ;;
+        *) fail "unexpected preflight marker for $target: $mark" ;;
+      esac
+    done
+    return 0
+  fi
+  (( status < 128 )) || exit "$status"
+  message="$(< "$transaction/preflight.err")"
+  message="${message#Mi user-unit install failed: }"
+  preflight_blockers+=("${message:-rejected without a message (status $status): $target}")
+  return 0
+}
+preflight_unit "$UNIT_DIR/mi-daemon.service" "$stage/mi-daemon.service"
+preflight_unit "$UNIT_DIR/mi-tick.service" "$stage/mi-tick.service"
+preflight_unit "$UNIT_DIR/mi-tick.timer" "$stage/mi-tick.timer"
+if (( ${#preflight_blockers[@]} > 0 )); then
+  printf 'Mi user-unit install blocker: %s\n' "${preflight_blockers[@]}" >&2
+  fail "${#preflight_blockers[@]} preflight blocker(s); no unit was changed"
+fi
 for target in "$UNIT_DIR/mi-daemon.service" "$UNIT_DIR/mi-tick.service" "$UNIT_DIR/mi-tick.timer" \
   "$UNIT_DIR/mi-daemon.service.d" "$UNIT_DIR/mi-tick.service.d" "$UNIT_DIR/mi-tick.timer.d"; do backup_target "$target"; done
 # Put this snapshot last so rollback restores the complete old directory after
@@ -397,18 +500,26 @@ for name in mi-daemon.service mi-tick.service mi-tick.timer; do
   chmod 600 "$temp"
   mv -f -- "$temp" "$UNIT_DIR/$name"
 done
-# Replace the complete reviewed legacy bundle, rather than leaving an accepted
-# drop-in directory beside the hardened daemon. The staged bundle is empty by
-# design. Moving the old directory aside before publishing it preserves an
-# exact rollback source if any later filesystem operation fails.
-legacy_dropins="$UNIT_DIR/mi-daemon.service.d"
-if [[ "$legacy_daemon" == 1 ]]; then
-  if [[ -d "$legacy_dropins" ]]; then
-    retired_dropins="$transaction/retired-mi-daemon.service.d"
-    mv -- "$legacy_dropins" "$retired_dropins"
+# Replace each complete reviewed legacy bundle, rather than leaving accepted
+# drop-ins beside the hardened base that already carries their safe settings.
+# Every staged replacement is empty by design. Moving an old directory aside
+# before publishing preserves an exact rollback source if any later filesystem
+# operation fails.
+retire_legacy_dropins() {
+  local name="$1" target
+  target="$UNIT_DIR/$name"
+  if [[ -d "$target" ]]; then
+    mv -- "$target" "$transaction/retired-$name"
   fi
-  mkdir -m 700 -- "$stage/mi-daemon.service.d"
-  mv -- "$stage/mi-daemon.service.d" "$legacy_dropins"
+  mkdir -m 700 -- "$stage/$name"
+  mv -- "$stage/$name" "$target"
+}
+if [[ "$legacy_daemon" == 1 ]]; then
+  retire_legacy_dropins mi-daemon.service.d
+fi
+if [[ "$legacy_tick" == 1 ]]; then
+  retire_legacy_dropins mi-tick.service.d
+  retire_legacy_dropins mi-tick.timer.d
 fi
 
 committed=1

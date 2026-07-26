@@ -306,6 +306,53 @@ try {
   await rm(unitDir, { recursive: true, force: true });
   result = run(home);
   assert.equal(result.status, 0, result.stderr);
+
+  // Tick drop-ins are held to the same shape as the daemon's: beside a
+  // hardened base only an empty owner-only directory is accepted. The exact
+  // legacy tick bundle is covered by the canonical-byte regression.
+  const tickDirs = [path.join(unitDir, 'mi-tick.service.d'), path.join(unitDir, 'mi-tick.timer.d')];
+  const hardenedUnits = ['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'];
+  const hardenedBytes = await Promise.all(hardenedUnits.map((name) => file(path.join(unitDir, name))));
+  for (const [name, prepare, pattern] of [
+    ['unreviewed tick service drop-in', async () => { await mkdir(tickDirs[0], { mode: 0o700 }); await chmod(tickDirs[0], 0o700); await writeFile(path.join(tickDirs[0], '90-mi-staged-activation.conf'), '[Service]\nEnvironment=MI_IMESSAGE_V2=1\n'); }, /refusing unknown hardened tick service drop-in directory bundle/],
+    ['unreviewed tick timer drop-in', async () => { await mkdir(tickDirs[1], { mode: 0o700 }); await chmod(tickDirs[1], 0o700); await writeFile(path.join(tickDirs[1], '50-interval.conf'), '[Timer]\nOnCalendar=\nOnCalendar=*:0/5\n'); }, /refusing unknown hardened tick timer drop-in directory bundle/],
+    ['loosened tick service drop-in directory', async () => { await mkdir(tickDirs[0]); await chmod(tickDirs[0], 0o755); }, /hardened tick service drop-in directory has an unexpected mode/],
+    ['linked tick timer drop-in directory', async () => { await symlink(path.join(temp, 'linked-dropin-target'), tickDirs[1]); }, /symlink component/],
+  ]) {
+    const beforeTickCalls = await file(calls);
+    await prepare();
+    result = run(home);
+    assert.notEqual(result.status, 0, `${name} is rejected`);
+    assert.match(result.stderr, pattern);
+    assert.deepEqual(await Promise.all(hardenedUnits.map((unit) => file(path.join(unitDir, unit)))), hardenedBytes, `${name} leaves every base unchanged`);
+    assert.equal(await file(calls), beforeTickCalls, `${name} makes no systemctl call`);
+    for (const directory of tickDirs) await rm(directory, { recursive: true, force: true });
+  }
+
+  // An absent tick base beneath leftover drop-ins is an incomplete bundle: the
+  // replacement base is never written under overrides it was not reviewed with.
+  await rm(path.join(unitDir, 'mi-tick.service'));
+  await mkdir(tickDirs[0], { mode: 0o700 });
+  await chmod(tickDirs[0], 0o700);
+  await writeFile(path.join(tickDirs[0], '90-mi-staged-activation.conf'), '[Service]\nEnvironment=MI_IMESSAGE_V2=1\n');
+  result = run(home);
+  assert.notEqual(result.status, 0, 'an absent tick base under leftover drop-ins is rejected');
+  assert.match(result.stderr, /refusing unknown hardened tick service drop-in directory bundle/);
+  assert.equal(spawnSync('test', ['-e', path.join(unitDir, 'mi-tick.service')]).status, 1, 'the rejected tick base is not written');
+  await rm(tickDirs[0], { recursive: true, force: true });
+
+  // Independent rejections are reported together rather than one run at a time.
+  await writeFile(path.join(unitDir, 'mi-daemon.service'), '[Unit]\nDescription=Mi background task daemon\nunrelated daemon\n');
+  await writeFile(path.join(unitDir, 'mi-tick.timer'), '[Unit]\nDescription=Run Mi scheduled tick\nunrelated timer\n');
+  result = run(home);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /blocker: refusing to replace altered or unrelated unit: .*mi-daemon\.service/);
+  assert.match(result.stderr, /blocker: refusing to replace altered or unrelated unit: .*mi-tick\.timer/);
+  assert.match(result.stderr, /2 preflight blocker\(s\); no unit was changed/);
+
+  await rm(unitDir, { recursive: true, force: true });
+  result = run(home);
+  assert.equal(result.status, 0, result.stderr);
   const dropin = path.join(unitDir, 'mi-daemon.service.d');
   await mkdir(dropin, { recursive: true });
   await chmod(dropin, 0o700);
