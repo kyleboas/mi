@@ -73,9 +73,5 @@ ProtectSystem=full
 WantedBy=default.target
 EOF
 
-if [[ ${MI_WEB_NO_SYSTEMD:-0} != 1 ]]; then
-  systemctl --user daemon-reload
-  systemctl --user enable --now mi-web-chat.service
-fi
-
-echo "Installed $UNIT_PATH for $DNS_NAME"
+# Files only. An operator must reload and start the web service separately.
+echo "Installed $UNIT_PATH for $DNS_NAME without activating services"

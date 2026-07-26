@@ -8,8 +8,10 @@ const tmp = await mkdtemp(path.join(os.tmpdir(), 'mi-web-unit-'));
 try {
   const bin = path.join(tmp, 'bin');
   await mkdir(bin);
+  const systemctlCalls = path.join(tmp, 'systemctl-calls');
+  await writeFile(systemctlCalls, '');
   await writeFile(path.join(bin, 'tailscale'), '#!/bin/sh\nprintf \'%s\\n\' \'{"Self":{"DNSName":"main.example.ts.net."}}\'\n');
-  await writeFile(path.join(bin, 'systemctl'), '#!/bin/sh\nexit 0\n');
+  await writeFile(path.join(bin, 'systemctl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(systemctlCalls)}\nexit 0\n`);
   await chmod(path.join(bin, 'tailscale'), 0o755);
   await chmod(path.join(bin, 'systemctl'), 0o755);
   const dropinDir = path.join(tmp, 'config/systemd/user/mi-web-chat.service.d');
@@ -22,6 +24,7 @@ try {
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'web unit install writes files without daemon-reload, enable, start, or restart');
   const unit = await readFile(path.join(tmp, 'config/systemd/user/mi-web-chat.service'), 'utf8');
   assert.match(unit, /tailscale cert[^\n]+main\.example\.ts\.net\.crt[^\n]+main\.example\.ts\.net\.key main\.example\.ts\.net/);
   assert.doesNotMatch(unit, /hermes/);

@@ -160,7 +160,7 @@ sudo env \
   "$MI_ROOT/scripts/install-mi-stack.sh"
 ```
 
-The script installs the production gateway and Pi registry, brokered gateway client, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It does not enable or start those units. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
+The script installs the production gateway and Pi registry, brokered gateway client, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It writes files only: it does not reload, enable, start, stop, or restart those services. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
 
 ```bash
 MI_APP_DIR="$MI_ROOT" "$MI_ROOT/scripts/install-mi-stack.sh" --dry-run
@@ -184,14 +184,22 @@ Environment=MI_PUSHOVER_NOTIFY=0
 Environment=MI_PUSHOVER_FALLBACK=0
 ```
 
-Then verify the daemon sandbox (`PrivateTmp=true`, `ProtectSystem=full`), fixed service-user PATH, reviewed private extension paths, and disabled notice/monitor settings. Reload and start only the daemon:
+Then verify the daemon sandbox (`PrivateTmp=true`, `ProtectSystem=full`), fixed service-user PATH, reviewed private extension paths, writable paths, and disabled notice/monitor settings. After separate approval, reload the files. Reloading does not start a service:
 
 ```bash
+sudo systemctl daemon-reload
 systemctl --user daemon-reload
-systemctl --user enable --now mi-daemon.service
 ```
 
-Leave the timer, web service, Photon bridge, proactive notices, and repair monitor disabled until each has separate approval.
+Start gateway, Mi daemon, and Photon only in separate approved commands:
+
+```bash
+sudo systemctl start llm-gateway.service
+systemctl --user start mi-daemon.service
+sudo systemctl start mi-photon-bridge.service
+```
+
+Leave the timer, web service, proactive notices, and repair monitor off until each has separate approval. Enabling a unit for boot is a separate approval too.
 
 ## 8. Ownership and modes
 
@@ -270,7 +278,7 @@ Back up only this new instance after it has created its own state. Keep code and
 - use the Pi product's own account recovery instead of copying `.pi` credentials; and
 - do not back up sockets, locks, coordinator policy/session files, or pending confirmations as portable data.
 
-For a code rollback, stop the Mi user services, check out the previous reviewed commit, run `npm ci && npm run build`, reinstall the package, and rerun the stack installer. Its transaction restores generated configuration after a failed stage. Keep broker-managed credentials in place; do not move them into the repository or backup bundle. Before activation, remove or quarantine any old Mi files in Pi global or project auto-load folders; do not restore them during rollback.
+For a code rollback, use a separately approved service stop only when needed, then check out the previous reviewed commit, run `npm ci && npm run build`, reinstall the package, and rerun the stack installer. Its failed-install transaction restores generated configuration while preserving the pre-install active and enabled state; it never reloads, enables, starts, stops, or restarts services. Keep broker-managed credentials in place; do not move them into the repository or backup bundle. Before activation, remove or quarantine any old Mi files in Pi global or project auto-load folders; do not restore them during rollback.
 
 The gateway-only installer saves all five replaced files under `/var/backups/mi-gateway` before it writes them. To restore that saved set together, use the same reviewed checkout and account settings used for installation:
 
@@ -287,7 +295,7 @@ sudo env \
   "$MI_ROOT/scripts/install-mi-subscription-gateway-root.sh" --rollback
 ```
 
-Rollback validates the full saved set before changing a gateway file. It is safe to repeat. It does not read or move broker-managed secrets.
+Rollback validates the full saved set before changing a gateway file. It restores files only, preserves gateway active and enabled state, is safe to repeat, and does not read or move broker-managed secrets.
 
 To stop the clean instance without deleting it:
 

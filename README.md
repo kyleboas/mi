@@ -180,7 +180,7 @@ Normal installation and repair has one user-facing command (run normally; it req
 /home/kyle/install-mi-stack.sh
 ```
 
-Use `/home/kyle/install-mi-stack.sh --check` for a non-secret configuration summary or `--dry-run` to list stages without mutation. The operation installs reviewed unit files but does not enable or start web, Photon, daemon, or timer work. It writes disabled notice and repair-monitor settings. After checking the safeguards, start only `mi-daemon.service`; leave the timer, notices, and repair monitor disabled. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
+Use `/home/kyle/install-mi-stack.sh --check` for a non-secret configuration summary or `--dry-run` to list stages without mutation. The operation installs files only: it does not reload, enable, start, stop, or restart the gateway, web, Photon, daemon, or timer. Check paths, sandbox settings, and disabled notice and repair-monitor flags first. Then, after separate approval, run the needed daemon-reload command and start gateway, Mi daemon, and Photon in separate commands. Keep the timer, notices, and repair monitor off. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
 
 The installer creates the system Photon bridge unit and the user web, daemon, and tick units. The Photon unit loads its broker-managed secret file with `EnvironmentFile=`. It does not print credential values into the agent shell.
 

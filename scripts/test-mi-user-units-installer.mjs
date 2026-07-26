@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,10 +29,76 @@ try {
   await mkdir(bin);
   await writeFile(path.join(bin, 'systemctl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\n`);
   await chmod(path.join(bin, 'systemctl'), 0o700);
+  await writeFile(calls, '');
+
+  // Sol reproduction: cleanup is armed before the one temporary transaction
+  // root exists. An injected failure immediately after that creation leaves
+  // neither that root nor a partial unit tree behind.
+  const firstTempScratch = path.join(temp, 'first-temp-scratch');
+  await mkdir(firstTempScratch);
+  let result = run(home, { TMPDIR: firstTempScratch, MI_USER_UNITS_FAIL_AFTER_TEMP: '1' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /injected failure after transaction temporary directory creation/);
+  assert.deepEqual(await readdir(firstTempScratch), [], 'failed first temporary step leaves no mi-user-units residue');
+  assert.equal(spawnSync('test', ['-e', path.join(home, '.config')]).status, 1, 'failed first temporary step does not create units');
+
+  // Existing path components that link outside the chosen service home fail
+  // before rendering, backup, target writes, or any systemctl operation.
+  const makeServiceHome = async (name) => {
+    const isolated = path.join(temp, name);
+    await mkdir(path.join(isolated, 'workflows'), { recursive: true });
+    await mkdir(path.join(isolated, '.pi', 'agent', 'mi'), { recursive: true });
+    await mkdir(path.join(isolated, 'mi'), { recursive: true });
+    return isolated;
+  };
+  const runLinkedPathCase = async (name, prepare, extra = {}) => {
+    const isolated = await makeServiceHome(`linked-${name}`);
+    const outside = path.join(temp, `outside-${name}`);
+    await mkdir(outside);
+    await writeFile(path.join(outside, 'marker'), `${name} outside marker\n`);
+    await prepare(isolated, outside);
+    const beforeCalls = await file(calls);
+    const linked = run(isolated, { PATH: `${bin}:${process.env.PATH}`, ...extra });
+    assert.notEqual(linked.status, 0, `${name} link fails closed`);
+    assert.match(linked.stderr, /symlink component/);
+    assert.deepEqual(await readdir(outside), ['marker'], `${name} link receives no outside writes`);
+    assert.equal(spawnSync('test', ['-e', path.join(isolated, '.config', 'systemd', 'user', 'mi-daemon.service')]).status, 1, `${name} link leaves units unchanged`);
+    assert.equal(await file(calls), beforeCalls, `${name} link makes no systemctl call`);
+  };
+  await runLinkedPathCase('config', async (isolated, outside) => {
+    await symlink(outside, path.join(isolated, '.config'));
+  });
+  await runLinkedPathCase('systemd', async (isolated, outside) => {
+    await mkdir(path.join(isolated, '.config'));
+    await symlink(outside, path.join(isolated, '.config', 'systemd'));
+  });
+  await runLinkedPathCase('workflows', async (isolated, outside) => {
+    await rm(path.join(isolated, 'workflows'), { recursive: true });
+    await symlink(outside, path.join(isolated, 'workflows'));
+  });
+  await runLinkedPathCase('runtime', async (isolated, outside) => {
+    await rm(path.join(isolated, '.pi', 'agent', 'mi'), { recursive: true });
+    await symlink(outside, path.join(isolated, '.pi', 'agent', 'mi'));
+  });
+  const linkedRoot = path.join(temp, 'linked-mi-root');
+  const linkedRootOutside = path.join(temp, 'outside-mi-root');
+  await mkdir(path.join(linkedRoot, 'pi', 'extensions'), { recursive: true });
+  await mkdir(linkedRootOutside);
+  await writeFile(path.join(linkedRootOutside, 'marker'), 'mi root outside marker\n');
+  await copyFile(path.join(repo, 'pi', 'extensions', 'mi-daemon.mjs'), path.join(linkedRoot, 'pi', 'extensions', 'mi-daemon.mjs'));
+  await symlink(linkedRootOutside, path.join(linkedRoot, 'state'));
+  const rootHome = await makeServiceHome('linked-mi-root-home');
+  const rootCalls = await file(calls);
+  result = run(rootHome, { PATH: `${bin}:${process.env.PATH}`, MI_APP_DIR: linkedRoot });
+  assert.notEqual(result.status, 0, 'Mi-root state link fails closed');
+  assert.match(result.stderr, /symlink component/);
+  assert.deepEqual(await readdir(linkedRootOutside), ['marker'], 'Mi-root link receives no outside writes');
+  assert.equal(spawnSync('test', ['-e', path.join(rootHome, '.config', 'systemd', 'user', 'mi-daemon.service')]).status, 1, 'Mi-root link leaves units unchanged');
+  assert.equal(await file(calls), rootCalls, 'Mi-root link makes no systemctl call');
 
   // The file installer has no systemctl side effects, even with old activation
   // switches set. Activation is a later documented operator operation.
-  let result = run(home, { PATH: `${bin}:${process.env.PATH}`, MI_USER_UNITS_ACTIVATE_DAEMON: '1', MI_USER_UNITS_ACTIVATE_TIMER: '1' });
+  result = run(home, { PATH: `${bin}:${process.env.PATH}`, MI_USER_UNITS_ACTIVATE_DAEMON: '1', MI_USER_UNITS_ACTIVATE_TIMER: '1' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal((await file(calls).catch(() => '')).trim(), '');
   const daemon = await file(path.join(unitDir, 'mi-daemon.service'));

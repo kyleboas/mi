@@ -152,14 +152,8 @@ rollback() {
     rm -rf -- "$path"
     [[ "$state" == present ]] && { mkdir -p "$(dirname "$path")"; cp -a -- "$backup/$key" "$path"; }
   done < "$manifest"
-  if [[ -z "$SYSTEM_ROOT" ]]; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart llm-gateway.service mi-photon-bridge.service >/dev/null 2>&1 || true
-    local service_user="${MI_SERVICE_USER:-kyle}" runtime_dir
-    runtime_dir="/run/user/$(id -u "$service_user")"
-    runuser -u "$service_user" -- env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user daemon-reload >/dev/null 2>&1 || true
-    runuser -u "$service_user" -- env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user try-restart mi-web-chat.service mi-daemon.service mi-tick.timer >/dev/null 2>&1 || true
-  fi
+  # This transaction is files-only. Restoring files must not reload, enable,
+  # start, stop, or restart a gateway, Photon, web, daemon, or timer service.
   rm -rf "$backup"
   exit "$status"
 }
@@ -203,6 +197,7 @@ as_user() {
 }
 
 run_stage production-gateway env \
+  MI_GATEWAY_NO_SYSTEMD=1 \
   MI_GATEWAY_ROOT="$SYSTEM_ROOT" \
   MI_GATEWAY_SERVICE_USER="$GATEWAY_SERVICE_USER" \
   MI_GATEWAY_SERVICE_HOME="$GATEWAY_SERVICE_HOME" \
@@ -222,6 +217,7 @@ run_stage user-units as_user env MI_APP_DIR="$ROOT" MI_USER_UNITS_NO_SYSTEMD=1 "
 run_stage photon-loopback env MI_APP_DIR="$ROOT" MI_SYSTEM_ROOT="$SYSTEM_ROOT" MI_PHOTON_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-imessage-stack-root.sh"
 run_stage generated-entrypoints env MI_STACK_HOME="$TARGET_HOME" "$ROOT/scripts/install-mi-home-entrypoints.sh"
 run_stage readiness env \
+  MI_STACK_READINESS_FILES_ONLY=1 \
   MI_SERVICE_USER="$SERVICE_USER" \
   MI_GATEWAY_HEALTH_USER="$GATEWAY_HEALTH_USER" \
   MI_GATEWAY_HEALTH_COMMAND="${MI_GATEWAY_HEALTH_COMMAND:-/home/kyle/bin/llm-gateway-health}" \

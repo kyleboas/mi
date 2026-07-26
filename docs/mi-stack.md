@@ -46,22 +46,32 @@ The web installer similarly removes only exact known Mi-owned predecessor drop-i
 
 ## First safe activation
 
-The stack install writes files only. It does not enable or start the web service, Photon bridge, daemon, or timer. It writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and `MI_IMESSAGE_MONITOR_ENABLED=false` into the tick unit.
+The stack install writes files only. It does not reload, enable, start, stop, or restart the gateway, web service, Photon bridge, daemon, or timer. It writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and `MI_IMESSAGE_MONITOR_ENABLED=false` into the tick unit.
 
-First run the file and readiness check, then review the installed daemon path, `PrivateTmp=true`, `ProtectSystem=full`, fixed service-user PATH, writable workflow directory, and the disabled tick settings. Only after those checks should an operator reload user units and start the daemon:
+First check the installed paths and sandbox settings: the daemon path must stay under the reviewed Mi root, `PrivateTmp=true`, `ProtectSystem=full`, the service-user PATH must be fixed, writable paths must be limited to the reviewed state, runtime, Mi home, and workflow folders, and both tick settings must be false.
+
+Only after separate approval, reload the unit files. Reloading reads files; it does not start a service:
 
 ```bash
 /home/kyle/install-mi-stack.sh --check
+sudo systemctl daemon-reload
 systemctl --user daemon-reload
-systemctl --user enable --now mi-daemon.service
 ```
 
-Leave `mi-tick.timer`, proactive notices, and the repair monitor disabled until a later, separate approval.
+Start each approved service in a separate command. Gateway and Photon approval is separate from Mi daemon approval:
+
+```bash
+sudo systemctl start llm-gateway.service
+systemctl --user start mi-daemon.service
+sudo systemctl start mi-photon-bridge.service
+```
+
+Leave `mi-tick.timer`, the web service, proactive notices, and the repair monitor off until each has later, separate approval. Enabling a unit for startup is also a separate approval.
 
 ## Rollback
 
-A failed install restores the pre-run generated files. The production gateway stage also restores its five files as one set if any file write or its readiness check fails. After correcting the named stage, rerun the canonical command and then `--check`.
+A failed install restores the pre-run generated files and preserves the pre-install active and enabled state of every service. It never reloads, enables, starts, stops, or restarts a service during rollback. The production gateway stage restores its five files as one set if any file write fails. After correcting the named stage, rerun the canonical command and then `--check`.
 
-The gateway-only installer keeps the prior five-file set under `/var/backups/mi-gateway`. Operators who need to restore that set can rerun `scripts/install-mi-subscription-gateway-root.sh --rollback` through the same root boundary and with the same explicit account settings used for install. The command checks that every prior file or absent-file marker exists before changing anything, restarts only after restoring the complete set, and is safe to repeat.
+The gateway-only installer keeps the prior five-file set under `/var/backups/mi-gateway`. Operators who need to restore that set can rerun `scripts/install-mi-subscription-gateway-root.sh --rollback` through the same root boundary and with the same explicit account settings used for install. The command checks that every prior file or absent-file marker exists before changing anything, restores files only, and is safe to repeat.
 
 V1 source and all tracked modular installers are retained; eval harness files are not removed.

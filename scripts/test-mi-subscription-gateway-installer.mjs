@@ -66,7 +66,9 @@ try {
   mkdirSync(agentDir, { recursive: true });
   mkdirSync(workDir);
   mkdirSync(bin, { recursive: true });
-  writeFileSync(resolve(bin, 'systemctl'), `#!/bin/sh\necho systemctl >> ${JSON.stringify(resolve(temp, 'systemctl-log'))}\nexit 0\n`);
+  const systemctlLog = resolve(temp, 'systemctl-log');
+  writeFileSync(systemctlLog, '');
+  writeFileSync(resolve(bin, 'systemctl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(systemctlLog)}\nexit 0\n`);
   writeFileSync(resolve(bin, 'runuser'), '#!/bin/sh\nshift 3\nexec "$@"\n');
   writeFileSync(pi, '#!/bin/sh\nexit 0\n');
   writeFileSync(passwd, `miworker:x:${uid}:${gid}::${serviceHome}:/bin/sh\n`);
@@ -124,7 +126,7 @@ try {
   const generatedFiles = readdirSync(target, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile()).map((entry) => readFileSync(resolve(entry.parentPath, entry.name), 'utf8')).join('\n');
   assert.doesNotMatch(generatedFiles, /\/home\/kyle/, 'portable artifacts contain no current-host home');
-  assert.equal(readFileSync(count, 'utf8').trim(), '3', 'authenticated readiness retries transient failures');
+  assert.equal(readFileSync(systemctlLog, 'utf8'), '', 'gateway install writes files without daemon-reload, start, restart, enable, or disable');
 
   const linkedPi = resolve(temp, 'linked-pi');
   symlinkSync(pi, linkedPi);
@@ -137,7 +139,7 @@ try {
     ['newline provider path', { MI_GATEWAY_PI_AGENT_DIR: `${agentDir}\nother` }],
     ['unexpanded provider path', { MI_GATEWAY_PI_AGENT_DIR: `${serviceHome}/@AGENT_DIR@` }],
   ];
-  const systemctlBefore = readFileSync(resolve(temp, 'systemctl-log'), 'utf8');
+  const systemctlBefore = readFileSync(systemctlLog, 'utf8');
   for (const [name, changedEnv] of badCases) {
     const badRoot = resolve(temp, `bad-root-${name.replaceAll(' ', '-')}`);
     mkdirSync(badRoot);
@@ -147,7 +149,7 @@ try {
     assert.notEqual(bad.status, 0, `${name} fails`);
     assert.deepEqual(readdirSync(badRoot), [], `${name} fails before artifact writes`);
   }
-  assert.equal(readFileSync(resolve(temp, 'systemctl-log'), 'utf8'), systemctlBefore, 'bad configuration does not restart');
+  assert.equal(readFileSync(systemctlLog, 'utf8'), systemctlBefore, 'bad configuration does not change service state');
 
   const destinationNames = [
     'etc/litellm/config.yaml',
@@ -167,7 +169,7 @@ try {
       writeFileSync(destination, content);
       prior.set(relative, content);
     }
-    const logBefore = readFileSync(resolve(temp, 'systemctl-log'));
+    const logBefore = readFileSync(systemctlLog);
     const failed = spawnSync('sh', [resolve(repo, 'scripts/install-mi-subscription-gateway-root.sh')], {
       encoding: 'utf8', env: { ...env, MI_GATEWAY_ROOT: failureRoot, MI_GATEWAY_FAIL_AFTER_WRITE: String(boundary) },
     });
@@ -181,7 +183,7 @@ try {
         `boundary ${boundary} keeps a byte-exact explicit backup for ${relative}`,
       );
     }
-    assert.deepEqual(readFileSync(resolve(temp, 'systemctl-log')), logBefore, `boundary ${boundary} does not restart`);
+    assert.deepEqual(readFileSync(systemctlLog), logBefore, `boundary ${boundary} does not change service state`);
     assert.deepEqual(readFileSync(resolve(failureRoot, destinationNames[1])), prior.get(destinationNames[1]), 'handler is not mixed with a new drop-in');
     assert.deepEqual(readFileSync(resolve(failureRoot, destinationNames[4])), prior.get(destinationNames[4]), 'drop-in is not mixed with a new handler');
     writeFileSync(count, '2\n');
@@ -192,7 +194,7 @@ try {
   for (let boundary = 1; boundary <= destinationNames.length; boundary += 1) {
     const failureRoot = resolve(temp, `failure-absent-${boundary}`);
     mkdirSync(failureRoot);
-    const logBefore = readFileSync(resolve(temp, 'systemctl-log'));
+    const logBefore = readFileSync(systemctlLog);
     const failed = spawnSync('sh', [resolve(repo, 'scripts/install-mi-subscription-gateway-root.sh')], {
       encoding: 'utf8', env: { ...env, MI_GATEWAY_ROOT: failureRoot, MI_GATEWAY_FAIL_AFTER_WRITE: String(boundary) },
     });
@@ -201,10 +203,12 @@ try {
       assert.throws(() => readFileSync(resolve(failureRoot, relative)), /ENOENT/, `boundary ${boundary} removes new ${relative}`);
       readFileSync(resolve(failureRoot, 'var/backups/mi-gateway', `${basename(relative)}.previous.absent`));
     }
-    assert.deepEqual(readFileSync(resolve(temp, 'systemctl-log')), logBefore, `absent boundary ${boundary} does not restart`);
+    assert.deepEqual(readFileSync(systemctlLog), logBefore, `absent boundary ${boundary} does not change service state`);
     writeFileSync(count, '2\n');
     run('install-mi-subscription-gateway-root.sh', { MI_GATEWAY_ROOT: failureRoot });
   }
+
+  assert.equal(readFileSync(systemctlLog, 'utf8'), '', 'all failed gateway transactions preserve systemctl state');
 
   const rollbackRoot = resolve(temp, 'explicit-rollback');
   const rollbackPrior = new Map();
@@ -228,6 +232,8 @@ try {
     }
   }
 
+  assert.equal(readFileSync(systemctlLog, 'utf8'), '', 'gateway rollback preserves service state for existing files');
+
   const absentRollbackRoot = resolve(temp, 'explicit-absent-rollback');
   mkdirSync(absentRollbackRoot);
   writeFileSync(count, '2\n');
@@ -239,6 +245,7 @@ try {
       assert.throws(() => readFileSync(resolve(absentRollbackRoot, relative)), /ENOENT/, `absent rollback ${attempt} removes ${relative}`);
     }
   }
+  assert.equal(readFileSync(systemctlLog, 'utf8'), '', 'gateway rollback preserves service state for absent files');
 
   writeFileSync(count, '2\n');
   run('install-mi-model-eval-gateway-root.sh');

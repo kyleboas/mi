@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install or roll back the durable production Pi/Codex LiteLLM gateway artifacts.
+# Install or roll back durable production Pi/Codex LiteLLM gateway files.
+# This installer is files-only: an operator reloads and starts services later.
 set -eu
 
 repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -7,6 +8,11 @@ repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$repo_dir/scripts/lib-mi-gateway-install.sh"
 mi_gateway_require_root
 mi_gateway_load_config
+
+case "${MI_GATEWAY_NO_SYSTEMD:-1}" in
+  1) ;;
+  *) echo 'Gateway install is files-only; MI_GATEWAY_NO_SYSTEMD must be 1 when set' >&2; exit 2 ;;
+esac
 
 mode=install
 case "${1:-}" in
@@ -88,14 +94,8 @@ if [ "$mode" = rollback ]; then
     mi_gateway_restore_previous "$destination"
   done
   rm -f "$eval_handler"
-  if [ -x "$waiter" ]; then
-    mi_gateway_restart_and_wait
-  else
-    systemctl daemon-reload
-    systemctl restart llm-gateway.service
-    systemctl is-active --quiet llm-gateway.service
-    "$waiter_source" "$MI_GATEWAY_HEALTH_COMMAND" "$MI_GATEWAY_HEALTH_USER"
-  fi
+  # Rollback restores files only. It deliberately preserves gateway activity
+  # and enablement rather than restarting a service that may be inactive.
   committed=1
   trap - 0 HUP INT TERM
   rm -rf "$transaction"
@@ -127,7 +127,8 @@ mi_gateway_render_dropin "$dropin_template" "$dropin"
 fail_after_write
 rm -f "$eval_handler"
 
-mi_gateway_restart_and_wait
+# Installation ends after every file is committed. Do not daemon-reload or
+# change service state here; activation is an explicit operator operation.
 committed=1
 trap - 0 HUP INT TERM
 rm -rf "$transaction"
