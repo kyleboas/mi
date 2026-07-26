@@ -254,6 +254,7 @@ try {
   // Near-miss modes: each member's mode is pinned exactly, and a mode that is
   // group or other writable is refused before the bytes are consulted at all.
   for (const [name, key, mode, pattern] of [
+    ['daemon base', 'daemon', 0o600, /legacy daemon unit has an unexpected mode/],
     ['tick service base', 'tickService', 0o600, /legacy tick service has an unexpected mode/],
     ['tick timer base', 'tickTimer', 0o600, /legacy tick timer has an unexpected mode/],
     ['tick service drop-in file', 'tickServiceDropin', 0o644, /legacy tick service drop-in file has an unexpected mode/],

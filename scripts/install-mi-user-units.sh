@@ -342,10 +342,12 @@ is_reviewed_live_account() {
   [[ "$MI_BIN" == /home/kyle/.nvm/versions/node/v24.15.0/bin/mi ]] || return 1
 }
 is_known_legacy_daemon_unit() {
-  local target="$1"
+  local target="$1" mode
   assert_safe_existing_file "$target" 'legacy daemon unit'
   is_reviewed_live_account || return 1
   [[ "$(sha256_file "$target")" == "$LEGACY_DAEMON_SHA256" ]] || return 1
+  mode="$(stat -c '%a' -- "$target")"
+  [[ "$mode" == 644 ]] || fail "legacy daemon unit has an unexpected mode: $target"
 }
 # A published bundle keeps an empty owner-only drop-in directory, so accept
 # only that shape beside an already hardened base.
