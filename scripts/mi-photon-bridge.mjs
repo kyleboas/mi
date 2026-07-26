@@ -310,11 +310,6 @@ function startTypingBestEffort(space, delayMs = 700) {
   };
 }
 
-function trackFollowUp(task) {
-  inFlightHandlers.add(task);
-  task.finally(() => inFlightHandlers.delete(task));
-}
-
 async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
   const id = stableDeliveryId(space, message);
@@ -350,15 +345,13 @@ async function handle(space, message) {
     // can fail with upstream connection drops before Mi is even asked. Typing is
     // cosmetic and best-effort; replies must continue without it.
     const result = await askImessage(body, id);
-    const ackSent = await send(space, result.reply);
-    await stopTypingNow();
-    if (result.handoff && ackSent) {
-      // Poll after the acknowledgement is visible, without keeping this inbound
-      // callback or its typing indicator open for a potentially slow task.
-      const followUp = waitForWorkerResult(result.startedAt, result.taskId)
-        .then((text) => text && text !== result.reply ? send(space, text) : undefined)
-        .catch((error) => console.warn('imessage follow-up failed:', error?.message || String(error)));
-      trackFollowUp(followUp);
+    if (result.handoff) {
+      // A handoff acknowledgement is implementation detail, not a useful reply.
+      // Wait for the completed work so the conversation receives one answer.
+      const finalText = await waitForWorkerResult(result.startedAt, result.taskId);
+      await send(space, finalText || 'I couldn’t finish that request in time. Try again?');
+    } else {
+      await send(space, result.reply);
     }
   } catch (error) {
     console.error('mi photon handling failed:', error?.message || String(error));

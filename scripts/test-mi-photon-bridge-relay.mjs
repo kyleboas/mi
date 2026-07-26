@@ -146,21 +146,15 @@ async function runRelayCase(root, name, workerReply) {
     assert.match(result.stdout, /imessage handoff - polling for (?:task|legacy worker) result/, `${name}: bridge should poll after handoff`);
 
     const sends = (await readJsonl(sendsPath)).filter((entry) => entry.kind === 'message');
-    const expectedMessages = workerReply.repeatIdentical ? 4 : 2;
-    assert.equal(sends.length, expectedMessages, `${name}: bridge should send ack plus worker follow-up for each inbound event`);
-    if (workerReply.repeatIdentical) {
-      assert.equal(sends.filter((entry) => entry.text === 'On it. I’ll follow up here.').length, 2);
-      assert.equal(sends.filter((entry) => entry.text === workerReply.text).length, 2);
-    } else {
-      assert.equal(sends[0].text, 'On it. I’ll follow up here.');
-      assert.equal(sends[1].text, workerReply.text);
-    }
-    assert.equal(sends[0].phone, '+15551234567');
-    assert.equal(sends[1].phone, '+15551234567');
+    const expectedMessages = workerReply.repeatIdentical ? 2 : 1;
+    assert.equal(sends.length, expectedMessages, `${name}: bridge should send only the completed worker result for each inbound event`);
+    assert.equal(sends.filter((entry) => entry.text === 'On it. I’ll follow up here.').length, 0, `${name}: internal handoff acknowledgement must not reach iMessage`);
+    assert.equal(sends.filter((entry) => entry.text === workerReply.text).length, expectedMessages);
+    for (const sent of sends) assert.equal(sent.phone, '+15551234567');
     if (workerReply.delayMs) {
-      assert.ok(Date.parse(sends[0].ts) < mi.resultAvailableAt, `${name}: acknowledgement must send before the delayed result exists`);
+      assert.ok(Date.parse(sends[0].ts) >= mi.resultAvailableAt, `${name}: reply must wait for the completed worker result`);
       const firstPoll = mi.calls.find((call) => call.method === 'GET' && call.path === '/api/messages');
-      assert.ok(firstPoll && Date.parse(sends[0].ts) <= firstPoll.at, `${name}: acknowledgement must precede result polling`);
+      assert.ok(firstPoll && firstPoll.at <= Date.parse(sends[0].ts), `${name}: result polling must precede the only reply`);
     }
 
     const inboundCall = mi.calls.find((call) => call.method === 'POST' && call.path === '/api/imessage');
