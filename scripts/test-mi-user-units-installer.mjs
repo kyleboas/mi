@@ -21,8 +21,14 @@ const run = (home, extra = {}) => spawnSync('bash', ['scripts/install-mi-user-un
   encoding: 'utf8',
 });
 const file = async (name) => readFile(name, 'utf8');
-const legacyRuntimeDir = `/run/user/${process.getuid()}/mi`;
-const legacyServicePath = (home) => `${path.dirname(node)}:${path.join(home, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin`;
+const legacyRuntimeDir = (home) => path.join(home, '.pi', 'agent', 'mi');
+const legacyNode = (home) => path.join(home, '.nvm', 'versions', 'node', 'v24.15.0', 'bin', 'node');
+const legacyServicePath = (home) => `${path.join(home, '.local', 'bin')}:${path.dirname(legacyNode(home))}:/usr/local/bin:/usr/bin:/bin`;
+const seedLegacyNode = async (home) => {
+  await mkdir(path.dirname(legacyNode(home)), { recursive: true });
+  await writeFile(legacyNode(home), '#!/bin/sh\nexit 0\n');
+  await chmod(legacyNode(home), 0o700);
+};
 const legacyDaemon = (home) => `[Unit]
 Description=Mi daemon (task/socket worker supervisor)
 After=network-online.target
@@ -30,11 +36,11 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${miRoot}
-ExecStart=${node} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
+ExecStart=${legacyNode(home)} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
 Restart=on-failure
 RestartSec=5
-Environment=MI_SOCKET_PATH=${legacyRuntimeDir}/main.sock
-Environment=MI_RUNTIME_DIR=${legacyRuntimeDir}
+Environment=MI_SOCKET_PATH=${legacyRuntimeDir(home)}/main.sock
+Environment=MI_RUNTIME_DIR=${legacyRuntimeDir(home)}
 Environment=MI_ROOT=${miRoot}
 Environment=PATH=${legacyServicePath(home)}
 PrivateTmp=true
@@ -50,13 +56,13 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${miRoot}
-ExecStart=${node} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
+ExecStart=${legacyNode(home)} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
 Restart=on-failure
 RestartSec=5
-Environment=MI_SOCKET_PATH=/run/user/${process.getuid()}/mi/main.sock
-Environment=MI_RUNTIME_DIR=/run/user/${process.getuid()}/mi
+Environment=MI_SOCKET_PATH=${home}/.pi/agent/mi/main.sock
+Environment=MI_RUNTIME_DIR=${home}/.pi/agent/mi
 Environment=MI_ROOT=${miRoot}
-Environment=PATH=${path.dirname(node)}:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${home}/.local/bin:${path.dirname(legacyNode(home))}:/usr/local/bin:/usr/bin:/bin
 PrivateTmp=true
 ProtectSystem=full
 
@@ -70,6 +76,7 @@ try {
   await mkdir(path.join(home, 'workflows'), { recursive: true });
   await mkdir(path.join(home, '.pi', 'agent', 'mi'), { recursive: true });
   await mkdir(path.join(home, 'mi'), { recursive: true });
+  await seedLegacyNode(home);
   const bin = path.join(temp, 'bin');
   const calls = path.join(temp, 'systemctl-calls');
   await mkdir(bin);
@@ -184,8 +191,9 @@ try {
   const legacyDropin = path.join(unitDir, 'mi-daemon.service.d');
   // Keep this fixture independently pinned to the observed legacy bytes.
   assert.equal(legacyDaemon(home), expectedLegacyDaemon(home), 'accepted legacy fixture exactly matches the observed unit');
-  assert.match(legacyDaemon(home), new RegExp(`Environment=MI_RUNTIME_DIR=/run/user/${process.getuid()}/mi`));
-  assert.match(legacyDaemon(home), new RegExp(`Environment=PATH=${path.dirname(node).replace(/[./]/g, '\\$&')}:${path.join(home, '.local', 'bin').replace(/[./]/g, '\\$&')}:`));
+  assert.match(legacyDaemon(home), new RegExp(`Environment=MI_RUNTIME_DIR=${legacyRuntimeDir(home).replace(/[./]/g, '\\$&')}`));
+  assert.match(legacyDaemon(home), new RegExp(`ExecStart=${legacyNode(home).replace(/[./]/g, '\\$&')} `));
+  assert.match(legacyDaemon(home), new RegExp(`Environment=PATH=${path.join(home, '.local', 'bin').replace(/[./]/g, '\\$&')}:${path.dirname(legacyNode(home)).replace(/[./]/g, '\\$&')}:`));
   await writeFile(legacyPath, legacyDaemon(home));
   const beforeMissingDropin = await readFile(legacyPath);
   result = run(home);
@@ -208,12 +216,14 @@ try {
   for (const changedLegacy of [
     legacyDaemon(home).replace('task/socket worker supervisor', 'changed daemon'),
     legacyDaemon(home).replace('extensions/mi-daemon.mjs', 'extensions/other-daemon.mjs'),
+    legacyDaemon(home).replace(legacyNode(home), '/usr/bin/node'),
+    legacyDaemon(home).replace(legacyNode(home), path.join(home, '.nvm', 'versions', 'node', 'v22.0.0', 'bin', 'node')),
     legacyDaemon(home).replace('Restart=on-failure', 'ExecStartPre=/bin/true\nRestart=on-failure'),
     legacyDaemon(home).replace('Environment=PATH=', 'Environment=HOME=${home}\nEnvironment=PATH='),
     legacyDaemon(home)
-      .replace(`Environment=MI_SOCKET_PATH=${legacyRuntimeDir}/main.sock`, `Environment=MI_SOCKET_PATH=${path.join(home, '.pi', 'agent', 'mi', 'main.sock')}`)
-      .replace(`Environment=MI_RUNTIME_DIR=${legacyRuntimeDir}`, `Environment=MI_RUNTIME_DIR=${path.join(home, '.pi', 'agent', 'mi')}`)
-      .replace(`Environment=PATH=${legacyServicePath(home)}`, `Environment=PATH=${path.dirname(node)}:/usr/local/bin:/usr/bin:/bin`),
+      .replace(`Environment=MI_SOCKET_PATH=${legacyRuntimeDir(home)}/main.sock`, `Environment=MI_SOCKET_PATH=/run/user/${process.getuid()}/mi/main.sock`)
+      .replace(`Environment=MI_RUNTIME_DIR=${legacyRuntimeDir(home)}`, `Environment=MI_RUNTIME_DIR=/run/user/${process.getuid()}/mi`),
+    legacyDaemon(home).replace(`Environment=PATH=${legacyServicePath(home)}`, `Environment=PATH=${path.dirname(legacyNode(home))}:${path.join(home, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin`),
     legacyDaemon(home).replace('PrivateTmp=true\n', ''),
     legacyDaemon(home).replace('ProtectSystem=full', 'ProtectSystem=false'),
     `${legacyDaemon(home)}\n`,

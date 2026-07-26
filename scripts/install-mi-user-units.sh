@@ -132,12 +132,14 @@ for entry in "${path_entries[@]}"; do
   SERVICE_PATH+="${SERVICE_PATH:+:}$entry"
 done
 
-# The reviewed pre-hardening daemon used the invoking user's XDG runtime
-# location and a distinct PATH. These migration bytes must not inherit any
-# caller-provided runtime or PATH values.
-LEGACY_RUNTIME_DIR="/run/user/$(id -u)/mi"
+# The reviewed pre-hardening daemon used this exact private runtime location
+# and PATH. These migration bytes must not inherit caller-provided values.
+LEGACY_RUNTIME_DIR="$HOME_DIR/.pi/agent/mi"
+LEGACY_NODE_BIN="$HOME_DIR/.nvm/versions/node/v24.15.0/bin/node"
+LEGACY_NODE_DIR="${LEGACY_NODE_BIN%/*}"
 require_safe_path "$LEGACY_RUNTIME_DIR" legacy-runtime-directory
-LEGACY_SERVICE_PATH="$NODE_DIR:$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin"
+require_safe_path "$LEGACY_NODE_BIN" legacy-node-binary
+LEGACY_SERVICE_PATH="$HOME_DIR/.local/bin:$LEGACY_NODE_DIR:/usr/local/bin:/usr/bin:/bin"
 IFS=: read -r -a path_entries <<< "$LEGACY_SERVICE_PATH"
 LEGACY_SERVICE_PATH=""
 for entry in "${path_entries[@]}"; do
@@ -323,7 +325,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$ROOT
-ExecStart=$NODE_BIN $HOME_DIR/.pi/agent/extensions/mi-daemon.mjs
+ExecStart=$LEGACY_NODE_BIN $HOME_DIR/.pi/agent/extensions/mi-daemon.mjs
 Restart=on-failure
 RestartSec=5
 Environment=MI_SOCKET_PATH=$LEGACY_RUNTIME_DIR/main.sock
@@ -356,6 +358,9 @@ assert_safe_existing_directory() {
 }
 is_known_legacy_daemon_unit() {
   local target="$1" expected_size actual_size
+  # This historical migration is intentionally pinned to one reviewed Node
+  # binary. Do not let current installer overrides influence accepted bytes.
+  canonical_executable "$LEGACY_NODE_BIN" legacy-node-binary >/dev/null
   assert_safe_existing_file "$target" 'legacy daemon unit'
   expected_size="$(stat -c '%s' -- "$legacy_daemon_unit")"
   actual_size="$(stat -c '%s' -- "$target")"
