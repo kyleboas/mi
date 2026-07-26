@@ -8,15 +8,38 @@ import path from 'node:path';
 const repo = path.resolve(import.meta.dirname, '..');
 const node = process.execPath;
 const temp = await mkdtemp(path.join(os.tmpdir(), 'mi-user-units-'));
+const miRoot = path.join(temp, 'mi-root');
+await mkdir(path.join(miRoot, 'pi', 'extensions'), { recursive: true });
+await mkdir(path.join(miRoot, 'state'), { recursive: true });
+await copyFile(path.join(repo, 'pi', 'extensions', 'mi-daemon.mjs'), path.join(miRoot, 'pi', 'extensions', 'mi-daemon.mjs'));
 const run = (home, extra = {}) => spawnSync('bash', ['scripts/install-mi-user-units.sh'], {
   cwd: repo,
   env: {
-    ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), MI_APP_DIR: repo,
+    ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), MI_APP_DIR: miRoot,
     MI_NODE_BIN: node, MI_BIN: node, MI_USER_UNITS_SKIP_SYSTEMD_VERIFY: '1', ...extra,
   },
   encoding: 'utf8',
 });
 const file = async (name) => readFile(name, 'utf8');
+const legacyDaemon = (home) => `[Unit]
+Description=Mi daemon (task/socket worker supervisor)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${miRoot}
+Environment=HOME=${home}
+Environment=MI_ROOT=${miRoot}
+Environment=MI_SOCKET_PATH=${path.join(home, '.pi', 'agent', 'mi', 'main.sock')}
+Environment=MI_RUNTIME_DIR=${path.join(home, '.pi', 'agent', 'mi')}
+Environment=PATH=${path.dirname(node)}:/usr/local/bin:/usr/bin:/bin
+ExecStart=${node} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
 
 try {
   const home = path.join(temp, 'home');
@@ -131,9 +154,33 @@ try {
     assert.equal(spawnSync('test', ['-e', path.join(isolated, '.config', 'systemd', 'user')]).status, 1);
   }
 
+  // The exact reviewed legacy daemon is migrated without activation. Its
+  // auto-load path is accepted only as part of this complete known shape.
+  const legacyPath = path.join(unitDir, 'mi-daemon.service');
+  await writeFile(legacyPath, legacyDaemon(home));
+  const callsBeforeLegacyMigration = await file(calls);
+  result = run(home);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await file(calls), callsBeforeLegacyMigration, 'legacy migration does not start or reload units');
+  assert.match(await file(legacyPath), /Description=Mi background task daemon/);
+  assert.doesNotMatch(await file(legacyPath), /\.pi\/agent\/extensions/);
+
+  for (const changedLegacy of [
+    legacyDaemon(home).replace('task/socket worker supervisor', 'changed daemon'),
+    legacyDaemon(home).replace('extensions/mi-daemon.mjs', 'extensions/other-daemon.mjs'),
+    legacyDaemon(home).replace('Restart=on-failure', 'ExecStartPre=/bin/true\nRestart=on-failure'),
+    legacyDaemon(home).replace('Environment=PATH=', 'Environment=EXTRA=1\nEnvironment=PATH='),
+  ]) {
+    await writeFile(legacyPath, changedLegacy);
+    const beforeRejectedLegacy = await file(legacyPath);
+    result = run(home);
+    assert.notEqual(result.status, 0, 'near-miss legacy unit is rejected');
+    assert.equal(await file(legacyPath), beforeRejectedLegacy, 'rejected legacy unit stays byte-for-byte unchanged');
+  }
+
   // A unit that points into Pi's automatic extension folder is never silently
-  // replaced, even when it has Mi's old description.
-  await writeFile(path.join(unitDir, 'mi-daemon.service'), '[Unit]\nDescription=Mi background task daemon\n[Service]\nExecStart=/home/user/.pi/agent/extensions/mi-daemon.mjs\n');
+  // replaced, even when it has Mi's current description.
+  await writeFile(legacyPath, '[Unit]\nDescription=Mi background task daemon\n[Service]\nExecStart=/home/user/.pi/agent/extensions/mi-daemon.mjs\n');
   result = run(home);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /contaminated Pi auto-load unit/);
@@ -150,8 +197,9 @@ try {
   assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => file(path.join(unitDir, name)))), old);
 
   // An explicit failing command after the first replacement restores files,
-  // present drop-ins, and leaves no installer temporary folders. Repeating the
-  // same rollback is safe.
+  // including the exact legacy daemon, present drop-ins, and leaves no
+  // installer temporary folders. Repeating the same rollback is safe.
+  await writeFile(legacyPath, legacyDaemon(home));
   const dropin = path.join(unitDir, 'mi-daemon.service.d');
   await mkdir(dropin, { recursive: true });
   await writeFile(path.join(dropin, 'operator.conf'), '[Service]\nEnvironment=KEEP=1\n');

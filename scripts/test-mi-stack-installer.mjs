@@ -13,6 +13,7 @@ const bin = path.join(tmp, 'bin');
 const stages = path.join(tmp, 'stages');
 await Promise.all([mkdir(home, { recursive: true }), mkdir(root), mkdir(bin), mkdir(stages)]);
 const sudoCount = path.join(tmp, 'sudo-count');
+const sudoCalls = path.join(tmp, 'sudo-calls');
 const systemctlCalls = path.join(tmp, 'systemctl-calls');
 const serviceState = path.join(tmp, 'service-state');
 const initialServiceState = [
@@ -24,7 +25,7 @@ const initialServiceState = [
 ].join('\n').concat('\n');
 await writeFile(serviceState, initialServiceState);
 await writeFile(systemctlCalls, '');
-await writeFile(path.join(bin, 'sudo'), `#!/bin/bash\necho sudo >> ${JSON.stringify(sudoCount)}\n[[ $1 == -- ]] && shift\nexec "$@"\n`);
+await writeFile(path.join(bin, 'sudo'), `#!/bin/bash\necho sudo >> ${JSON.stringify(sudoCount)}\nprintf '%s\\n' "$*" >> ${JSON.stringify(sudoCalls)}\n[[ $1 == -- ]] && shift\nexec "$@"\n`);
 await writeFile(path.join(bin, 'systemctl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(systemctlCalls)}\nexit 0\n`);
 await chmod(path.join(bin, 'sudo'), 0o700);
 await chmod(path.join(bin, 'systemctl'), 0o700);
@@ -87,7 +88,7 @@ await writeFile(path.join(setupRegistry, 'models.json'), '{"providers":{"other":
 const setupSettingsBefore = await readFile(path.join(setupRegistry, 'settings.json'));
 const setupModelsBefore = await readFile(path.join(setupRegistry, 'models.json'));
 for (const setupStep of ['after-temp', 'after-manifest']) {
-  result = run([], { MI_STACK_NO_SUDO: '1', MI_STACK_FAIL_SETUP: setupStep, TMPDIR: transactionTmp });
+  result = run([], { MI_STACK_FAIL_SETUP: setupStep, TMPDIR: transactionTmp });
   assert.notEqual(result.status, 0, `injected ${setupStep} failure stops the stack`);
   assert.deepEqual(await readFile(path.join(setupRegistry, 'settings.json')), setupSettingsBefore, `${setupStep} leaves settings byte-for-byte unchanged`);
   assert.deepEqual(await readFile(path.join(setupRegistry, 'models.json')), setupModelsBefore, `${setupStep} leaves models byte-for-byte unchanged`);
@@ -95,6 +96,8 @@ for (const setupStep of ['after-temp', 'after-manifest']) {
 }
 assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'setup failures preserve service state byte-for-byte');
 assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'setup failures make no systemctl call');
+await writeFile(sudoCount, '');
+await writeFile(sudoCalls, '');
 
 result = run();
 assert.equal(result.status, 0, result.stderr);
@@ -268,10 +271,33 @@ const registry = path.join(home, '.pi/agent');
 await mkdir(registry, { recursive: true });
 await writeFile(path.join(registry, 'settings.json'), JSON.stringify({ enabledModels: ['vps-gateway/coding-main', 'vps-gateway/mi-concierge'] }));
 await writeFile(path.join(registry, 'models.json'), JSON.stringify({ providers: { 'vps-gateway': { models: [{ id: 'coding-main' }, { id: 'mi-concierge' }] } } }));
+const sudoChecksBefore = (await readFile(sudoCount, 'utf8')).trim().split('\n').filter(Boolean).length;
 result = run(['--check'], { MI_GATEWAY_CONFIG_DIR: registry, MI_NODE_BIN: process.execPath });
 assert.equal(result.status, 0, result.stderr);
+assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').filter(Boolean).length, sudoChecksBefore + 1, 'non-root check crosses sudo exactly once');
+const checkSudoCall = (await readFile(sudoCalls, 'utf8')).trim().split('\n').at(-1);
+assert.match(checkSudoCall, /env -i MI_APP_DIR=\/home\/kyle\/.pi\/worktrees\/mi-pi-clean-integration/);
+assert.match(checkSudoCall, /MI_STACK_HOME=/);
+assert.match(checkSudoCall, /PATH=\/usr\/local\/sbin:.*install-mi-stack-root\.sh --check$/);
+assert.doesNotMatch(checkSudoCall, /ROOT_XDG_LEAK|inherited-home|inherited-config/);
 assert.match(result.stdout, /Mi stack check passed/);
 assert.doesNotMatch(result.stdout, /example\.ts\.net|EnvironmentFile|TOKEN|SECRET/);
+
+const sudoCallsAfterCheck = await readFile(sudoCount, 'utf8');
+result = spawnSync('bash', [path.join(repo, 'scripts/install-mi-stack-root.sh'), '--check'], {
+  env: { ...env, MI_GATEWAY_CONFIG_DIR: registry, MI_NODE_BIN: process.execPath }, encoding: 'utf8',
+});
+assert.equal(result.status, 0, result.stderr);
+assert.equal(await readFile(sudoCount, 'utf8'), sudoCallsAfterCheck, 'direct root check does not invoke sudo');
+for (const [args, extra, expectedStatus] of [
+  [['--bad'], {}, 2],
+  [['--check', 'extra'], {}, 2],
+  [[], { MI_STACK_HOME: `${home}/bad space` }, 1],
+  [[], { MI_GATEWAY_WORK_DIR: `${tmp}/bad;command` }, 1],
+]) {
+  result = run(args, extra);
+  assert.equal(result.status, expectedStatus, `wrapper rejects invalid input: ${args.join(' ') || JSON.stringify(extra)}`);
+}
 
 const failedHealth = path.join(tmp, 'failed-health');
 await writeFile(failedHealth, '#!/bin/sh\nexit 1\n');

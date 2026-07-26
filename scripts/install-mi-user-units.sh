@@ -292,11 +292,42 @@ if command -v systemd-analyze >/dev/null && [[ ${MI_USER_UNITS_SKIP_SYSTEMD_VERI
   systemd-analyze verify "$stage/mi-daemon.service" "$stage/mi-tick.service" "$stage/mi-tick.timer" >/dev/null
 fi
 
+# This is the one older daemon unit we can safely replace. It used Pi's
+# automatic extension folder, but every value must still be the value derived
+# above for this selected service account. Any edit, extra directive, or other
+# auto-load unit remains unsafe and is rejected.
+legacy_daemon_unit="$(cat <<EOF
+[Unit]
+Description=Mi daemon (task/socket worker supervisor)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$ROOT
+Environment=HOME=$HOME_DIR
+Environment=MI_ROOT=$ROOT
+Environment=MI_SOCKET_PATH=$RUNTIME_DIR/main.sock
+Environment=MI_RUNTIME_DIR=$RUNTIME_DIR
+Environment=PATH=$SERVICE_PATH
+ExecStart=$NODE_BIN $HOME_DIR/.pi/agent/extensions/mi-daemon.mjs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+)"
+is_known_legacy_daemon_unit() {
+  [[ "$(cat -- "$1")" == "$legacy_daemon_unit" ]]
+}
 assert_replaceable_unit() {
   local target="$1" description="$2"
   validate_unit_target "$target"
   [[ ! -e "$target" && ! -L "$target" ]] && return 0
   [[ -f "$target" && ! -L "$target" ]] || fail "refusing to replace non-file unit: $target"
+  if [[ "$target" == "$UNIT_DIR/mi-daemon.service" ]] && is_known_legacy_daemon_unit "$target"; then
+    return 0
+  fi
   grep -Fqx "Description=$description" "$target" || fail "refusing to replace unrelated unit: $target"
   ! grep -Fq '.pi/agent/extensions' "$target" || fail "refusing contaminated Pi auto-load unit: $target"
 }
