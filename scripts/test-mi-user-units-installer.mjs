@@ -163,6 +163,7 @@ try {
   assert.doesNotMatch(daemon, /ReadWritePaths=.*\.pi\/agent(?:\s|$)/);
   assert.match(daemon, new RegExp(`Environment=MI_WORKFLOWS_DIR=${path.join(home, 'workflows').replace(/[./]/g, '\\$&')}`));
   assert.match(daemon, new RegExp(`Environment=PATH=${path.dirname(node).replace(/[./]/g, '\\$&')}`));
+  assert.match(daemon, /^Environment=MI_DAEMON_IDLE_EXIT_MS=0$/m);
   assert.doesNotMatch(daemon, /Environment=PATH=.*root/);
   assert.match(tick, /MI_PROACTIVE_IMESSAGE_NOTIFY=false/);
   assert.match(tick, /MI_IMESSAGE_MONITOR_ENABLED=false/);

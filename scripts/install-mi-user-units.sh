@@ -237,6 +237,7 @@ Environment=HOME=$HOME_DIR
 Environment=MI_ROOT=$ROOT
 Environment=MI_WORKFLOWS_DIR=$WORKFLOWS_DIR
 Environment=PATH=$SERVICE_PATH
+Environment=MI_DAEMON_IDLE_EXIT_MS=0
 ExecStart=$NODE_BIN $DAEMON_PATH
 Restart=on-failure
 RestartSec=5
