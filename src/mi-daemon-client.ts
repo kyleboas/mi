@@ -4,11 +4,13 @@ import { existsSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { miDaemonPath } from './mi-runtime-paths.js';
 
 const HOME = homedir();
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 'mi');
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
-const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
+// The daemon is a reviewed Mi source file, never a Pi auto-loaded extension.
+const MI_DAEMON_PATH = miDaemonPath();
 const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const MI_DAEMON_HOST = process.env.MI_DAEMON_HOST || join(HOME, 'bin', 'mi-daemon-host');
 

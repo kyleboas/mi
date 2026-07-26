@@ -11,6 +11,7 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
+import { miDaemonPath as miDaemonPathFor } from '../dist/src/mi-runtime-paths.js';
 import { buildImessageCompletionPrompt, IMESSAGE_V2_LIMITS, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
 import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
@@ -43,7 +44,8 @@ const miPreferencesPath = path.join(home, 'mi', 'preferences.md');
 const miMemoryPath = path.join(home, 'mi', 'memory.md');
 const miRuntimeDir = process.env.MI_RUNTIME_DIR || path.join(home, '.pi', 'agent', 'mi');
 const miSocketPath = process.env.MI_SOCKET_PATH || path.join(miRuntimeDir, 'main.sock');
-const miDaemonPath = process.env.MI_DAEMON_PATH || path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
+// The daemon stays in the reviewed Mi tree. Do not use Pi's auto-load folder.
+const miDaemonPath = miDaemonPathFor(process.env, home);
 const miDaemonSystemdUnit = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const miDaemonHost = process.env.MI_DAEMON_HOST || path.join(home, 'bin', 'mi-daemon-host');
 const workerModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';

@@ -61,6 +61,7 @@ After=network-online.target llm-gateway.service
 [Service]
 Type=simple
 WorkingDirectory=$ROOT
+Environment=MI_ROOT=$ROOT
 ExecStartPre=/usr/bin/tailscale cert --cert-file $CERT_PATH --key-file $KEY_PATH $DNS_NAME
 ExecStart=/usr/bin/env node $ROOT/scripts/mi-web-chat.mjs
 Restart=on-failure

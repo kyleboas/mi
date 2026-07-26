@@ -109,9 +109,13 @@ The timer is installed with the complete Mi stack; use the production command in
 
 ## Mi pi extension
 
-A global pi extension is installed at `~/.pi/agent/extensions/mi.ts`.
+Mi's Pi extension is opt-in. It is not installed in Pi's global auto-load folder. Start a deliberate Mi TUI session with:
 
-Inside pi, the Mi extension exposes a single slash command: `/mi`.
+```bash
+MI_ROOT="${MI_ROOT:-$HOME/assistant}" pi --extension "${MI_ROOT:-$HOME/assistant}/pi/extensions/mi.ts"
+```
+
+Inside that Pi session, the Mi extension exposes a single slash command: `/mi`.
 
 ```bash
 /mi             # open the Mi side-channel thread

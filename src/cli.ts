@@ -19,6 +19,7 @@ import { readRunRecords } from './primitives.js';
 import { runFlueChat } from './flue.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import { runMiTick } from './tick.js';
+import { miDaemonPath } from './mi-runtime-paths.js';
 import { memoryPaths, readMemory, readMemoryHistory, runDreamConsolidation } from './memory.js';
 import { handleLoopDiscoverySelection, runLoopDiscovery } from './loop-discovery.js';
 import { decideLoopFactoryImplementation, handleLoopFactoryReply, loopFactoryStatus, runLoopFactoryCapture, runLoopFactoryDigest } from './loop-factory.js';
@@ -2420,7 +2421,8 @@ const PUSHOVER_MESSAGE_LIMIT = 1024;
 const MI_TASKS_DIR = join(HOME, 'mi');
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 'mi');
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
-const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
+// The daemon is a reviewed Mi source file, never a Pi auto-loaded extension.
+const MI_DAEMON_PATH = miDaemonPath();
 const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const MI_DAEMON_HOST = process.env.MI_DAEMON_HOST || join(HOME, 'bin', 'mi-daemon-host');
 const MI_MODEL = process.env.MI_MODEL || 'openai-codex/gpt-5.5:low';

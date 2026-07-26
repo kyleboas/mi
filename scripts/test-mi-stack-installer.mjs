@@ -112,6 +112,7 @@ assert.match(await readFile(photonOverride, 'utf8'), /OPERATOR_SETTING/, 'unknow
 // --check reports only fixed non-secret expectations and succeeds on a fixture.
 await mkdir(path.join(home, '.config/systemd/user/mi-web-chat.service.d'), { recursive: true });
 await copyFile(path.join(repo, 'systemd/mi-web-chat.service.d/10-mi-runtime.conf'), path.join(home, '.config/systemd/user/mi-web-chat.service.d/10-mi-runtime.conf'));
+await writeFile(path.join(home, '.config/systemd/user/mi-daemon.service'), `[Service]\nExecStart=${process.execPath} ${path.join(repo, 'pi/extensions/mi-daemon.mjs')}\n`);
 await mkdir(path.join(root, 'etc/systemd/system'), { recursive: true });
 await writeFile(path.join(root, 'etc/systemd/system/mi-photon-bridge.service'), '[Service]\nEnvironment=MI_WEB_URL=http://127.0.0.1:8787\n');
 const registry = path.join(home, '.pi/agent');

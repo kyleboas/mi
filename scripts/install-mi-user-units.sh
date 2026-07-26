@@ -4,11 +4,12 @@ set -euo pipefail
 ROOT="${MI_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 HOME_DIR="${HOME:?}"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME_DIR/.config}/systemd/user"
-EXT_DIR="$HOME_DIR/.pi/agent/extensions"
 NODE_BIN="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
 MI_BIN="${MI_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/mi}"
-install -d -m 700 "$UNIT_DIR" "$EXT_DIR"
-install -m 700 "$ROOT/pi/extensions/mi-daemon.mjs" "$EXT_DIR/mi-daemon.mjs"
+DAEMON_PATH="$ROOT/pi/extensions/mi-daemon.mjs"
+[[ -f "$DAEMON_PATH" ]] || { echo "Missing reviewed Mi daemon: $DAEMON_PATH" >&2; exit 1; }
+# Never install Mi files in ~/.pi/agent/extensions. Pi auto-loads that folder.
+install -d -m 700 "$UNIT_DIR"
 cat > "$UNIT_DIR/mi-daemon.service" <<EOF
 [Unit]
 Description=Mi background task daemon
@@ -18,7 +19,8 @@ After=network-online.target
 Type=simple
 WorkingDirectory=$ROOT
 Environment=HOME=$HOME_DIR
-ExecStart=$NODE_BIN $EXT_DIR/mi-daemon.mjs
+Environment=MI_ROOT=$ROOT
+ExecStart=$NODE_BIN $DAEMON_PATH
 Restart=on-failure
 RestartSec=5
 
@@ -33,6 +35,7 @@ Description=Mi scheduled tick
 Type=oneshot
 WorkingDirectory=$ROOT
 Environment=HOME=$HOME_DIR
+Environment=MI_ROOT=$ROOT
 Environment=MI_PROACTIVE_IMESSAGE_NOTIFY=true
 Environment=MI_PHOTON_NOTIFY_PORT=8788
 ExecStart=$MI_BIN tick

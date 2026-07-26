@@ -94,20 +94,19 @@ Start `pi` once as the new service user and complete Pi's normal login flow. Use
 
 Configure only the models this instance needs. The iMessage coordinator uses the configured concierge route. Terra, Luna, and Sol-High worker names also need matching models available to this Pi login. A model name in source code does not prove the account can use it.
 
-## 5. Install only reviewed extensions and skills
+## 5. Keep Mi execution files in the reviewed source tree
 
-Do not copy another host's global extension or skill folders. Install reviewed files one by one:
+Pi auto-loads `~/.pi/agent/extensions`. Do not copy Mi's TUI, daemon, capability guard, or orchestrator adapter into that folder or into any project `.pi/extensions` folder. They stay in the reviewed checkout at `$MI_ROOT/pi/extensions` and Mi starts them only by explicit absolute path.
+
+The Mi TUI is optional. A normal `pi` session must not load it. To use it for one deliberate session, run:
 
 ```bash
-install -d -m 0700 "$MI_HOME/.pi/agent/extensions" "$MI_HOME/.pi/agent/skills"
-install -m 0600 "$MI_ROOT/pi/extensions/mi.ts" "$MI_HOME/.pi/agent/extensions/mi.ts"
-install -m 0700 "$MI_ROOT/pi/extensions/mi-daemon.mjs" "$MI_HOME/.pi/agent/extensions/mi-daemon.mjs"
-install -m 0600 "$MI_ROOT/pi/extensions/mi-capability-guard.ts" "$MI_HOME/.pi/agent/extensions/mi-capability-guard.ts"
+MI_ROOT="$MI_ROOT" pi --extension "$MI_ROOT/pi/extensions/mi.ts"
 ```
 
-`mi-orchestrator-adapter.ts` is Mi-specific and guarded. Leave it in the reviewed repository at `pi/extensions/mi-orchestrator-adapter.ts`; the iMessage coordinator loads that exact file explicitly alongside the capability guard. Do not add it as a normal globally discovered extension.
+The iMessage coordinator explicitly loads `$MI_ROOT/pi/extensions/mi-capability-guard.ts` and `$MI_ROOT/pi/extensions/mi-orchestrator-adapter.ts` after `--no-extensions`. The daemon user unit explicitly runs `$MI_ROOT/pi/extensions/mi-daemon.mjs`. Do not add any of these files as globally discovered extensions.
 
-The advisor skill is not bundled in this repository. Install its reviewed source as its own directory at `<service-home>/.pi/agent/skills/advisor`, with `SKILL.md` and its required source registry. Do not copy the whole skills directory from another machine. Point `MI_ADVISOR_SKILL_PATH` at that reviewed directory if it is installed elsewhere.
+The advisor skill is passive until it is explicitly requested. If it is installed, keep its reviewed source at `$MI_HOME/.pi/agent/skills/advisor`, with `SKILL.md` and its required source registry. Do not copy the whole skills directory from another machine. Point `MI_ADVISOR_SKILL_PATH` at that reviewed directory if it is installed elsewhere.
 
 Direct advisor requests fail closed unless all required parts exist. Each selected advisor needs one independent Sol-High worker, a configured `openai-codex/gpt-5.6-sol:high` model, the reviewed advisor skill, and the Mi daemon. “Ask the advisors” needs two separate Sol-High workers, one per advisor. Mi must not claim advisor output when any worker cannot start.
 
@@ -206,7 +205,7 @@ chmod 0700 "$MI_WORKSPACE" "$MI_ROOT/state" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi
 find "$MI_ROOT/state" "$MI_HOME/mi" "$MI_HOME/.pi/agent/mi" -type f -exec chmod 0600 {} +
 ```
 
-Keep global extension and skill directories at `0700`; use `0600` for TypeScript and Markdown files and `0700` for executable scripts. Systemd unit files are normally `0644`. The repair sudoers file must be `0440`. Leave broker secret ownership and modes to `sudo secret`; do not change or inspect them.
+Keep the reviewed `$MI_ROOT/pi/extensions` directory and the passive advisor skill directory at `0700`; use `0600` for TypeScript and Markdown files and `0700` for the executable daemon script. Systemd unit files are normally `0644`. The repair sudoers file must be `0440`. Leave broker secret ownership and modes to `sudo secret`; do not change or inspect them.
 
 ## 9. Repair monitor and notifications
 
@@ -271,7 +270,7 @@ Back up only this new instance after it has created its own state. Keep code and
 - use the Pi product's own account recovery instead of copying `.pi` credentials; and
 - do not back up sockets, locks, coordinator policy/session files, or pending confirmations as portable data.
 
-For a code rollback, check out the previous reviewed commit, run `npm ci && npm run build`, reinstall the package, and rerun the stack installer. Its transaction restores generated configuration after a failed stage. Keep broker-managed credentials in place; do not move them into the repository or backup bundle.
+For a code rollback, stop the Mi user services, check out the previous reviewed commit, run `npm ci && npm run build`, reinstall the package, and rerun the stack installer. Its transaction restores generated configuration after a failed stage. Keep broker-managed credentials in place; do not move them into the repository or backup bundle. Before activation, remove or quarantine any old Mi files in Pi global or project auto-load folders; do not restore them during rollback.
 
 The gateway-only installer saves all five replaced files under `/var/backups/mi-gateway` before it writes them. To restore that saved set together, use the same reviewed checkout and account settings used for installation:
 

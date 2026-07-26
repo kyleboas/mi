@@ -41,6 +41,14 @@ if [[ "$MODE" == check ]]; then
     check_contains "$runtime" 'Environment=PI_CMD=' 'legacy PI_CMD rollback' || failed=1
     check_contains "$runtime" 'Environment=PATH=' 'NVM PATH' || failed=1
   fi
+  daemon_unit="$TARGET_HOME/.config/systemd/user/mi-daemon.service"
+  check_file "$daemon_unit" 'Mi daemon user unit' || failed=1
+  if [[ -f "$daemon_unit" ]]; then
+    check_contains "$daemon_unit" "$ROOT/pi/extensions/mi-daemon.mjs" 'reviewed Mi daemon path' || failed=1
+    if grep -Fq -- '.pi/agent/extensions' "$daemon_unit"; then
+      echo 'mismatch: Mi daemon must not use Pi auto-load extensions'; failed=1
+    fi
+  fi
   photon="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service"
   check_contains "$photon" 'Environment=MI_WEB_URL=http://127.0.0.1:8787' 'Photon loopback URL' || failed=1
   node_bin="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"

@@ -22,7 +22,8 @@ assert.match(crons, /options\.remindersOnly && cron\.command/, 'scheduled tickin
 assert.match(installer, /ExecStart=\$\{MI_BIN\} tick/, 'systemd installer uses mi tick');
 assert.match(installer, /enable-linger/, 'systemd installer enables user lingering for scheduled user timer reliability');
 assert.match(deployScript, /git diff --quiet[\s\S]*git status --short/, 'deploy script refuses dirty trees and shows status');
-assert.match(deployScript, /npm test[\s\S]*install -m 600 pi\/extensions\/mi\.ts[\s\S]*install -m 700 pi\/extensions\/mi-daemon\.mjs/, 'deploy script runs tests before copying extension files');
+assert.match(deployScript, /npm test[\s\S]*node scripts\/test-mi-tick\.mjs[\s\S]*node dist\/src\/cli\.js tick/, 'deploy script runs tests and both tick canaries before service restart');
+assert.doesNotMatch(deployScript, /\.pi\/agent\/extensions/, 'deploy script never copies Mi into Pi auto-load extensions');
 
 const root = await mkdtemp(join(tmpdir(), 'mi-tick-'));
 try {

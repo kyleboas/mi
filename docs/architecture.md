@@ -16,20 +16,20 @@ The runner reads an assistant file and starts a short run from an explicit trigg
 
 ### Mi command and Pi extension
 
-`mi` opens the main interface. `mi agents` shows daemon tasks and known Pi sessions. The global `mi.ts` Pi extension adds `/mi` as a side channel to the main Mi thread.
+`mi` opens the main interface. `mi agents` shows daemon tasks and known Pi sessions. `mi.ts` adds `/mi` only when a user starts Pi with `--extension <reviewed Mi path>`; it is never globally auto-loaded.
 
 ### Mi daemon
 
-`pi/extensions/mi-daemon.mjs` owns the local worker socket and background task records. Its default runtime directory is `~/.pi/agent/mi`. Scoped workers get short-lived capability files and a reduced environment. Read workers get read tools. Write workers are allowed only inside the configured workflows directory.
+`$MI_ROOT/pi/extensions/mi-daemon.mjs` owns the local worker socket and background task records. The user unit and on-demand launches use that explicit reviewed path. Its default runtime directory is `~/.pi/agent/mi`. Scoped workers get short-lived capability files and a reduced environment. Read workers get read tools. Write workers are allowed only inside the configured workflows directory.
 
 ### iMessage coordinator
 
 The web process receives an allowed iMessage turn from the Photon bridge. For tool-backed work it starts a Pi coordinator in RPC mode with no normal context files, extensions, skills, prompt templates, themes, or saved session. It explicitly loads:
 
-- `pi/extensions/mi-capability-guard.ts`; and
-- `pi/extensions/mi-orchestrator-adapter.ts`.
+- `$MI_ROOT/pi/extensions/mi-capability-guard.ts`; and
+- `$MI_ROOT/pi/extensions/mi-orchestrator-adapter.ts`.
 
-A coordinator policy binds the request to one real workspace root and working directory. The root cannot be the user's home directory or an ancestor of it. The working directory must be inside the root. The reviewed adapter can start only the named Terra, Luna, or Sol-High worker routes and only through the Mi daemon.
+A coordinator policy binds the request to one real workspace root and working directory. The root cannot be the user's home directory or an ancestor of it. The working directory must be inside the root. The reviewed adapter can start only the named Terra, Luna, or Sol-High worker routes and only through the Mi daemon. The shared model gateway is transport for model requests; it does not make ordinary Pi sessions run through Mi.
 
 ### Advisor workers
 
