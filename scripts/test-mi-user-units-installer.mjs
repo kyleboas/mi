@@ -164,12 +164,15 @@ try {
   assert.equal(await file(calls), callsBeforeLegacyMigration, 'legacy migration does not start or reload units');
   assert.match(await file(legacyPath), /Description=Mi background task daemon/);
   assert.doesNotMatch(await file(legacyPath), /\.pi\/agent\/extensions/);
+  result = run(home);
+  assert.equal(result.status, 0, `safe hardened rerun succeeds: ${result.stderr}`);
 
   for (const changedLegacy of [
     legacyDaemon(home).replace('task/socket worker supervisor', 'changed daemon'),
     legacyDaemon(home).replace('extensions/mi-daemon.mjs', 'extensions/other-daemon.mjs'),
     legacyDaemon(home).replace('Restart=on-failure', 'ExecStartPre=/bin/true\nRestart=on-failure'),
     legacyDaemon(home).replace('Environment=PATH=', 'Environment=EXTRA=1\nEnvironment=PATH='),
+    `${legacyDaemon(home)}\n`,
   ]) {
     await writeFile(legacyPath, changedLegacy);
     const beforeRejectedLegacy = await file(legacyPath);
@@ -177,6 +180,55 @@ try {
     assert.notEqual(result.status, 0, 'near-miss legacy unit is rejected');
     assert.equal(await file(legacyPath), beforeRejectedLegacy, 'rejected legacy unit stays byte-for-byte unchanged');
   }
+
+  await writeFile(legacyPath, Buffer.concat([Buffer.from(legacyDaemon(home)), Buffer.from([0])]));
+  const nulLegacy = await readFile(legacyPath);
+  result = run(home);
+  assert.notEqual(result.status, 0, 'NUL bytes cannot be recognized as a legacy unit');
+  assert.deepEqual(await readFile(legacyPath), nulLegacy, 'NUL legacy unit stays byte-for-byte unchanged');
+
+  // Every existing legacy daemon drop-in must be the reviewed whole bundle.
+  // The reviewed bundle has no files, so unknown, extra, altered, and linked
+  // entries all fail before any target mutation.
+  const legacyDropin = path.join(unitDir, 'mi-daemon.service.d');
+  for (const [name, prepare] of [
+    ['unknown', async () => { await writeFile(path.join(legacyDropin, 'operator.conf'), '[Service]\nEnvironment=KEEP=1\n'); }],
+    ['extra', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n'); await writeFile(path.join(legacyDropin, '20-extra.conf'), '[Service]\n'); }],
+    ['altered', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65537\n'); }],
+  ]) {
+    await rm(legacyDropin, { recursive: true, force: true });
+    await mkdir(legacyDropin, { recursive: true });
+    await prepare();
+    await writeFile(legacyPath, legacyDaemon(home));
+    const beforeRejectedBundle = await readFile(legacyPath);
+    result = run(home);
+    assert.notEqual(result.status, 0, `${name} legacy drop-in bundle is rejected`);
+    assert.deepEqual(await readFile(legacyPath), beforeRejectedBundle, `${name} rejection preserves legacy unit bytes`);
+  }
+  const linkedDropinTarget = path.join(temp, 'linked-dropin-target');
+  await mkdir(linkedDropinTarget);
+  await rm(legacyDropin, { recursive: true, force: true });
+  await symlink(linkedDropinTarget, legacyDropin);
+  await writeFile(legacyPath, legacyDaemon(home));
+  result = run(home);
+  assert.notEqual(result.status, 0, 'symlinked legacy drop-in directory is rejected');
+  assert.deepEqual(await readdir(linkedDropinTarget), [], 'linked drop-in target receives no mutation');
+  await rm(legacyDropin, { force: true });
+  await mkdir(legacyDropin, { recursive: true });
+  const linkedDropinFileTarget = path.join(temp, 'linked-dropin-file-target');
+  await writeFile(linkedDropinFileTarget, '[Service]\n');
+  await symlink(linkedDropinFileTarget, path.join(legacyDropin, 'linked.conf'));
+  await writeFile(legacyPath, legacyDaemon(home));
+  result = run(home);
+  assert.notEqual(result.status, 0, 'symlinked legacy drop-in file is rejected');
+  await rm(legacyDropin, { recursive: true, force: true });
+  await mkdir(legacyDropin, { recursive: true });
+  await chmod(legacyDropin, 0o777);
+  await writeFile(legacyPath, legacyDaemon(home));
+  result = run(home);
+  assert.notEqual(result.status, 0, 'unsafe legacy drop-in mode is rejected');
+  await chmod(legacyDropin, 0o755);
+  await rm(legacyDropin, { recursive: true, force: true });
 
   // A unit that points into Pi's automatic extension folder is never silently
   // replaced, even when it has Mi's current description.
@@ -202,20 +254,20 @@ try {
   await writeFile(legacyPath, legacyDaemon(home));
   const dropin = path.join(unitDir, 'mi-daemon.service.d');
   await mkdir(dropin, { recursive: true });
-  await writeFile(path.join(dropin, 'operator.conf'), '[Service]\nEnvironment=KEEP=1\n');
   const failingBin = path.join(temp, 'failing-bin');
   const mvCount = path.join(temp, 'mv-count');
   const rollbackTmp = path.join(temp, 'rollback-tmp');
   await mkdir(failingBin);
   await mkdir(rollbackTmp);
-  await writeFile(path.join(failingBin, 'mv'), `#!/bin/sh\nn=0; [ -f ${JSON.stringify(mvCount)} ] && n=$(cat ${JSON.stringify(mvCount)})\nn=$((n + 1)); echo "$n" > ${JSON.stringify(mvCount)}\n[ "$n" -eq 2 ] && exit 91\nexec /bin/mv "$@"\n`);
+  await writeFile(path.join(failingBin, 'mv'), `#!/bin/sh\nn=0; [ -f ${JSON.stringify(mvCount)} ] && n=$(cat ${JSON.stringify(mvCount)})\nn=$((n + 1)); echo "$n" > ${JSON.stringify(mvCount)}\n[ "$n" -eq 5 ] && exit 91\nexec /bin/mv "$@"\n`);
   await chmod(path.join(failingBin, 'mv'), 0o700);
-  const beforeFailure = await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer', 'mi-daemon.service.d/operator.conf'].map((name) => file(path.join(unitDir, name))));
+  const beforeFailure = await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name))));
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await rm(mvCount, { force: true });
     result = run(home, { PATH: `${failingBin}:${process.env.PATH}`, TMPDIR: rollbackTmp });
     assert.notEqual(result.status, 0);
-    assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer', 'mi-daemon.service.d/operator.conf'].map((name) => file(path.join(unitDir, name)))), beforeFailure);
+    assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name)))), beforeFailure, 'rollback restores every legacy unit byte-for-byte');
+    assert.deepEqual(await readdir(dropin), [], 'rollback restores the complete legacy drop-in directory');
   }
   assert.deepEqual(await readdir(rollbackTmp), [], 'rollback removes temporary folders');
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -46,7 +46,6 @@ for (const name of stageNames.filter((name) => name !== 'generated-entrypoints')
 const env = {
   ...process.env,
   PATH: `${bin}:${process.env.PATH}`,
-  MI_APP_DIR: repo,
   MI_STACK_HOME: home,
   MI_SYSTEM_ROOT: root,
   MI_STACK_STAGE_COMMAND_DIR: stages,
@@ -71,7 +70,51 @@ const run = (args = [], extra = {}) => spawnSync('bash', [path.join(repo, 'scrip
 const beforeServiceState = await readFile(serviceState, 'utf8');
 assert.equal(beforeServiceState, initialServiceState, 'fixture captures inactive and disabled service state before installation');
 
-let result = run(['--dry-run']);
+// The public wrapper derives its reviewed root from its own physical path.
+// A caller-selected MI_APP_DIR must fail before dry-run execution or sudo.
+const attackerRoot = path.join(tmp, 'attacker-root');
+const attackerRan = path.join(tmp, 'attacker-ran');
+await mkdir(path.join(attackerRoot, 'scripts'), { recursive: true });
+await writeFile(path.join(attackerRoot, 'scripts', 'install-mi-stack-root.sh'), `#!/bin/sh\nprintf attacker > ${JSON.stringify(attackerRan)}\n`);
+await chmod(path.join(attackerRoot, 'scripts', 'install-mi-stack-root.sh'), 0o700);
+let result = run(['--dry-run'], { MI_APP_DIR: attackerRoot });
+assert.notEqual(result.status, 0, 'caller MI_APP_DIR override is rejected');
+assert.equal(spawnSync('test', ['-e', attackerRan]).status, 1, 'override never executes an attacker root installer');
+assert.equal(spawnSync('test', ['-e', sudoCount]).status, 1, 'override fails before sudo');
+
+const linkedWrapper = path.join(tmp, 'linked-install-mi-stack.sh');
+await symlink(path.join(repo, 'scripts', 'install-mi-stack.sh'), linkedWrapper);
+result = spawnSync('bash', [linkedWrapper, '--dry-run'], { env, encoding: 'utf8' });
+assert.notEqual(result.status, 0, 'linked reviewed wrapper is rejected');
+assert.equal(spawnSync('test', ['-e', sudoCount]).status, 1, 'linked wrapper fails before sudo');
+const linkedRoot = path.join(tmp, 'linked-root');
+await symlink(repo, linkedRoot);
+result = spawnSync('bash', [path.join(linkedRoot, 'scripts', 'install-mi-stack.sh'), '--dry-run'], { env, encoding: 'utf8' });
+assert.notEqual(result.status, 0, 'linked reviewed root component is rejected');
+assert.equal(spawnSync('test', ['-e', sudoCount]).status, 1, 'linked root fails before sudo');
+const unsafeReviewedRoot = path.join(tmp, 'unsafe-reviewed-root');
+await mkdir(path.join(unsafeReviewedRoot, 'scripts'), { recursive: true });
+await copyFile(path.join(repo, 'scripts', 'install-mi-stack.sh'), path.join(unsafeReviewedRoot, 'scripts', 'install-mi-stack.sh'));
+await copyFile(path.join(repo, 'scripts', 'install-mi-stack-root.sh'), path.join(unsafeReviewedRoot, 'scripts', 'install-mi-stack-root.sh'));
+await chmod(path.join(unsafeReviewedRoot, 'scripts'), 0o700);
+await chmod(path.join(unsafeReviewedRoot, 'scripts', 'install-mi-stack.sh'), 0o700);
+await chmod(path.join(unsafeReviewedRoot, 'scripts', 'install-mi-stack-root.sh'), 0o700);
+await chmod(unsafeReviewedRoot, 0o777);
+result = spawnSync('bash', [path.join(unsafeReviewedRoot, 'scripts', 'install-mi-stack.sh'), '--dry-run'], { env, encoding: 'utf8' });
+assert.notEqual(result.status, 0, 'group/other-writable reviewed root is rejected');
+assert.equal(spawnSync('test', ['-e', sudoCount]).status, 1, 'unsafe reviewed root fails before sudo');
+const portableRoot = path.join(tmp, 'portable-reviewed-root');
+await mkdir(path.join(portableRoot, 'scripts'), { recursive: true });
+await copyFile(path.join(repo, 'scripts', 'install-mi-stack.sh'), path.join(portableRoot, 'scripts', 'install-mi-stack.sh'));
+await copyFile(path.join(repo, 'scripts', 'install-mi-stack-root.sh'), path.join(portableRoot, 'scripts', 'install-mi-stack-root.sh'));
+await chmod(portableRoot, 0o700);
+await chmod(path.join(portableRoot, 'scripts'), 0o700);
+await chmod(path.join(portableRoot, 'scripts', 'install-mi-stack.sh'), 0o700);
+await chmod(path.join(portableRoot, 'scripts', 'install-mi-stack-root.sh'), 0o700);
+result = spawnSync('bash', [path.join(portableRoot, 'scripts', 'install-mi-stack.sh'), '--dry-run'], { env, encoding: 'utf8' });
+assert.equal(result.status, 0, `portable physical reviewed fixture works: ${result.stderr}`);
+
+result = run(['--dry-run']);
 assert.equal(result.status, 0, result.stderr);
 assert.deepEqual(result.stdout.trim().split('\n').slice(1).map((line) => line.trim()), stageNames, 'dry-run lists the exact dependency order');
 assert.equal(spawnSync('test', ['-e', path.join(home, 'install-mi-stack.sh')]).status, 1, 'dry-run does not mutate');
@@ -121,6 +164,7 @@ for (const line of recordedUserStages) {
 }
 assert.equal((await stat(path.join(home, 'install-mi-stack.sh'))).mode & 0o777, 0o700);
 assert.match(await readFile(path.join(home, 'install-mi-stack.sh'), 'utf8'), /MI-GENERATED: install-mi-stack-v1/);
+assert.match(await readFile(path.join(home, 'install-mi-stack.sh'), 'utf8'), new RegExp(`exec ${path.join(repo, 'scripts', 'install-mi-stack.sh').replace(/[./]/g, '\\$&')}`), 'home wrapper renders the canonical reviewed path');
 assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'successful stack install preserves active and enabled service states byte-for-byte');
 assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'successful stack install makes no systemctl call');
 result = run();
