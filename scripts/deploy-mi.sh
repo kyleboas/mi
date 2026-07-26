@@ -50,6 +50,11 @@ restart_user_unit() {
 restart_user_unit mi-daemon.service
 restart_user_unit mi-web-chat.service
 restart_user_unit mi-flue.service
-restart_user_unit mi-tick.timer
+# A deploy does not wake scheduled or outbound work unless an operator makes a
+# separate, explicit choice and supplies both safety values.
+if [[ ${MI_DEPLOY_ACTIVATE_TIMER:-0} == 1 ]]; then
+  [[ -n ${MI_PROACTIVE_IMESSAGE_NOTIFY+x} && -n ${MI_IMESSAGE_MONITOR_ENABLED+x} ]] || { echo 'Timer activation requires explicit notice and monitor values.' >&2; exit 1; }
+  restart_user_unit mi-tick.timer
+fi
 
 echo "Mi deploy complete. Mi execution files remain under $ROOT/pi/extensions."

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -46,12 +46,18 @@ const runtime = join(root, 'runtime');
 const socketPath = join(runtime, 'main.sock');
 const sessionDir = join(root, 'sessions');
 await mkdir(runtime, { recursive: true });
+const miRoot = join(root, 'assistant');
+const privateExtensions = join(miRoot, 'pi', 'extensions');
+await mkdir(privateExtensions, { recursive: true });
+for (const file of ['mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) {
+  await copyFile(new URL(`../pi/extensions/${file}`, import.meta.url), join(privateExtensions, file));
+}
 
 const daemon = new URL('../pi/extensions/mi-daemon.mjs', import.meta.url).pathname;
 const env = {
   ...process.env,
   HOME: root,
-  MI_ROOT: join(root, 'assistant'),
+  MI_ROOT: miRoot,
   MI_RUNTIME_DIR: runtime,
   MI_SOCKET_PATH: socketPath,
   MI_SESSION_DIR: sessionDir,

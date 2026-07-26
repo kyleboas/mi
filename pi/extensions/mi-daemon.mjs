@@ -6,7 +6,8 @@ import { appendFile, chmod, mkdir, open, readFile, readdir, readlink, rename, rm
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { parseWorkerCompletion } from "../../scripts/mi-worker-completion.mjs";
+import { pathToFileURL } from "node:url";
+import { reviewedMiExtensionPaths } from "./mi-reviewed-paths.mjs";
 
 const HOME = homedir();
 const RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, ".pi", "agent", "mi");
@@ -40,7 +41,17 @@ const NICE_BIN = process.env.MI_NICE_BIN || "/usr/bin/nice";
 const IONICE_BIN = process.env.MI_IONICE_BIN || "/usr/bin/ionice";
 const MI_WORKER_NICE = Number(process.env.MI_WORKER_NICE || 10);
 const MI_WORKER_IONICE_CLASS = String(process.env.MI_WORKER_IONICE_CLASS || "3");
-const MI_CAPABILITY_GUARD = process.env.MI_CAPABILITY_GUARD || join(MI_ROOT, "pi", "extensions", "mi-capability-guard.ts");
+const REVIEWED_MI_PATHS = reviewedMiExtensionPaths({
+  root: MI_ROOT,
+  capabilityGuardPath: process.env.MI_CAPABILITY_GUARD,
+  capabilityAdapterPath: process.env.MI_CAPABILITY_ADAPTER,
+  // This process does not spawn a daemon. Clients and web chat validate that
+  // path before they spawn it; here the required Pi guard and adapter matter.
+  requireDaemon: false,
+  requireGuard: true,
+  requireAdapter: true,
+});
+const MI_CAPABILITY_GUARD = REVIEWED_MI_PATHS.capabilityGuardPath;
 const MI_CAPABILITY_GRANT_TTL_MS = Number(process.env.MI_CAPABILITY_GRANT_TTL_MS || 6 * 60 * 60_000);
 const MI_ADVISOR_SKILL_PATH = process.env.MI_ADVISOR_SKILL_PATH || join(HOME, ".pi", "agent", "skills", "advisor");
 const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "HOSTNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR", "TMP", "TEMP", "PI_PROVIDER", "PI_MODEL", "PI_CONFIG_DIR", "PI_GATEWAY_URL", "AGENT_GATEWAY_URL"];
@@ -1508,7 +1519,9 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
   // --no-skills blocks every discovered global/project skill. Pi still loads
   // this one reviewed root through the explicit additive --skill flag.
   if (advisorRoot) args.push("--skill", advisorRoot);
-  if (existsSync(MI_CAPABILITY_GUARD)) args.push("--extension", MI_CAPABILITY_GUARD);
+  // REVIEWED_MI_PATHS checked this before any worker can spawn. Never fall
+  // back to an unguarded Pi process.
+  args.push("--extension", MI_CAPABILITY_GUARD);
   if (sessionDir) args.splice(2, 0, "--session-dir", sessionDir);
   if (sessionFile) args.splice(2, 0, "--session", sessionFile);
   const launch = rpcLaunchCommand(args, env);

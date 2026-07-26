@@ -32,7 +32,7 @@ Prepare a supported Linux VPS with:
 - a separate Photon project connected to the new iMessage number; and
 - sudo access for installation.
 
-The web installer calls `tailscale status` and `tailscale cert`. The stack readiness check expects `llm-gateway.service`, `mi-photon-bridge.service`, `mi-web-chat.service`, `mi-daemon.service`, and `mi-tick.timer`.
+The web installer calls `tailscale status` and `tailscale cert`. The staged stack check verifies files and safeguards. It does not require the web, Photon, or tick units to be active; the first activation starts only the daemon.
 
 The gateway installer renders account paths from explicit settings. It rejects placeholders, relative or unclean paths, symlinks, account-home mismatches, and unexpected owners before changing gateway files or restarting the service.
 
@@ -160,7 +160,7 @@ sudo env \
   "$MI_ROOT/scripts/install-mi-stack.sh"
 ```
 
-The script installs the production gateway and Pi registry, brokered gateway client, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. Preview its stages first if needed:
+The script installs the production gateway and Pi registry, brokered gateway client, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It does not enable or start those units. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
 
 ```bash
 MI_APP_DIR="$MI_ROOT" "$MI_ROOT/scripts/install-mi-stack.sh" --dry-run
@@ -184,14 +184,14 @@ Environment=MI_PUSHOVER_NOTIFY=0
 Environment=MI_PUSHOVER_FALLBACK=0
 ```
 
-Then reload and start only after reviewing the unit files:
+Then verify the daemon sandbox (`PrivateTmp=true`, `ProtectSystem=full`), fixed service-user PATH, reviewed private extension paths, and disabled notice/monitor settings. Reload and start only the daemon:
 
 ```bash
 systemctl --user daemon-reload
-sudo systemctl daemon-reload
-systemctl --user enable --now mi-web-chat.service mi-daemon.service mi-tick.timer
-sudo systemctl enable --now mi-photon-bridge.service
+systemctl --user enable --now mi-daemon.service
 ```
+
+Leave the timer, web service, Photon bridge, proactive notices, and repair monitor disabled until each has separate approval.
 
 ## 8. Ownership and modes
 

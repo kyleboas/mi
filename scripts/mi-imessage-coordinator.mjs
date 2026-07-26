@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import path from 'node:path';
+import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 
 const DEFAULT_STDOUT_CAP = 256 * 1024;
 const DEFAULT_STDERR_CAP = 16 * 1024;
@@ -212,13 +213,22 @@ export function runMiCoordinatorRpc({
  * global resource runs here: only Mi's reviewed, explicit extensions load.
  */
 export function miCoordinatorLaunch({ piCommand, cwd, runtimeDir, model, capabilityGuardPath, capabilityAdapterPath, env = {} }) {
+  if (!capabilityGuardPath || !capabilityAdapterPath) throw new Error('Mi coordinator requires its reviewed guard and adapter');
+  const root = path.resolve(capabilityGuardPath, '..', '..', '..');
+  const reviewed = reviewedMiExtensionPaths({
+    root,
+    capabilityGuardPath,
+    capabilityAdapterPath,
+    requireGuard: true,
+    requireAdapter: true,
+  });
   const sessionDir = path.join(runtimeDir, 'imessage-coordinator-sessions');
   const args = [
     '--mode', 'rpc', '--session-dir', sessionDir, '--model', model,
     '--no-context-files', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes',
   ];
-  if (capabilityGuardPath) args.push('--extension', capabilityGuardPath);
-  if (capabilityAdapterPath) args.push('--extension', capabilityAdapterPath);
+  args.push('--extension', reviewed.capabilityGuardPath);
+  args.push('--extension', reviewed.capabilityAdapterPath);
   return {
     command: piCommand,
     args,

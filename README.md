@@ -87,7 +87,7 @@ Mi discovers pi sessions from the default pi session store (`~/.pi/agent/session
 
 A lock at `state/tick.lock` prevents overlapping runs. The systemd timer runs every minute, while the repair monitor limits itself to once every 15 minutes by default (`MI_IMESSAGE_MONITOR_INTERVAL_MS`).
 
-When the Photon bridge is running, tick notices can use its local-only outbound endpoint. The stack installer sets `MI_PROACTIVE_IMESSAGE_NOTIFY=true`; set it to `false` in the tick service to keep these notices out of iMessage. Pushover is opt-in through `MI_PUSHOVER_NOTIFY=1` or `MI_PUSHOVER_FALLBACK=1`.
+When the Photon bridge is running, tick notices can use its local-only outbound endpoint. A new install writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and does not start the timer. Keep it false until an operator chooses to send notices. Pushover is opt-in through `MI_PUSHOVER_NOTIFY=1` or `MI_PUSHOVER_FALLBACK=1`.
 
 The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, and recent Mi thread activity. A repair attempt restarts the Photon bridge and the user services named by `MI_IMESSAGE_REPAIR_USER_SERVICES`, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
 
@@ -180,7 +180,7 @@ Normal installation and repair has one user-facing command (run normally; it req
 /home/kyle/install-mi-stack.sh
 ```
 
-Use `/home/kyle/install-mi-stack.sh --check` for a non-secret health/configuration summary or `--dry-run` to list stages without mutation. The operation installs the production gateway and registry, brokered client helper, dynamic Tailscale TLS/web service, loopback Photon bridge, daemon, timer, and user/system units. It also removes temporary eval aliases and restores production while preserving eval harness files. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
+Use `/home/kyle/install-mi-stack.sh --check` for a non-secret configuration summary or `--dry-run` to list stages without mutation. The operation installs reviewed unit files but does not enable or start web, Photon, daemon, or timer work. It writes disabled notice and repair-monitor settings. After checking the safeguards, start only `mi-daemon.service`; leave the timer, notices, and repair monitor disabled. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
 
 The installer creates the system Photon bridge unit and the user web, daemon, and tick units. The Photon unit loads its broker-managed secret file with `EnvironmentFile=`. It does not print credential values into the agent shell.
 

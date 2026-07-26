@@ -18,8 +18,10 @@ try {
   await writeFile(path.join(extensions, 'fixture-disabled.ts.disabled'), 'export default function () {}\n');
   await writeFile(path.join(skills, 'SKILL.md'), '# Fixture skill\n');
 
-  const guard = path.join(home, 'mi-capability-guard.ts');
-  const adapter = path.join(home, 'mi-orchestrator-adapter.ts');
+  const privateExtensions = path.join(home, 'assistant', 'pi', 'extensions');
+  await mkdir(privateExtensions, { recursive: true });
+  const guard = path.join(privateExtensions, 'mi-capability-guard.ts');
+  const adapter = path.join(privateExtensions, 'mi-orchestrator-adapter.ts');
   await writeFile(guard, 'export default function () {}\n');
   await writeFile(adapter, 'export default function () {}\n');
   const launch = miCoordinatorLaunch({
@@ -37,6 +39,7 @@ try {
   assert.ok(launch.args.includes(adapter), 'coordinator explicitly loads the reviewed Mi delegation adapter');
   assert.ok(!launch.args.includes('--tools'), 'coordinator keeps only Pi defaults plus reviewed extensions');
   assert.equal(launch.env.MI_COORDINATOR_MODE, '1');
+  assert.throws(() => miCoordinatorLaunch({ piCommand: 'pi', cwd: home, runtimeDir: home, model: 'test' }), /requires its reviewed guard and adapter/, 'coordinator refuses an unguarded launch');
 
   const prompt = miCoordinatorPrompt({ message: 'Ask Terra to inspect this.', context: 'User: continue the earlier task' });
   assert.match(prompt, /mi_orchestrator_delegate/, 'coordinator instructions expose only the reviewed Mi delegation path');

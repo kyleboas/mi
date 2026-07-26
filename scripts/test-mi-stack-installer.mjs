@@ -20,7 +20,9 @@ const stageLog = path.join(tmp, 'stage-log');
 for (const name of stageNames) {
   const gatewayValues = name === 'production-gateway'
     ? `printf '%s\\n' "$MI_GATEWAY_SERVICE_USER|$MI_GATEWAY_SERVICE_HOME|$MI_GATEWAY_PI_BINARY|$MI_GATEWAY_PI_COMMAND_DIR|$MI_GATEWAY_PI_AGENT_DIR|$MI_GATEWAY_WORK_DIR|$MI_GATEWAY_HEALTH_COMMAND|$MI_GATEWAY_HEALTH_USER" > ${JSON.stringify(path.join(tmp, 'gateway-values'))}\n`
-    : '';
+    : name === 'production-registry'
+      ? `printf '%s\\n' "$HOME|$XDG_CONFIG_HOME|$XDG_DATA_HOME|$PATH" > ${JSON.stringify(path.join(tmp, 'registry-env'))}\n`
+      : '';
   await writeFile(path.join(stages, name), `#!/bin/sh\necho ${name} >> ${JSON.stringify(stageLog)}\n${gatewayValues}`);
   await chmod(path.join(stages, name), 0o700);
 }
@@ -41,6 +43,7 @@ const env = {
   MI_GATEWAY_WORK_DIR: path.join(tmp, 'gateway-work'),
   MI_GATEWAY_HEALTH_COMMAND: path.join(tmp, 'other-health-command'),
   MI_GATEWAY_HEALTH_USER: 'other-health',
+  MI_NODE_BIN: process.execPath,
 };
 const run = (args = [], extra = {}) => spawnSync('bash', [path.join(repo, 'scripts/install-mi-stack.sh'), ...args], { env: { ...env, ...extra }, encoding: 'utf8' });
 
@@ -59,6 +62,9 @@ assert.equal(
   `other-user|${home}|${path.join(tmp, 'pi-real')}|${bin}|${path.join(home, '.pi/agent')}|${path.join(tmp, 'gateway-work')}|${path.join(tmp, 'other-health-command')}|other-health`,
   'stack forwards all portable gateway settings',
 );
+const rootInstallerText = await readFile(path.join(repo, 'scripts/install-mi-stack-root.sh'), 'utf8');
+assert.match(rootInstallerText, /run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR=/, 'production registry crosses the service-user boundary');
+assert.match(rootInstallerText, /env HOME="\$TARGET_HOME" XDG_CONFIG_HOME="\$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="\$TARGET_XDG_DATA_HOME" PATH="\$TARGET_SERVICE_PATH"/, 'service-user stages clear root HOME, XDG, and PATH values');
 assert.equal((await stat(path.join(home, 'install-mi-stack.sh'))).mode & 0o777, 0o700);
 assert.match(await readFile(path.join(home, 'install-mi-stack.sh'), 'utf8'), /MI-GENERATED: install-mi-stack-v1/);
 result = run();
@@ -112,7 +118,8 @@ assert.match(await readFile(photonOverride, 'utf8'), /OPERATOR_SETTING/, 'unknow
 // --check reports only fixed non-secret expectations and succeeds on a fixture.
 await mkdir(path.join(home, '.config/systemd/user/mi-web-chat.service.d'), { recursive: true });
 await copyFile(path.join(repo, 'systemd/mi-web-chat.service.d/10-mi-runtime.conf'), path.join(home, '.config/systemd/user/mi-web-chat.service.d/10-mi-runtime.conf'));
-await writeFile(path.join(home, '.config/systemd/user/mi-daemon.service'), `[Service]\nExecStart=${process.execPath} ${path.join(repo, 'pi/extensions/mi-daemon.mjs')}\n`);
+await writeFile(path.join(home, '.config/systemd/user/mi-daemon.service'), `[Service]\nExecStart=${process.execPath} ${path.join(repo, 'pi/extensions/mi-daemon.mjs')}\nPrivateTmp=true\nProtectSystem=full\nEnvironment=PATH=${path.dirname(process.execPath)}:/usr/bin:/bin\n`);
+await writeFile(path.join(home, '.config/systemd/user/mi-tick.service'), '[Service]\nEnvironment=MI_PROACTIVE_IMESSAGE_NOTIFY=false\nEnvironment=MI_IMESSAGE_MONITOR_ENABLED=false\n');
 await mkdir(path.join(root, 'etc/systemd/system'), { recursive: true });
 await writeFile(path.join(root, 'etc/systemd/system/mi-photon-bridge.service'), '[Service]\nEnvironment=MI_WEB_URL=http://127.0.0.1:8787\n');
 const registry = path.join(home, '.pi/agent');

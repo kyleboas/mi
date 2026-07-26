@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { miDaemonPath } from '../dist/src/mi-runtime-paths.js';
 import { miCoordinatorLaunch } from './mi-imessage-coordinator.mjs';
+import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 
 const repo = path.resolve(import.meta.dirname, '..');
 const temp = await mkdtemp(path.join(tmpdir(), 'mi-pi-isolation-'));
@@ -29,6 +30,22 @@ try {
 
   await mkdir(autoLoad, { recursive: true });
   await mkdir(projectAutoLoad, { recursive: true });
+  const privateRoot = path.join(temp, 'private-mi');
+  const privateExtensions = path.join(privateRoot, 'pi', 'extensions');
+  await mkdir(privateExtensions, { recursive: true });
+  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await writeFile(path.join(privateExtensions, file), 'export {};\n');
+  const reviewed = reviewedMiExtensionPaths({ root: privateRoot, requireDaemon: true, requireGuard: true, requireAdapter: true });
+  assert.equal(reviewed.daemonPath, path.join(privateExtensions, 'mi-daemon.mjs'));
+  const outsideDaemon = path.join(temp, 'outside.mjs');
+  await writeFile(outsideDaemon, 'export {};\n');
+  await assert.rejects(async () => reviewedMiExtensionPaths({ root: privateRoot, daemonPath: outsideDaemon, requireDaemon: true }), /reviewed file/);
+  await rm(path.join(privateExtensions, 'mi-capability-guard.ts'));
+  await assert.rejects(async () => reviewedMiExtensionPaths({ root: privateRoot, requireGuard: true }), /unavailable/);
+  await writeFile(path.join(temp, 'guard-target.ts'), 'export {};\n');
+  await (await import('node:fs/promises')).symlink(path.join(temp, 'guard-target.ts'), path.join(privateExtensions, 'mi-capability-guard.ts'));
+  await assert.rejects(async () => reviewedMiExtensionPaths({ root: privateRoot, requireGuard: true }), /symlink/);
+  await rm(path.join(privateExtensions, 'mi-capability-guard.ts'));
+  await writeFile(path.join(privateExtensions, 'mi-capability-guard.ts'), 'export {};\n');
   await writeFile(path.join(autoLoad, 'ordinary-pi-extension.ts'), 'export default function () {}\n');
   await writeFile(path.join(projectAutoLoad, 'ordinary-project-extension.ts'), 'export default function () {}\n');
   const install = spawnSync('bash', ['scripts/install-mi-user-units.sh'], {

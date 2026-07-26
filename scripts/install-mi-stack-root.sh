@@ -48,6 +48,15 @@ if [[ "$MODE" == check ]]; then
     if grep -Fq -- '.pi/agent/extensions' "$daemon_unit"; then
       echo 'mismatch: Mi daemon must not use Pi auto-load extensions'; failed=1
     fi
+    check_contains "$daemon_unit" 'PrivateTmp=true' 'daemon private temporary files' || failed=1
+    check_contains "$daemon_unit" 'ProtectSystem=full' 'daemon protected system files' || failed=1
+    check_contains "$daemon_unit" 'Environment=PATH=' 'daemon fixed PATH' || failed=1
+  fi
+  tick_unit="$TARGET_HOME/.config/systemd/user/mi-tick.service"
+  check_file "$tick_unit" 'Mi tick user unit' || failed=1
+  if [[ -f "$tick_unit" ]]; then
+    check_contains "$tick_unit" 'Environment=MI_PROACTIVE_IMESSAGE_NOTIFY=false' 'tick notices disabled' || failed=1
+    check_contains "$tick_unit" 'Environment=MI_IMESSAGE_MONITOR_ENABLED=false' 'tick repair monitor disabled' || failed=1
   fi
   photon="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service"
   check_contains "$photon" 'Environment=MI_WEB_URL=http://127.0.0.1:8787' 'Photon loopback URL' || failed=1
@@ -65,14 +74,11 @@ if [[ "$MODE" == check ]]; then
     'Expected helper: ~/.local/share/mi/mi-gateway-client.py' \
     'Expected PATH: supported NVM bin, then system bins'
   if command -v systemctl >/dev/null && [[ -z "$SYSTEM_ROOT" ]]; then
-    for unit in llm-gateway.service mi-photon-bridge.service; do
-      systemctl is-active --quiet "$unit" || { echo "inactive: $unit"; failed=1; }
-    done
     service_user="${MI_SERVICE_USER:-kyle}"
     runtime_dir="/run/user/$(id -u "$service_user")"
-    for unit in mi-web-chat.service mi-daemon.service mi-tick.timer; do
-      runuser -u "$service_user" -- env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-active --quiet "$unit" || { echo "inactive: $unit"; failed=1; }
-    done
+    if runuser -u "$service_user" -- env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-active --quiet mi-tick.timer; then
+      echo 'mismatch: mi-tick.timer must stay inactive until separately approved'; failed=1
+    fi
   fi
   (( failed == 0 )) && echo 'Mi stack check passed'
   exit "$failed"
@@ -148,8 +154,18 @@ run_stage() {
     "$@"
   fi
 }
+TARGET_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$TARGET_HOME/.config}"
+TARGET_XDG_DATA_HOME="${XDG_DATA_HOME:-$TARGET_HOME/.local/share}"
+STACK_NODE_BIN="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
+TARGET_SERVICE_PATH="${MI_STACK_SERVICE_PATH:-${STACK_NODE_BIN%/*}:/usr/local/bin:/usr/bin:/bin}"
 as_user() {
-  if [[ -n "$SYSTEM_ROOT" || ${MI_STACK_NO_RUNUSER:-0} == 1 ]]; then "$@"; else runuser -u "${MI_SERVICE_USER:-kyle}" -- "$@"; fi
+  # runuser otherwise keeps too much of the root caller environment. Every
+  # service-user stage gets its target home, XDG roots, and a fixed PATH.
+  if [[ -n "$SYSTEM_ROOT" || ${MI_STACK_NO_RUNUSER:-0} == 1 ]]; then
+    env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="$TARGET_XDG_DATA_HOME" PATH="$TARGET_SERVICE_PATH" "$@"
+  else
+    runuser -u "${MI_SERVICE_USER:-kyle}" -- env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="$TARGET_XDG_DATA_HOME" PATH="$TARGET_SERVICE_PATH" "$@"
+  fi
 }
 
 run_stage production-gateway env \
@@ -163,11 +179,13 @@ run_stage production-gateway env \
   MI_GATEWAY_HEALTH_COMMAND="${MI_GATEWAY_HEALTH_COMMAND:-/home/kyle/bin/llm-gateway-health}" \
   MI_GATEWAY_HEALTH_USER="$GATEWAY_HEALTH_USER" \
   "$ROOT/scripts/install-mi-subscription-gateway-root.sh"
-run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR="$TARGET_HOME/.pi/agent" "${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}" "$ROOT/scripts/install-mi-gateway-models.mjs"
-run_stage gateway-client as_user env HOME="$TARGET_HOME" XDG_DATA_HOME="$TARGET_HOME/.local/share" XDG_CONFIG_HOME="$TARGET_HOME/.config" MI_GATEWAY_CLIENT_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-gateway-client.sh"
-run_stage tailscale-web as_user env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" MI_APP_DIR="$ROOT" "$ROOT/scripts/install-mi-web-chat-systemd.sh"
-run_stage user-units as_user env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_HOME/.config" MI_APP_DIR="$ROOT" "$ROOT/scripts/install-mi-user-units.sh"
-run_stage photon-loopback env MI_APP_DIR="$ROOT" MI_SYSTEM_ROOT="$SYSTEM_ROOT" "$ROOT/scripts/install-mi-imessage-stack-root.sh"
+run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR="$TARGET_HOME/.pi/agent" "$STACK_NODE_BIN" "$ROOT/scripts/install-mi-gateway-models.mjs"
+run_stage gateway-client as_user env MI_GATEWAY_CLIENT_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-gateway-client.sh"
+# A staged install writes reviewed units only. It never starts web, Photon,
+# daemon, or tick work; activation is a separate operator step.
+run_stage tailscale-web as_user env MI_APP_DIR="$ROOT" MI_WEB_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-web-chat-systemd.sh"
+run_stage user-units as_user env MI_APP_DIR="$ROOT" MI_USER_UNITS_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-user-units.sh"
+run_stage photon-loopback env MI_APP_DIR="$ROOT" MI_SYSTEM_ROOT="$SYSTEM_ROOT" MI_PHOTON_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-imessage-stack-root.sh"
 run_stage generated-entrypoints env MI_STACK_HOME="$TARGET_HOME" "$ROOT/scripts/install-mi-home-entrypoints.sh"
 run_stage readiness env \
   MI_SERVICE_USER="$SERVICE_USER" \

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -16,6 +16,9 @@ const advisorRoot = join(root, 'advisor-skill');
 await mkdir(sessionsRoot, { recursive: true });
 await mkdir(join(home, 'mi', 'state'), { recursive: true });
 await mkdir(advisorRoot, { recursive: true });
+const privateExtensions = join(home, 'assistant', 'pi', 'extensions');
+await mkdir(privateExtensions, { recursive: true });
+for (const file of ['mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await copyFile(new URL(`../pi/extensions/${file}`, import.meta.url), join(privateExtensions, file));
 await writeFile(join(advisorRoot, 'SKILL.md'), '# Advisor fixture\n');
 
 const fakePiJsPath = join(root, 'fake-pi.js');

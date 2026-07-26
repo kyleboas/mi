@@ -11,16 +11,31 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
-import { miDaemonPath as miDaemonPathFor } from '../dist/src/mi-runtime-paths.js';
 import { buildImessageCompletionPrompt, IMESSAGE_V2_LIMITS, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
 import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
 import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
+import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
+// Check these immediately before a process can spawn. Keeping this lazy lets
+// read-only web status checks report a missing daemon instead of starting one.
+let reviewedMiPaths;
+function reviewedPrivateMiPaths() {
+  reviewedMiPaths ||= reviewedMiExtensionPaths({
+    root,
+    daemonPath: process.env.MI_DAEMON_PATH,
+    capabilityGuardPath: process.env.MI_CAPABILITY_GUARD,
+    capabilityAdapterPath: process.env.MI_CAPABILITY_ADAPTER,
+    requireDaemon: true,
+    requireGuard: true,
+    requireAdapter: true,
+  });
+  return reviewedMiPaths;
+}
 const stateDir = path.join(root, 'state', 'threads');
 const host = process.env.MI_WEB_HOST || '127.0.0.1';
 const port = Number(process.env.MI_WEB_PORT || 8787);
@@ -44,8 +59,7 @@ const miPreferencesPath = path.join(home, 'mi', 'preferences.md');
 const miMemoryPath = path.join(home, 'mi', 'memory.md');
 const miRuntimeDir = process.env.MI_RUNTIME_DIR || path.join(home, '.pi', 'agent', 'mi');
 const miSocketPath = process.env.MI_SOCKET_PATH || path.join(miRuntimeDir, 'main.sock');
-// The daemon stays in the reviewed Mi tree. Do not use Pi's auto-load folder.
-const miDaemonPath = miDaemonPathFor(process.env, home);
+// The daemon path is checked against the reviewed private Mi tree before use.
 const miDaemonSystemdUnit = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const miDaemonHost = process.env.MI_DAEMON_HOST || path.join(home, 'bin', 'mi-daemon-host');
 const workerModel = process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low';
@@ -106,7 +120,7 @@ function reducedPiEnv(extra = {}) {
 }
 
 function capabilityGuardPath() {
-  return process.env.MI_CAPABILITY_GUARD || path.join(root, 'pi', 'extensions', 'mi-capability-guard.ts');
+  return reviewedPrivateMiPaths().capabilityGuardPath;
 }
 
 async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }, rights = ['read']) {
@@ -588,7 +602,7 @@ async function startMiDaemon() {
   await mkdir(path.dirname(miSocketPath), { recursive: true });
   if (await startMiDaemonWithSystemd()) return;
   if (existsSync(miDaemonHost) && await runQuiet(miDaemonHost, [], 30000) && await waitForMiDaemonHealth(5000)) return;
-  const child = spawn(process.execPath, [miDaemonPath], {
+  const child = spawn(process.execPath, [reviewedPrivateMiPaths().daemonPath], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir },
@@ -671,7 +685,7 @@ async function runLoopDiscoveryCli(args, timeoutMs = 60000) {
   const miBin = process.env.MI_BIN || (existsSync(localTsx) ? localTsx : 'mi');
   const cliArgs = miBin === localTsx ? [path.join(root, 'src', 'cli.ts'), 'loop-discovery', ...args] : ['loop-discovery', ...args];
   return await new Promise((resolve) => {
-    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_DISCOVERY_STATE_PATH: loopDiscoveryStatePath, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: miDaemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_DISCOVERY_STATE_PATH: loopDiscoveryStatePath, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: reviewedPrivateMiPaths().daemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
@@ -728,7 +742,7 @@ async function runLoopFactoryCli(args, timeoutMs = 60000) {
   const miBin = process.env.MI_BIN || (existsSync(localTsx) ? localTsx : 'mi');
   const cliArgs = miBin === localTsx ? [path.join(root, 'src', 'cli.ts'), 'loop-factory', ...args] : ['loop-factory', ...args];
   return await new Promise((resolve) => {
-    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_FACTORY_STATE_PATH: loopFactoryStatePath, MI_LOOP_FACTORY_NOTES_PATH: loopFactoryNotesPath, MI_LOOP_FACTORY_WORKFLOWS_DIR: loopFactoryWorkflowsDir, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: miDaemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_FACTORY_STATE_PATH: loopFactoryStatePath, MI_LOOP_FACTORY_NOTES_PATH: loopFactoryNotesPath, MI_LOOP_FACTORY_WORKFLOWS_DIR: loopFactoryWorkflowsDir, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: reviewedPrivateMiPaths().daemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
@@ -2194,7 +2208,7 @@ async function runImessageChat(message, threadId) {
   const prompt = `${persona}${memory}${history}\n\nReply to this iMessage naturally.\n\nUser message:\n${message}`;
   const tools = process.env.MI_IMESSAGE_TOOLS || process.env.MI_CHAT_TOOLS || 'read,grep,find,ls';
   const guard = capabilityGuardPath();
-  const guardArgs = existsSync(guard) ? ['--no-extensions', '--extension', guard] : ['--no-extensions'];
+  const guardArgs = ['--no-extensions', '--extension', guard];
   const grantsFile = await writeCapabilityGrantsFile(home, 'chat-read', { id: 'mi-imessage', type: 'imessage', displayName: 'Mi iMessage' });
   const auditFile = path.join(miRuntimeDir, 'capability-audit.jsonl');
   const baseArgs = ['--mode', 'json', '--no-session', '--no-context-files', ...guardArgs, '--no-skills', '--no-prompt-templates', '--no-themes', '--tools', tools];
@@ -2339,7 +2353,7 @@ async function v2ClearPendingAction(threadId) {
 }
 
 function coordinatorAdapterPath() {
-  return process.env.MI_ORCHESTRATOR_ADAPTER || path.join(root, 'pi', 'extensions', 'mi-orchestrator-adapter.ts');
+  return reviewedPrivateMiPaths().capabilityAdapterPath;
 }
 
 async function writeCoordinatorPolicyFile({ correlationId, objective, workspace, allowWrite, advisorSelections = [] }) {
@@ -2482,7 +2496,8 @@ async function startImessageCoordinator(threadId, message, plan) {
     const history = await recentThreadContextForWorker(threadId, message);
     const guard = capabilityGuardPath();
     const adapter = coordinatorAdapterPath();
-    if (!existsSync(guard) || !existsSync(adapter)) throw new Error('Mi coordinator safety tools are unavailable.');
+    const reviewed = reviewedPrivateMiPaths();
+    if (guard !== reviewed.capabilityGuardPath || adapter !== reviewed.capabilityAdapterPath) throw new Error('Mi coordinator safety tools are unavailable.');
     const coordinatorGrants = await writeCapabilityGrantsFile(workspace.cwd, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read']);
     const coordinatorPolicy = await writeCoordinatorPolicyFile({ correlationId, objective: plan.objective, workspace, allowWrite: plan.allowWrite, advisorSelections: plan.advisorSelections });
     const launch = miCoordinatorLaunch({
