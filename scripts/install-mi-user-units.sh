@@ -132,6 +132,20 @@ for entry in "${path_entries[@]}"; do
   SERVICE_PATH+="${SERVICE_PATH:+:}$entry"
 done
 
+# The reviewed pre-hardening daemon used the invoking user's XDG runtime
+# location and a distinct PATH. These migration bytes must not inherit any
+# caller-provided runtime or PATH values.
+LEGACY_RUNTIME_DIR="/run/user/$(id -u)/mi"
+require_safe_path "$LEGACY_RUNTIME_DIR" legacy-runtime-directory
+LEGACY_SERVICE_PATH="$NODE_DIR:$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin"
+IFS=: read -r -a path_entries <<< "$LEGACY_SERVICE_PATH"
+LEGACY_SERVICE_PATH=""
+for entry in "${path_entries[@]}"; do
+  require_safe_path "$entry" legacy-PATH
+  [[ ":$LEGACY_SERVICE_PATH:" == *":$entry:"* ]] && continue
+  LEGACY_SERVICE_PATH+="${LEGACY_SERVICE_PATH:+:}$entry"
+done
+
 PROACTIVE_NOTICE="${MI_PROACTIVE_IMESSAGE_NOTIFY:-false}"
 MONITOR_ENABLED="${MI_IMESSAGE_MONITOR_ENABLED:-false}"
 case "$PROACTIVE_NOTICE" in true|false|1|0|yes|no|on|off) ;; *) fail 'MI_PROACTIVE_IMESSAGE_NOTIFY must be a boolean' ;; esac
@@ -312,10 +326,10 @@ WorkingDirectory=$ROOT
 ExecStart=$NODE_BIN $HOME_DIR/.pi/agent/extensions/mi-daemon.mjs
 Restart=on-failure
 RestartSec=5
-Environment=MI_SOCKET_PATH=$RUNTIME_DIR/main.sock
-Environment=MI_RUNTIME_DIR=$RUNTIME_DIR
+Environment=MI_SOCKET_PATH=$LEGACY_RUNTIME_DIR/main.sock
+Environment=MI_RUNTIME_DIR=$LEGACY_RUNTIME_DIR
 Environment=MI_ROOT=$ROOT
-Environment=PATH=$SERVICE_PATH
+Environment=PATH=$LEGACY_SERVICE_PATH
 PrivateTmp=true
 ProtectSystem=full
 

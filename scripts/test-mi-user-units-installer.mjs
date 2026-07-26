@@ -21,6 +21,8 @@ const run = (home, extra = {}) => spawnSync('bash', ['scripts/install-mi-user-un
   encoding: 'utf8',
 });
 const file = async (name) => readFile(name, 'utf8');
+const legacyRuntimeDir = `/run/user/${process.getuid()}/mi`;
+const legacyServicePath = (home) => `${path.dirname(node)}:${path.join(home, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin`;
 const legacyDaemon = (home) => `[Unit]
 Description=Mi daemon (task/socket worker supervisor)
 After=network-online.target
@@ -31,10 +33,30 @@ WorkingDirectory=${miRoot}
 ExecStart=${node} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
 Restart=on-failure
 RestartSec=5
-Environment=MI_SOCKET_PATH=${path.join(home, '.pi', 'agent', 'mi', 'main.sock')}
-Environment=MI_RUNTIME_DIR=${path.join(home, '.pi', 'agent', 'mi')}
+Environment=MI_SOCKET_PATH=${legacyRuntimeDir}/main.sock
+Environment=MI_RUNTIME_DIR=${legacyRuntimeDir}
 Environment=MI_ROOT=${miRoot}
-Environment=PATH=${path.dirname(node)}:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${legacyServicePath(home)}
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target
+`;
+const expectedLegacyDaemon = (home) => `[Unit]
+Description=Mi daemon (task/socket worker supervisor)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${miRoot}
+ExecStart=${node} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
+Restart=on-failure
+RestartSec=5
+Environment=MI_SOCKET_PATH=/run/user/${process.getuid()}/mi/main.sock
+Environment=MI_RUNTIME_DIR=/run/user/${process.getuid()}/mi
+Environment=MI_ROOT=${miRoot}
+Environment=PATH=${path.dirname(node)}:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin
 PrivateTmp=true
 ProtectSystem=full
 
@@ -160,6 +182,10 @@ try {
   // known bundle; an absent drop-in directory fails before mutation.
   const legacyPath = path.join(unitDir, 'mi-daemon.service');
   const legacyDropin = path.join(unitDir, 'mi-daemon.service.d');
+  // Keep this fixture independently pinned to the observed legacy bytes.
+  assert.equal(legacyDaemon(home), expectedLegacyDaemon(home), 'accepted legacy fixture exactly matches the observed unit');
+  assert.match(legacyDaemon(home), new RegExp(`Environment=MI_RUNTIME_DIR=/run/user/${process.getuid()}/mi`));
+  assert.match(legacyDaemon(home), new RegExp(`Environment=PATH=${path.dirname(node).replace(/[./]/g, '\\$&')}:${path.join(home, '.local', 'bin').replace(/[./]/g, '\\$&')}:`));
   await writeFile(legacyPath, legacyDaemon(home));
   const beforeMissingDropin = await readFile(legacyPath);
   result = run(home);
@@ -184,6 +210,10 @@ try {
     legacyDaemon(home).replace('extensions/mi-daemon.mjs', 'extensions/other-daemon.mjs'),
     legacyDaemon(home).replace('Restart=on-failure', 'ExecStartPre=/bin/true\nRestart=on-failure'),
     legacyDaemon(home).replace('Environment=PATH=', 'Environment=HOME=${home}\nEnvironment=PATH='),
+    legacyDaemon(home)
+      .replace(`Environment=MI_SOCKET_PATH=${legacyRuntimeDir}/main.sock`, `Environment=MI_SOCKET_PATH=${path.join(home, '.pi', 'agent', 'mi', 'main.sock')}`)
+      .replace(`Environment=MI_RUNTIME_DIR=${legacyRuntimeDir}`, `Environment=MI_RUNTIME_DIR=${path.join(home, '.pi', 'agent', 'mi')}`)
+      .replace(`Environment=PATH=${legacyServicePath(home)}`, `Environment=PATH=${path.dirname(node)}:/usr/local/bin:/usr/bin:/bin`),
     legacyDaemon(home).replace('PrivateTmp=true\n', ''),
     legacyDaemon(home).replace('ProtectSystem=full', 'ProtectSystem=false'),
     `${legacyDaemon(home)}\n`,
