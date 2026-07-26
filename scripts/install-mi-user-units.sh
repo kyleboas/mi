@@ -309,14 +309,15 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$ROOT
-Environment=HOME=$HOME_DIR
-Environment=MI_ROOT=$ROOT
-Environment=MI_SOCKET_PATH=$RUNTIME_DIR/main.sock
-Environment=MI_RUNTIME_DIR=$RUNTIME_DIR
-Environment=PATH=$SERVICE_PATH
 ExecStart=$NODE_BIN $HOME_DIR/.pi/agent/extensions/mi-daemon.mjs
 Restart=on-failure
 RestartSec=5
+Environment=MI_SOCKET_PATH=$RUNTIME_DIR/main.sock
+Environment=MI_RUNTIME_DIR=$RUNTIME_DIR
+Environment=MI_ROOT=$ROOT
+Environment=PATH=$SERVICE_PATH
+PrivateTmp=true
+ProtectSystem=full
 
 [Install]
 WantedBy=default.target
@@ -350,11 +351,15 @@ is_known_legacy_daemon_unit() {
 # drop-in. Migration accepts only the complete bundle, including exact types,
 # modes, and bytes, rather than attempting to parse untrusted systemd input.
 legacy_daemon_dropin_dir="$stage/legacy-mi-daemon.service.d"
-legacy_daemon_dropin="$legacy_daemon_dropin_dir/10-limit.conf"
+legacy_daemon_dropin="$legacy_daemon_dropin_dir/resource-limits.conf"
 mkdir -m 755 -- "$legacy_daemon_dropin_dir"
 cat > "$legacy_daemon_dropin" <<'EOF'
 [Service]
-LimitNOFILE=65536
+MemoryMax=600M
+MemoryHigh=450M
+CPUQuota=75%
+Environment=NODE_OPTIONS=--max-old-space-size=384
+OOMPolicy=stop
 EOF
 chmod 644 "$legacy_daemon_dropin"
 assert_known_legacy_daemon_dropins() {
@@ -367,7 +372,7 @@ assert_known_legacy_daemon_dropins() {
   shopt -s nullglob dotglob
   entries=("$target"/*)
   shopt -u nullglob dotglob
-  [[ "${#entries[@]}" == 1 && "${entries[0]}" == "$target/10-limit.conf" ]] || fail "refusing unknown legacy daemon drop-in bundle: $target"
+  [[ "${#entries[@]}" == 1 && "${entries[0]}" == "$target/resource-limits.conf" ]] || fail "refusing unknown legacy daemon drop-in bundle: $target"
   assert_safe_existing_file "${entries[0]}" 'legacy daemon drop-in file'
   mode="$(stat -c '%a' -- "${entries[0]}")"
   [[ "$mode" == 644 ]] || fail "legacy daemon drop-in file has an unexpected mode: ${entries[0]}"

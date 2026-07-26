@@ -28,14 +28,15 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${miRoot}
-Environment=HOME=${home}
-Environment=MI_ROOT=${miRoot}
-Environment=MI_SOCKET_PATH=${path.join(home, '.pi', 'agent', 'mi', 'main.sock')}
-Environment=MI_RUNTIME_DIR=${path.join(home, '.pi', 'agent', 'mi')}
-Environment=PATH=${path.dirname(node)}:/usr/local/bin:/usr/bin:/bin
 ExecStart=${node} ${path.join(home, '.pi', 'agent', 'extensions', 'mi-daemon.mjs')}
 Restart=on-failure
 RestartSec=5
+Environment=MI_SOCKET_PATH=${path.join(home, '.pi', 'agent', 'mi', 'main.sock')}
+Environment=MI_RUNTIME_DIR=${path.join(home, '.pi', 'agent', 'mi')}
+Environment=MI_ROOT=${miRoot}
+Environment=PATH=${path.dirname(node)}:/usr/local/bin:/usr/bin:/bin
+PrivateTmp=true
+ProtectSystem=full
 
 [Install]
 WantedBy=default.target
@@ -167,8 +168,8 @@ try {
   await rm(legacyDropin, { recursive: true, force: true });
   await mkdir(legacyDropin, { recursive: true });
   await chmod(legacyDropin, 0o755);
-  await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n');
-  await chmod(path.join(legacyDropin, '10-limit.conf'), 0o644);
+  await writeFile(path.join(legacyDropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n');
+  await chmod(path.join(legacyDropin, 'resource-limits.conf'), 0o644);
   const callsBeforeLegacyMigration = await file(calls);
   result = run(home);
   assert.equal(result.status, 0, result.stderr);
@@ -182,7 +183,9 @@ try {
     legacyDaemon(home).replace('task/socket worker supervisor', 'changed daemon'),
     legacyDaemon(home).replace('extensions/mi-daemon.mjs', 'extensions/other-daemon.mjs'),
     legacyDaemon(home).replace('Restart=on-failure', 'ExecStartPre=/bin/true\nRestart=on-failure'),
-    legacyDaemon(home).replace('Environment=PATH=', 'Environment=EXTRA=1\nEnvironment=PATH='),
+    legacyDaemon(home).replace('Environment=PATH=', 'Environment=HOME=${home}\nEnvironment=PATH='),
+    legacyDaemon(home).replace('PrivateTmp=true\n', ''),
+    legacyDaemon(home).replace('ProtectSystem=full', 'ProtectSystem=false'),
     `${legacyDaemon(home)}\n`,
   ]) {
     await writeFile(legacyPath, changedLegacy);
@@ -203,9 +206,9 @@ try {
   for (const [name, prepare] of [
     ['empty', async () => {}],
     ['unknown', async () => { await writeFile(path.join(legacyDropin, 'operator.conf'), '[Service]\nEnvironment=KEEP=1\n'); }],
-    ['extra', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n'); await writeFile(path.join(legacyDropin, '20-extra.conf'), '[Service]\n'); }],
-    ['altered', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65537\n'); }],
-    ['mode', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n'); await chmod(path.join(legacyDropin, '10-limit.conf'), 0o600); }],
+    ['extra', async () => { await writeFile(path.join(legacyDropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n'); await writeFile(path.join(legacyDropin, '20-extra.conf'), '[Service]\n'); }],
+    ['altered', async () => { await writeFile(path.join(legacyDropin, 'resource-limits.conf'), '[Service]\nMemoryMax=601M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n'); }],
+    ['mode', async () => { await writeFile(path.join(legacyDropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n'); await chmod(path.join(legacyDropin, 'resource-limits.conf'), 0o600); }],
   ]) {
     await rm(legacyDropin, { recursive: true, force: true });
     await mkdir(legacyDropin, { recursive: true });
@@ -234,7 +237,7 @@ try {
   assert.notEqual(result.status, 0, 'symlinked legacy drop-in file is rejected');
   await rm(legacyDropin, { recursive: true, force: true });
   await mkdir(legacyDropin, { recursive: true });
-  await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n');
+  await writeFile(path.join(legacyDropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n');
   await chmod(legacyDropin, 0o777);
   await writeFile(legacyPath, legacyDaemon(home));
   result = run(home);
@@ -267,8 +270,8 @@ try {
   const dropin = path.join(unitDir, 'mi-daemon.service.d');
   await mkdir(dropin, { recursive: true });
   await chmod(dropin, 0o755);
-  await writeFile(path.join(dropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n');
-  await chmod(path.join(dropin, '10-limit.conf'), 0o644);
+  await writeFile(path.join(dropin, 'resource-limits.conf'), '[Service]\nMemoryMax=600M\nMemoryHigh=450M\nCPUQuota=75%\nEnvironment=NODE_OPTIONS=--max-old-space-size=384\nOOMPolicy=stop\n');
+  await chmod(path.join(dropin, 'resource-limits.conf'), 0o644);
   const failingBin = path.join(temp, 'failing-bin');
   const mvCount = path.join(temp, 'mv-count');
   const rollbackTmp = path.join(temp, 'rollback-tmp');
@@ -277,16 +280,16 @@ try {
   await writeFile(path.join(failingBin, 'mv'), `#!/bin/sh\nn=0; [ -f ${JSON.stringify(mvCount)} ] && n=$(cat ${JSON.stringify(mvCount)})\nn=$((n + 1)); echo "$n" > ${JSON.stringify(mvCount)}\n[ "$n" -eq 5 ] && exit 91\nexec /bin/mv "$@"\n`);
   await chmod(path.join(failingBin, 'mv'), 0o700);
   const beforeFailure = await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name))));
-  const beforeFailureDropin = await readFile(path.join(dropin, '10-limit.conf'));
+  const beforeFailureDropin = await readFile(path.join(dropin, 'resource-limits.conf'));
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await rm(mvCount, { force: true });
     result = run(home, { PATH: `${failingBin}:${process.env.PATH}`, TMPDIR: rollbackTmp });
     assert.notEqual(result.status, 0);
     assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name)))), beforeFailure, 'rollback restores every legacy unit byte-for-byte');
-    assert.deepEqual(await readdir(dropin), ['10-limit.conf'], 'rollback restores the complete legacy drop-in directory');
-    assert.deepEqual(await readFile(path.join(dropin, '10-limit.conf')), beforeFailureDropin, 'rollback restores legacy drop-in bytes');
+    assert.deepEqual(await readdir(dropin), ['resource-limits.conf'], 'rollback restores the complete legacy drop-in directory');
+    assert.deepEqual(await readFile(path.join(dropin, 'resource-limits.conf')), beforeFailureDropin, 'rollback restores legacy drop-in bytes');
     assert.equal((await stat(dropin)).mode & 0o777, 0o755, 'rollback restores legacy drop-in directory mode');
-    assert.equal((await stat(path.join(dropin, '10-limit.conf'))).mode & 0o777, 0o644, 'rollback restores legacy drop-in file mode');
+    assert.equal((await stat(path.join(dropin, 'resource-limits.conf'))).mode & 0o777, 0o644, 'rollback restores legacy drop-in file mode');
   }
   assert.deepEqual(await readdir(rollbackTmp), [], 'rollback removes temporary folders');
 
