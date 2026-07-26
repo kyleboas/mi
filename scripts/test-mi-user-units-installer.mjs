@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -154,10 +154,21 @@ try {
     assert.equal(spawnSync('test', ['-e', path.join(isolated, '.config', 'systemd', 'user')]).status, 1);
   }
 
-  // The exact reviewed legacy daemon is migrated without activation. Its
-  // auto-load path is accepted only as part of this complete known shape.
+  // The exact reviewed legacy daemon and resource-limit drop-in are migrated
+  // without activation. The auto-load path is accepted only as this complete
+  // known bundle; an absent drop-in directory fails before mutation.
   const legacyPath = path.join(unitDir, 'mi-daemon.service');
+  const legacyDropin = path.join(unitDir, 'mi-daemon.service.d');
   await writeFile(legacyPath, legacyDaemon(home));
+  const beforeMissingDropin = await readFile(legacyPath);
+  result = run(home);
+  assert.notEqual(result.status, 0, 'missing legacy drop-in directory is rejected');
+  assert.deepEqual(await readFile(legacyPath), beforeMissingDropin, 'missing drop-in rejection preserves legacy unit bytes');
+  await rm(legacyDropin, { recursive: true, force: true });
+  await mkdir(legacyDropin, { recursive: true });
+  await chmod(legacyDropin, 0o755);
+  await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n');
+  await chmod(path.join(legacyDropin, '10-limit.conf'), 0o644);
   const callsBeforeLegacyMigration = await file(calls);
   result = run(home);
   assert.equal(result.status, 0, result.stderr);
@@ -187,14 +198,14 @@ try {
   assert.notEqual(result.status, 0, 'NUL bytes cannot be recognized as a legacy unit');
   assert.deepEqual(await readFile(legacyPath), nulLegacy, 'NUL legacy unit stays byte-for-byte unchanged');
 
-  // Every existing legacy daemon drop-in must be the reviewed whole bundle.
-  // The reviewed bundle has no files, so unknown, extra, altered, and linked
-  // entries all fail before any target mutation.
-  const legacyDropin = path.join(unitDir, 'mi-daemon.service.d');
+  // Every legacy daemon drop-in must match the reviewed whole bundle. Unknown,
+  // extra, altered, and linked entries all fail before any target mutation.
   for (const [name, prepare] of [
+    ['empty', async () => {}],
     ['unknown', async () => { await writeFile(path.join(legacyDropin, 'operator.conf'), '[Service]\nEnvironment=KEEP=1\n'); }],
     ['extra', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n'); await writeFile(path.join(legacyDropin, '20-extra.conf'), '[Service]\n'); }],
     ['altered', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65537\n'); }],
+    ['mode', async () => { await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n'); await chmod(path.join(legacyDropin, '10-limit.conf'), 0o600); }],
   ]) {
     await rm(legacyDropin, { recursive: true, force: true });
     await mkdir(legacyDropin, { recursive: true });
@@ -223,6 +234,7 @@ try {
   assert.notEqual(result.status, 0, 'symlinked legacy drop-in file is rejected');
   await rm(legacyDropin, { recursive: true, force: true });
   await mkdir(legacyDropin, { recursive: true });
+  await writeFile(path.join(legacyDropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n');
   await chmod(legacyDropin, 0o777);
   await writeFile(legacyPath, legacyDaemon(home));
   result = run(home);
@@ -254,6 +266,9 @@ try {
   await writeFile(legacyPath, legacyDaemon(home));
   const dropin = path.join(unitDir, 'mi-daemon.service.d');
   await mkdir(dropin, { recursive: true });
+  await chmod(dropin, 0o755);
+  await writeFile(path.join(dropin, '10-limit.conf'), '[Service]\nLimitNOFILE=65536\n');
+  await chmod(path.join(dropin, '10-limit.conf'), 0o644);
   const failingBin = path.join(temp, 'failing-bin');
   const mvCount = path.join(temp, 'mv-count');
   const rollbackTmp = path.join(temp, 'rollback-tmp');
@@ -262,12 +277,16 @@ try {
   await writeFile(path.join(failingBin, 'mv'), `#!/bin/sh\nn=0; [ -f ${JSON.stringify(mvCount)} ] && n=$(cat ${JSON.stringify(mvCount)})\nn=$((n + 1)); echo "$n" > ${JSON.stringify(mvCount)}\n[ "$n" -eq 5 ] && exit 91\nexec /bin/mv "$@"\n`);
   await chmod(path.join(failingBin, 'mv'), 0o700);
   const beforeFailure = await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name))));
+  const beforeFailureDropin = await readFile(path.join(dropin, '10-limit.conf'));
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await rm(mvCount, { force: true });
     result = run(home, { PATH: `${failingBin}:${process.env.PATH}`, TMPDIR: rollbackTmp });
     assert.notEqual(result.status, 0);
     assert.deepEqual(await Promise.all(['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'].map((name) => readFile(path.join(unitDir, name)))), beforeFailure, 'rollback restores every legacy unit byte-for-byte');
-    assert.deepEqual(await readdir(dropin), [], 'rollback restores the complete legacy drop-in directory');
+    assert.deepEqual(await readdir(dropin), ['10-limit.conf'], 'rollback restores the complete legacy drop-in directory');
+    assert.deepEqual(await readFile(path.join(dropin, '10-limit.conf')), beforeFailureDropin, 'rollback restores legacy drop-in bytes');
+    assert.equal((await stat(dropin)).mode & 0o777, 0o755, 'rollback restores legacy drop-in directory mode');
+    assert.equal((await stat(path.join(dropin, '10-limit.conf'))).mode & 0o777, 0o644, 'rollback restores legacy drop-in file mode');
   }
   assert.deepEqual(await readdir(rollbackTmp), [], 'rollback removes temporary folders');
 
