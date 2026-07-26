@@ -30,6 +30,9 @@ try {
 
   await mkdir(autoLoad, { recursive: true });
   await mkdir(projectAutoLoad, { recursive: true });
+  await mkdir(path.join(home, 'workflows'), { recursive: true });
+  await mkdir(path.join(home, '.pi', 'agent', 'mi'), { recursive: true });
+  await mkdir(path.join(home, 'mi'), { recursive: true });
   const privateRoot = path.join(temp, 'private-mi');
   const privateExtensions = path.join(privateRoot, 'pi', 'extensions');
   await mkdir(privateExtensions, { recursive: true });

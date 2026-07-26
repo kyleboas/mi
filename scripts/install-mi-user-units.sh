@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Install Mi's private user units. Installation does not activate any unit.
+# Install Mi's private user units. Installation writes files only; it never
+# reloads, enables, starts, restarts, or otherwise activates a unit.
 set -Eeuo pipefail
 umask 077
 
 fail() { echo "Mi user-unit install failed: $*" >&2; exit 1; }
-unsafe_systemd_path() {
-  [[ -z "$1" || "$1" != /* || "$1" == *'%'* || "$1" == *$'\n'* || "$1" == *$'\r'* || "$1" == *$'\t'* || "$1" =~ [[:space:]] || "$1" == *'\\'* || "$1" == *'"'* || "$1" == *"'"* ]]
+# These values are rendered into systemd fields or PATH entries. Keep their
+# grammar deliberately smaller than shell paths so systemd cannot reinterpret
+# a value as an expansion, specifier, list, or quoted argument.
+safe_systemd_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]
 }
-require_safe_path() { if unsafe_systemd_path "$1"; then fail "unsafe path for $2"; fi; }
+require_safe_path() { safe_systemd_path "$1" || fail "unsafe path for $2"; }
 canonical_dir() {
   local value="$1" label="$2" result
   require_safe_path "$value" "$label"
@@ -19,7 +23,7 @@ canonical_dir() {
 canonical_executable() {
   local value="$1" label="$2" result
   require_safe_path "$value" "$label"
-  [[ -f "$value" && -x "$value" ]] || fail "$label is not an executable file: $value"
+  [[ -f "$value" && -x "$value" && ! -L "$value" ]] || fail "$label is not an executable file: $value"
   result="$(readlink -f -- "$value")"
   [[ -f "$result" && -x "$result" ]] || fail "$label does not resolve to an executable file"
   require_safe_path "$result" "$label"
@@ -35,9 +39,7 @@ ROOT="$(canonical_dir "$RAW_ROOT" MI_APP_DIR)"
 HOME_DIR="$(canonical_dir "$RAW_HOME" HOME)"
 RAW_CONFIG="${XDG_CONFIG_HOME:-$HOME_DIR/.config}"
 require_safe_path "$RAW_CONFIG" XDG_CONFIG_HOME
-# The config directory may be new, but it must still be an unambiguous child of
-# the target home. This prevents root's inherited XDG settings from being used.
-case "$RAW_CONFIG" in "$HOME_DIR"|"$HOME_DIR"/*) ;; *) fail 'XDG_CONFIG_HOME must be under the target service user HOME' ;; esac
+case "$RAW_CONFIG" in "$HOME_DIR"/*) ;; *) fail 'XDG_CONFIG_HOME must be under the target service user HOME' ;; esac
 CONFIG_DIR="$RAW_CONFIG"
 UNIT_DIR="$CONFIG_DIR/systemd/user"
 require_safe_path "$UNIT_DIR" unit-directory
@@ -50,11 +52,26 @@ require_safe_path "$DAEMON_PATH" daemon-path
 DAEMON_PATH="$(readlink -f -- "$DAEMON_PATH")"
 case "$DAEMON_PATH" in "$ROOT"/pi/extensions/mi-daemon.mjs) ;; *) fail 'reviewed daemon escapes the private Mi extension root' ;; esac
 
-# Do not inherit a caller PATH. It is deterministic and contains only the two
-# reviewed executable directories plus system command directories.
+# The daemon's only writable Pi runtime folder is its own Mi subfolder. A
+# write-scoped worker also needs its configured workflow directory.
+RAW_WORKFLOWS_DIR="${MI_WORKFLOWS_DIR:-$HOME_DIR/workflows}"
+require_safe_path "$RAW_WORKFLOWS_DIR" MI_WORKFLOWS_DIR
+case "$RAW_WORKFLOWS_DIR" in "$HOME_DIR"/*) ;; *) fail 'MI_WORKFLOWS_DIR must be under the target service user HOME' ;; esac
+WORKFLOWS_DIR="$(canonical_dir "$RAW_WORKFLOWS_DIR" MI_WORKFLOWS_DIR)"
+STATE_DIR="$(canonical_dir "$ROOT/state" state-directory)"
+RUNTIME_DIR="$(canonical_dir "$HOME_DIR/.pi/agent/mi" runtime-directory)"
+MI_HOME_DIR="$(canonical_dir "$HOME_DIR/mi" mi-home-directory)"
+for rendered_path in "$STATE_DIR" "$RUNTIME_DIR" "$MI_HOME_DIR" "$WORKFLOWS_DIR"; do
+  [[ -w "$rendered_path" ]] || fail "$rendered_path is not writable"
+done
+
+# Do not inherit a caller PATH. It has exactly the reviewed executable folders
+# followed by fixed system folders. Validate every individual PATH member.
 path_part() { dirname "$1"; }
-SERVICE_PATH="$(path_part "$NODE_BIN"):$(path_part "$MI_BIN"):/usr/local/bin:/usr/bin:/bin"
-# Remove duplicate path entries while keeping the reviewed Node and Mi paths first.
+NODE_DIR="$(path_part "$NODE_BIN")"
+MI_DIR="$(path_part "$MI_BIN")"
+for rendered_path in "$NODE_DIR" "$MI_DIR" /usr/local/bin /usr/bin /bin; do require_safe_path "$rendered_path" PATH; done
+SERVICE_PATH="$NODE_DIR:$MI_DIR:/usr/local/bin:/usr/bin:/bin"
 IFS=: read -r -a path_entries <<< "$SERVICE_PATH"
 SERVICE_PATH=""
 for entry in "${path_entries[@]}"; do
@@ -67,11 +84,17 @@ MONITOR_ENABLED="${MI_IMESSAGE_MONITOR_ENABLED:-false}"
 case "$PROACTIVE_NOTICE" in true|false|1|0|yes|no|on|off) ;; *) fail 'MI_PROACTIVE_IMESSAGE_NOTIFY must be a boolean' ;; esac
 case "$MONITOR_ENABLED" in true|false|1|0|yes|no|on|off) ;; *) fail 'MI_IMESSAGE_MONITOR_ENABLED must be a boolean' ;; esac
 
+# All values above are checked before either temporary or target state exists.
 stage="$(mktemp -d "${TMPDIR:-/tmp}/mi-user-units-render.XXXXXX")"
 backup="$(mktemp -d "${TMPDIR:-/tmp}/mi-user-units-backup.XXXXXX")"
 manifest="$backup/manifest"
 : > "$manifest"
 committed=0
+rolled_back=0
+config_dir_existed=0
+systemd_dir_existed=0
+[[ -d "$CONFIG_DIR" ]] && config_dir_existed=1
+[[ -d "$CONFIG_DIR/systemd" ]] && systemd_dir_existed=1
 backup_target() {
   local target="$1" key
   key="$(printf '%s' "$target" | sha256sum | cut -d' ' -f1)"
@@ -82,9 +105,10 @@ backup_target() {
     printf 'absent\t-\t%s\n' "$target" >> "$manifest"
   fi
 }
+cleanup() { rm -rf -- "$stage" "$backup"; }
 rollback() {
-  local status=$?
-  (( committed == 1 )) && return
+  (( rolled_back == 1 )) && return
+  rolled_back=1
   while IFS=$'\t' read -r state key target; do
     rm -rf -- "$target"
     if [[ "$state" == present ]]; then
@@ -92,12 +116,23 @@ rollback() {
       cp -a -- "$backup/$key" "$target"
     fi
   done < "$manifest"
-  rm -rf -- "$stage" "$backup"
+  # Remove only parent folders this failed first install created. Existing
+  # empty folders are preserved, while an absent unit tree returns to absent.
+  (( systemd_dir_existed == 1 )) || rmdir -- "$CONFIG_DIR/systemd" 2>/dev/null || true
+  (( config_dir_existed == 1 )) || rmdir -- "$CONFIG_DIR" 2>/dev/null || true
+  cleanup
+}
+on_exit() {
+  local status=$?
+  trap - EXIT ERR INT TERM HUP
+  (( committed == 1 )) || rollback
   exit "$status"
 }
-cleanup() { rm -rf -- "$stage" "$backup"; }
-trap rollback ERR INT TERM
-trap '(( committed == 1 )) && cleanup || true' EXIT
+trap on_exit EXIT
+trap 'exit $?' ERR
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cat > "$stage/mi-daemon.service" <<EOF
 [Unit]
@@ -109,6 +144,7 @@ Type=simple
 WorkingDirectory=$ROOT
 Environment=HOME=$HOME_DIR
 Environment=MI_ROOT=$ROOT
+Environment=MI_WORKFLOWS_DIR=$WORKFLOWS_DIR
 Environment=PATH=$SERVICE_PATH
 ExecStart=$NODE_BIN $DAEMON_PATH
 Restart=on-failure
@@ -117,7 +153,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 NoNewPrivileges=true
-ReadWritePaths=$ROOT/state $HOME_DIR/.pi/agent $HOME_DIR/mi
+ReadWritePaths=$STATE_DIR $RUNTIME_DIR $MI_HOME_DIR $WORKFLOWS_DIR
 
 [Install]
 WantedBy=default.target
@@ -131,6 +167,7 @@ Type=oneshot
 WorkingDirectory=$ROOT
 Environment=HOME=$HOME_DIR
 Environment=MI_ROOT=$ROOT
+Environment=MI_WORKFLOWS_DIR=$WORKFLOWS_DIR
 Environment=PATH=$SERVICE_PATH
 Environment=MI_PROACTIVE_IMESSAGE_NOTIFY=false
 Environment=MI_IMESSAGE_MONITOR_ENABLED=false
@@ -141,7 +178,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 NoNewPrivileges=true
-ReadWritePaths=$ROOT/state $HOME_DIR/.pi/agent $HOME_DIR/mi
+ReadWritePaths=$STATE_DIR $RUNTIME_DIR $MI_HOME_DIR $WORKFLOWS_DIR
 EOF
 cat > "$stage/mi-tick.timer" <<'EOF'
 [Unit]
@@ -156,17 +193,14 @@ Persistent=true
 WantedBy=timers.target
 EOF
 chmod 600 "$stage"/*
-# Check all generated text before the target unit directory changes.
 grep -Fqx "Environment=PATH=$SERVICE_PATH" "$stage/mi-daemon.service" || fail 'daemon PATH rendering failed'
+grep -Fqx "Environment=MI_WORKFLOWS_DIR=$WORKFLOWS_DIR" "$stage/mi-daemon.service" || fail 'daemon workflow rendering failed'
 grep -Fqx 'Environment=MI_PROACTIVE_IMESSAGE_NOTIFY=false' "$stage/mi-tick.service" || fail 'tick notice safety rendering failed'
 grep -Fqx 'Environment=MI_IMESSAGE_MONITOR_ENABLED=false' "$stage/mi-tick.service" || fail 'tick monitor safety rendering failed'
 if command -v systemd-analyze >/dev/null && [[ ${MI_USER_UNITS_SKIP_SYSTEMD_VERIFY:-0} != 1 ]]; then
   systemd-analyze verify "$stage/mi-daemon.service" "$stage/mi-tick.service" "$stage/mi-tick.timer" >/dev/null
 fi
 
-# Do not replace an unrelated administrator unit or a former unsafe Mi unit.
-# The small description check accepts older generated Mi units so safe reruns
-# can tighten them, but contamination is always a hard failure.
 assert_replaceable_unit() {
   local target="$1" description="$2"
   [[ ! -e "$target" && ! -L "$target" ]] && return 0
@@ -177,9 +211,12 @@ assert_replaceable_unit() {
 assert_replaceable_unit "$UNIT_DIR/mi-daemon.service" 'Mi background task daemon'
 assert_replaceable_unit "$UNIT_DIR/mi-tick.service" 'Mi scheduled tick'
 assert_replaceable_unit "$UNIT_DIR/mi-tick.timer" 'Run Mi scheduled tick'
-install -d -m 700 "$UNIT_DIR"
 for target in "$UNIT_DIR/mi-daemon.service" "$UNIT_DIR/mi-tick.service" "$UNIT_DIR/mi-tick.timer" \
   "$UNIT_DIR/mi-daemon.service.d" "$UNIT_DIR/mi-tick.service.d" "$UNIT_DIR/mi-tick.timer.d"; do backup_target "$target"; done
+# Put this snapshot last so rollback restores the complete old directory after
+# individual files, and removes a directory that did not exist before a run.
+backup_target "$UNIT_DIR"
+install -d -m 700 "$UNIT_DIR"
 for name in mi-daemon.service mi-tick.service mi-tick.timer; do
   temp="$UNIT_DIR/.${name}.tmp.$$"
   cp -- "$stage/$name" "$temp"
@@ -187,17 +224,7 @@ for name in mi-daemon.service mi-tick.service mi-tick.timer; do
   mv -f -- "$temp" "$UNIT_DIR/$name"
 done
 
-if [[ ${MI_USER_UNITS_NO_SYSTEMD:-0} != 1 ]]; then
-  systemctl --user daemon-reload
-  if [[ ${MI_USER_UNITS_ACTIVATE_DAEMON:-0} == 1 ]]; then
-    systemctl --user enable --now mi-daemon.service
-  fi
-  if [[ ${MI_USER_UNITS_ACTIVATE_TIMER:-0} == 1 ]]; then
-    [[ -n ${MI_PROACTIVE_IMESSAGE_NOTIFY+x} && -n ${MI_IMESSAGE_MONITOR_ENABLED+x} ]] || fail 'timer activation requires explicit notice and monitor values'
-    systemctl --user enable --now mi-tick.timer
-  fi
-fi
 committed=1
 cleanup
-trap - ERR INT TERM EXIT
-echo 'Installed Mi daemon and tick user units without starting them'
+trap - EXIT ERR INT TERM HUP
+echo 'Installed Mi daemon and tick user units without activating them'

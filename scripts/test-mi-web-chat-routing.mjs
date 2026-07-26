@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
 
 const source = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
 const routingSource = await readFile(new URL('./mi-imessage-routing.mjs', import.meta.url), 'utf8');
@@ -86,5 +89,43 @@ assert.match(photonSource, /server\.listen\(notifyPort, notifyHost/, 'Photon bri
 assert.match(photonSource, /localOnly\(req\)/, 'Photon notify endpoint rejects non-local callers');
 assert.match(notifySource, /MI_PROACTIVE_IMESSAGE_NOTIFY/, 'Mi notifications can opt into iMessage delivery');
 assert.match(notifySource, /127\.0\.0\.1:\$\{process\.env\.MI_PHOTON_NOTIFY_PORT \|\| '8788'\}\/notify/, 'Mi notifications use the local Photon notify endpoint by default');
+
+// This executes the real daemon-start path. Missing, symlinked, and escaped
+// reviewed paths must fail before mkdir, systemctl, helper, or child spawn.
+const daemonStartTemp = await mkdtemp(path.join(os.tmpdir(), 'mi-web-daemon-start-'));
+try {
+  const privateRoot = path.join(daemonStartTemp, 'private-mi');
+  const extensions = path.join(privateRoot, 'pi', 'extensions');
+  await mkdir(extensions, { recursive: true });
+  const makeReviewedFiles = async () => {
+    for (const name of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await writeFile(path.join(extensions, name), 'export {};\\n');
+  };
+  const runInvalidStart = (extra = {}) => {
+    const calls = path.join(daemonStartTemp, `calls-${Math.random().toString(36).slice(2)}`);
+    const result = spawnSync(process.execPath, ['scripts/mi-web-chat.mjs'], {
+      cwd: path.resolve(import.meta.dirname, '..'),
+      env: { ...process.env, MI_ROOT: privateRoot, MI_WEB_CHAT_TEST_START_DAEMON: '1', MI_WEB_CHAT_TEST_SPAWN_LOG: calls, ...extra },
+      encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0, result.stderr);
+    assert.equal(spawnSync('test', ['-e', calls]).status, 1, `invalid start made a side effect: ${result.stderr}`);
+  };
+  await writeFile(path.join(extensions, 'mi-daemon.mjs'), 'export {};\\n');
+  await writeFile(path.join(extensions, 'mi-orchestrator-adapter.ts'), 'export {};\\n');
+  runInvalidStart();
+  await makeReviewedFiles();
+  const guard = path.join(extensions, 'mi-capability-guard.ts');
+  await rm(guard);
+  await writeFile(path.join(daemonStartTemp, 'outside-guard.ts'), 'export {};\\n');
+  await symlink(path.join(daemonStartTemp, 'outside-guard.ts'), guard);
+  runInvalidStart();
+  await rm(guard);
+  await writeFile(guard, 'export {};\\n');
+  const escaped = path.join(daemonStartTemp, 'escaped-daemon.mjs');
+  await writeFile(escaped, 'export {};\\n');
+  runInvalidStart({ MI_DAEMON_PATH: escaped });
+} finally {
+  await rm(daemonStartTemp, { recursive: true, force: true });
+}
 
 console.log('Mi web chat routing checks passed.');

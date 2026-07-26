@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { appendFile, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
@@ -572,8 +572,17 @@ async function waitForMiDaemonHealth(timeoutMs = 5000) {
   return false;
 }
 
+function recordDaemonStartSpawn(command) {
+  // This opt-in hook is only used by the isolated behavior test. It records
+  // attempted side effects, including failed executable lookups.
+  if (process.env.MI_WEB_CHAT_TEST_SPAWN_LOG) {
+    try { appendFileSync(process.env.MI_WEB_CHAT_TEST_SPAWN_LOG, `${command}\n`); } catch {}
+  }
+}
+
 function runQuiet(command, args, timeoutMs = 10000) {
   return new Promise((resolve) => {
+    recordDaemonStartSpawn(command);
     const child = spawn(command, args, { stdio: 'ignore' });
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
@@ -599,10 +608,14 @@ async function startMiDaemonWithSystemd() {
 }
 
 async function startMiDaemon() {
+  // Validate every reviewed private path before mkdir, systemctl, a helper,
+  // or a fallback child process can make a side effect.
+  const privatePaths = reviewedPrivateMiPaths();
   await mkdir(path.dirname(miSocketPath), { recursive: true });
   if (await startMiDaemonWithSystemd()) return;
   if (existsSync(miDaemonHost) && await runQuiet(miDaemonHost, [], 30000) && await waitForMiDaemonHealth(5000)) return;
-  const child = spawn(process.execPath, [reviewedPrivateMiPaths().daemonPath], {
+  recordDaemonStartSpawn(process.execPath);
+  const child = spawn(process.execPath, [privatePaths.daemonPath], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir },
@@ -2834,22 +2847,33 @@ async function handle(req, res) {
   }
 }
 
-await ensureMainThread();
-await loadActiveWorkers();
-setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
-void monitorBackgroundWorkers().catch(() => undefined);
-const server = http.createServer(handle);
-server.listen(port, host, () => {
-  console.log(`Mi web chat listening on http://${host}:${port}`);
-});
-
-if (httpsPort && tlsCertPath && tlsKeyPath) {
-  const tls = {
-    cert: await readFile(tlsCertPath, 'utf8'),
-    key: await readFile(tlsKeyPath, 'utf8'),
-  };
-  const secureServer = https.createServer(tls, handle);
-  secureServer.listen(httpsPort, host, () => {
-    console.log(`Mi web chat listening on https://${host}:${httpsPort}`);
+if (process.env.MI_WEB_CHAT_TEST_START_DAEMON === '1') {
+  // Keep the daemon-start behavior test in this process so it observes actual
+  // imports and path checks instead of matching source text.
+  try {
+    await startMiDaemon();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+} else {
+  await ensureMainThread();
+  await loadActiveWorkers();
+  setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
+  void monitorBackgroundWorkers().catch(() => undefined);
+  const server = http.createServer(handle);
+  server.listen(port, host, () => {
+    console.log(`Mi web chat listening on http://${host}:${port}`);
   });
+
+  if (httpsPort && tlsCertPath && tlsKeyPath) {
+    const tls = {
+      cert: await readFile(tlsCertPath, 'utf8'),
+      key: await readFile(tlsKeyPath, 'utf8'),
+    };
+    const secureServer = https.createServer(tls, handle);
+    secureServer.listen(httpsPort, host, () => {
+      console.log(`Mi web chat listening on https://${host}:${httpsPort}`);
+    });
+  }
 }

@@ -16,14 +16,17 @@ const sudoCount = path.join(tmp, 'sudo-count');
 await writeFile(path.join(bin, 'sudo'), `#!/bin/bash\necho sudo >> ${JSON.stringify(sudoCount)}\n[[ $1 == -- ]] && shift\nexec "$@"\n`);
 await chmod(path.join(bin, 'sudo'), 0o700);
 const stageNames = ['production-gateway', 'production-registry', 'gateway-client', 'tailscale-web', 'user-units', 'photon-loopback', 'readiness'];
+const userStages = new Set(['production-registry', 'gateway-client', 'tailscale-web', 'user-units']);
 const stageLog = path.join(tmp, 'stage-log');
+const stageEnvLog = path.join(tmp, 'stage-env-log');
 for (const name of stageNames) {
   const gatewayValues = name === 'production-gateway'
     ? `printf '%s\\n' "$MI_GATEWAY_SERVICE_USER|$MI_GATEWAY_SERVICE_HOME|$MI_GATEWAY_PI_BINARY|$MI_GATEWAY_PI_COMMAND_DIR|$MI_GATEWAY_PI_AGENT_DIR|$MI_GATEWAY_WORK_DIR|$MI_GATEWAY_HEALTH_COMMAND|$MI_GATEWAY_HEALTH_USER" > ${JSON.stringify(path.join(tmp, 'gateway-values'))}\n`
-    : name === 'production-registry'
-      ? `printf '%s\\n' "$HOME|$XDG_CONFIG_HOME|$XDG_DATA_HOME|$PATH" > ${JSON.stringify(path.join(tmp, 'registry-env'))}\n`
-      : '';
-  await writeFile(path.join(stages, name), `#!/bin/sh\necho ${name} >> ${JSON.stringify(stageLog)}\n${gatewayValues}`);
+    : '';
+  const recordedEnvironment = userStages.has(name)
+    ? `printf '%s|%s|%s|%s|%s|%s\\n' ${name} "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$PATH" "\${ROOT_XDG_LEAK-unset}" >> ${JSON.stringify(stageEnvLog)}\n`
+    : '';
+  await writeFile(path.join(stages, name), `#!/bin/sh\necho ${name} >> ${JSON.stringify(stageLog)}\n${gatewayValues}${recordedEnvironment}`);
   await chmod(path.join(stages, name), 0o700);
 }
 const env = {
@@ -44,6 +47,10 @@ const env = {
   MI_GATEWAY_HEALTH_COMMAND: path.join(tmp, 'other-health-command'),
   MI_GATEWAY_HEALTH_USER: 'other-health',
   MI_NODE_BIN: process.execPath,
+  HOME: '/root/inherited-home',
+  XDG_CONFIG_HOME: '/root/inherited-config',
+  XDG_DATA_HOME: '/root/inherited-data',
+  ROOT_XDG_LEAK: 'must-not-reach-service-stage',
 };
 const run = (args = [], extra = {}) => spawnSync('bash', [path.join(repo, 'scripts/install-mi-stack.sh'), ...args], { env: { ...env, ...extra }, encoding: 'utf8' });
 
@@ -62,9 +69,17 @@ assert.equal(
   `other-user|${home}|${path.join(tmp, 'pi-real')}|${bin}|${path.join(home, '.pi/agent')}|${path.join(tmp, 'gateway-work')}|${path.join(tmp, 'other-health-command')}|other-health`,
   'stack forwards all portable gateway settings',
 );
-const rootInstallerText = await readFile(path.join(repo, 'scripts/install-mi-stack-root.sh'), 'utf8');
-assert.match(rootInstallerText, /run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR=/, 'production registry crosses the service-user boundary');
-assert.match(rootInstallerText, /env HOME="\$TARGET_HOME" XDG_CONFIG_HOME="\$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="\$TARGET_XDG_DATA_HOME" PATH="\$TARGET_SERVICE_PATH"/, 'service-user stages clear root HOME, XDG, and PATH values');
+const recordedUserStages = (await readFile(stageEnvLog, 'utf8')).trim().split('\n');
+assert.equal(recordedUserStages.length, userStages.size, 'every service-user stage records its clean environment');
+for (const line of recordedUserStages) {
+  const [name, recordedHome, recordedConfig, recordedData, recordedPath, inherited] = line.split('|');
+  assert.ok(userStages.has(name));
+  assert.equal(recordedHome, home);
+  assert.equal(recordedConfig, path.join(home, '.config'));
+  assert.equal(recordedData, path.join(home, '.local/share'));
+  assert.equal(recordedPath, `${path.dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`);
+  assert.equal(inherited, 'unset', `${name} must not inherit root caller variables`);
+}
 assert.equal((await stat(path.join(home, 'install-mi-stack.sh'))).mode & 0o777, 0o700);
 assert.match(await readFile(path.join(home, 'install-mi-stack.sh'), 'utf8'), /MI-GENERATED: install-mi-stack-v1/);
 result = run();

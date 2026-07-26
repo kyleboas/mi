@@ -48,9 +48,10 @@ The web installer similarly removes only exact known Mi-owned predecessor drop-i
 
 The stack install writes files only. It does not enable or start the web service, Photon bridge, daemon, or timer. It writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and `MI_IMESSAGE_MONITOR_ENABLED=false` into the tick unit.
 
-Review the installed daemon path, `PrivateTmp=true`, `ProtectSystem=full`, fixed service-user PATH, and the disabled tick settings. Then reload user units and start only the daemon:
+First run the file and readiness check, then review the installed daemon path, `PrivateTmp=true`, `ProtectSystem=full`, fixed service-user PATH, writable workflow directory, and the disabled tick settings. Only after those checks should an operator reload user units and start the daemon:
 
 ```bash
+/home/kyle/install-mi-stack.sh --check
 systemctl --user daemon-reload
 systemctl --user enable --now mi-daemon.service
 ```

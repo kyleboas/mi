@@ -89,6 +89,26 @@ if [[ -z "$SYSTEM_ROOT" && ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
+STACK_NODE_BIN="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
+safe_stack_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]; }
+require_stack_path() { safe_stack_path "$1" || { echo "Mi stack preflight failed: unsafe $2" >&2; exit 1; }; }
+require_stack_path "$ROOT" MI_APP_DIR
+require_stack_path "$TARGET_HOME" MI_STACK_HOME
+require_stack_path "$STACK_NODE_BIN" MI_NODE_BIN
+[[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo 'Mi stack preflight failed: unsafe MI_SERVICE_USER' >&2; exit 1; }
+# Never derive service paths from a root caller environment. The service home
+# is an existing, canonical target-account directory; XDG roots are fixed
+# children of it and PATH comes only from the reviewed Node path and system dirs.
+[[ -d "$TARGET_HOME" && ! -L "$TARGET_HOME" ]] || { echo 'Mi stack preflight failed: MI_STACK_HOME must be a real directory' >&2; exit 1; }
+TARGET_HOME="$(cd "$TARGET_HOME" && pwd -P)"
+require_stack_path "$TARGET_HOME" MI_STACK_HOME
+[[ -x "$STACK_NODE_BIN" && ! -L "$STACK_NODE_BIN" ]] || { echo 'Mi stack preflight failed: MI_NODE_BIN must be an executable file' >&2; exit 1; }
+STACK_NODE_BIN="$(readlink -f -- "$STACK_NODE_BIN")"
+require_stack_path "$STACK_NODE_BIN" MI_NODE_BIN
+TARGET_XDG_CONFIG_HOME="$TARGET_HOME/.config"
+TARGET_XDG_DATA_HOME="$TARGET_HOME/.local/share"
+TARGET_SERVICE_PATH="${STACK_NODE_BIN%/*}:/usr/local/bin:/usr/bin:/bin"
+
 backup="$(mktemp -d "${TMPDIR:-/tmp}/mi-stack-rollback.XXXXXX")"
 manifest="$backup/manifest"
 : > "$manifest"
@@ -149,22 +169,36 @@ run_stage() {
   current_stage="$1"; shift
   echo "Mi stack stage: $current_stage"
   if [[ -n ${MI_STACK_STAGE_COMMAND_DIR:-} && -x "$MI_STACK_STAGE_COMMAND_DIR/$current_stage" ]]; then
-    "$MI_STACK_STAGE_COMMAND_DIR/$current_stage"
+    # Test stages replace only the stage executable. Keep the as_user boundary
+    # and its explicit VAR=value arguments, but remove a normal interpreter
+    # and its source-file argument as one command.
+    if [[ "$1" == as_user ]]; then
+      shift
+      local user_command=(env)
+      [[ "$1" == env ]] && shift
+      while (( $# )) && [[ "$1" == *=* ]]; do
+        user_command+=("$1")
+        shift
+      done
+      user_command+=("$MI_STACK_STAGE_COMMAND_DIR/$current_stage")
+      as_user "${user_command[@]}"
+    else
+      local command=("$@")
+      local last=$((${#command[@]} - 1))
+      command[$last]="$MI_STACK_STAGE_COMMAND_DIR/$current_stage"
+      "${command[@]}"
+    fi
   else
     "$@"
   fi
 }
-TARGET_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$TARGET_HOME/.config}"
-TARGET_XDG_DATA_HOME="${XDG_DATA_HOME:-$TARGET_HOME/.local/share}"
-STACK_NODE_BIN="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
-TARGET_SERVICE_PATH="${MI_STACK_SERVICE_PATH:-${STACK_NODE_BIN%/*}:/usr/local/bin:/usr/bin:/bin}"
 as_user() {
-  # runuser otherwise keeps too much of the root caller environment. Every
-  # service-user stage gets its target home, XDG roots, and a fixed PATH.
+  # env -i drops root HOME, XDG roots, PATH, and every other inherited value.
+  # Arguments following it are the only explicit variables allowed per stage.
   if [[ -n "$SYSTEM_ROOT" || ${MI_STACK_NO_RUNUSER:-0} == 1 ]]; then
-    env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="$TARGET_XDG_DATA_HOME" PATH="$TARGET_SERVICE_PATH" "$@"
+    env -i HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="$TARGET_XDG_DATA_HOME" PATH="$TARGET_SERVICE_PATH" "$@"
   else
-    runuser -u "${MI_SERVICE_USER:-kyle}" -- env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="$TARGET_XDG_DATA_HOME" PATH="$TARGET_SERVICE_PATH" "$@"
+    runuser -u "$SERVICE_USER" -- env -i HOME="$TARGET_HOME" XDG_CONFIG_HOME="$TARGET_XDG_CONFIG_HOME" XDG_DATA_HOME="$TARGET_XDG_DATA_HOME" PATH="$TARGET_SERVICE_PATH" "$@"
   fi
 }
 

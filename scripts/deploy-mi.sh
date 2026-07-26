@@ -42,8 +42,10 @@ node dist/src/cli.js tick
 
 restart_user_unit() {
   local unit="$1"
-  if systemctl --user list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit"; then
-    systemctl --user restart "$unit"
+  # A deploy refreshes only a unit that was already running. try-restart keeps
+  # this true even if it stops between the check and the command.
+  if systemctl --user is-active --quiet "$unit"; then
+    systemctl --user try-restart "$unit"
   fi
 }
 
