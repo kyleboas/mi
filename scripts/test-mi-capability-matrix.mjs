@@ -52,6 +52,7 @@ const coverage = {
     continue_worker: ['test-mi-cli-surfaces.mjs', 'test-mi-worker-error-continue.mjs', 'test-mi-worker-result-report.mjs'],
     list_tasks: ['test-mi-cli-surfaces.mjs', 'test-mi-agent-e2e.mjs'],
     stop_task: ['test-mi-agent-e2e.mjs'],
+    worker_state: ['test-mi-agent-e2e.mjs'],
     dismiss_task: ['test-mi-agent-render-snapshot.mjs'],
     list_pi_sessions: ['test-mi-agent-e2e.mjs'],
     resume_session: ['test-mi-agent-e2e.mjs'],
@@ -67,11 +68,11 @@ const coverage = {
     'GET /api/push/public-key': ['test-mi-web-api-e2e.mjs'],
     'POST /api/push/subscribe': ['test-mi-web-api-e2e.mjs'],
     'GET /api/threads': ['test-mi-web-api-e2e.mjs'],
-    'GET /api/messages': ['test-mi-web-api-e2e.mjs'],
+    'GET /api/worker-state': ['test-mi-web-api-e2e.mjs'],
+    'GET /api/thread-state': ['test-mi-web-api-e2e.mjs', 'test-mi-web-chat-routing.mjs'],
     'POST /api/notify': ['test-mi-web-api-e2e.mjs'],
     'POST /api/send': ['test-mi-web-api-e2e.mjs', 'test-mi-web-chat-routing.mjs'],
     'POST /api/photo': ['test-mi-web-api-e2e.mjs'],
-    'POST /api/imessage': ['test-mi-web-api-e2e.mjs', 'test-mi-imessage-scenarios.mjs'],
   },
 };
 

@@ -1,0 +1,725 @@
+#!/usr/bin/env node
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { realpathSync, statSync } from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
+import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
+import { diverNotesPreflight } from './mi-diver-notes-intent.mjs';
+import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
+import { redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
+import { directAdvisorSelections, v2RouteDecision } from './mi-web-chat-v2-route.mjs';
+import { emitTurnEvent } from './mi-turn-observability.mjs';
+
+const root = process.env.MI_ROOT || path.join(os.homedir(), 'assistant');
+const maxReplyChars = boundedInteger(process.env.MI_IMESSAGE_MAX_REPLY_CHARS, 1200, 120, 6000);
+const maxMessageChars = boundedInteger(process.env.MI_WEB_MAX_MESSAGE_CHARS, 4000, 1, 16000);
+const maxCompletionChars = boundedInteger(process.env.MI_IMESSAGE_COMPLETION_MAX_CHARS, maxReplyChars, 120, 6000);
+const coordinatorTimeoutMs = boundedInteger(process.env.MI_IMESSAGE_COORDINATOR_TIMEOUT_MS, 90_000, 1000, 10 * 60_000);
+const taskPollMs = boundedInteger(process.env.MI_IMESSAGE_TASK_POLL_MS, 250, 25, 5000);
+const maxConversations = boundedInteger(process.env.MI_IMESSAGE_CONCURRENCY, 4, 1, 16);
+const confirmationObjectiveMaxChars = 240;
+const coordinatorObjectiveMaxChars = boundedInteger(process.env.MI_COORDINATOR_OBJECTIVE_MAX_CHARS, 4000, 240, 16 * 1024);
+const deliverySchemaVersion = 1;
+const terminalTaskStatuses = new Set(['complete', 'completed', 'done', 'error', 'stopped', 'inactive']);
+const incompleteStatuses = new Set(['received', 'running', 'interrupted']);
+
+export const IMESSAGE_REPLIES = Object.freeze({
+  retryIdentity: 'Please retry that message. I need its upstream ID and timestamp before I can process it.',
+  startFailure: 'I could not start that request. Please try again.',
+  sessionFailure: 'I could not reopen this conversation safely. Please try again.',
+  timeout: 'That request took too long to finish. Please try again.',
+  interruption: 'That request was interrupted before it finished. Please try again.',
+  missingEvidence: 'I could not verify the completed result. Please try again.',
+  sendFailure: 'I finished the request, but I could not send the reply. Please try again.',
+  prohibited: 'I cannot handle secret, destructive, financial, or authentication actions from iMessage.',
+  confirmationMissing: 'I cannot find a pending action for that confirmation.',
+  confirmationCancelled: 'Okay, I will not proceed with that action.',
+  workspace: 'I need an existing approved workspace before I can start that work.',
+  objectiveTooLong: 'Please send a shorter request. I cannot safely store this exact action.',
+  clarify: 'What exactly should I act on?',
+});
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= minimum && number <= maximum ? number : fallback;
+}
+
+function isoNow() {
+  return new Date().toISOString();
+}
+
+function safeId(value) {
+  const id = String(value || '').trim();
+  return /^[A-Za-z0-9._:-]{1,200}$/.test(id) ? id : '';
+}
+
+function normalizeIdentity(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function digest(value) {
+  return createHash('sha256').update(String(value)).digest('hex');
+}
+
+function stableConversationIdentity(space, message) {
+  const spaceId = normalizeIdentity(space?.id || message?.space?.id);
+  if (spaceId) return { kind: 'photon-space', value: spaceId };
+  const sender = normalizeIdentity(message?.sender?.id || space?.phone || message?.space?.phone);
+  if (sender) return { kind: 'imessage-sender', value: sender };
+  return undefined;
+}
+
+export function conversationIdFor(space, message) {
+  const identity = stableConversationIdentity(space, message);
+  return identity ? `imessage-${digest(JSON.stringify(identity)).slice(0, 32)}` : undefined;
+}
+
+export function upstreamMessageId(message) {
+  return [message?.id, message?.messageId, message?.eventId, message?.guid]
+    .map((value) => String(value || '').trim()).find(Boolean) || '';
+}
+
+export function stableMessageTimestamp(message) {
+  const value = message?.timestamp || message?.createdAt || message?.date;
+  if (value === undefined || value === null || String(value).trim() === '') return '';
+  const parsed = typeof value === 'number' && Number.isFinite(value) ? value : Date.parse(String(value));
+  return Number.isFinite(parsed) && parsed > 0 ? new Date(parsed).toISOString() : '';
+}
+
+export function deliveryIdFor(conversationId, message) {
+  const upstreamId = upstreamMessageId(message);
+  if (!conversationId || !upstreamId) return undefined;
+  return digest(JSON.stringify({ version: 1, conversationId, upstreamId }));
+}
+
+function contentTextFor(content) {
+  if (!content || typeof content !== 'object') return '';
+  if (content.type === 'text') return String(content.text || '').trim();
+  if (content.type === 'richlink') return String(content.url || '').trim();
+  if (content.type === 'reaction') return String(content.emoji ? `reaction: ${content.emoji}` : 'reaction').trim();
+  if (content.type === 'group') return (Array.isArray(content.items) ? content.items : []).map((item) => contentTextFor(item?.content || item)).filter(Boolean).join('\n').trim();
+  if (content.type === 'attachment') return '[the user sent an attachment]';
+  if (content.type === 'voice') return '[the user sent a voice message]';
+  return '[the user sent something I cannot read here]';
+}
+
+export function messageTextFor(message) {
+  return contentTextFor(message?.content).slice(0, maxMessageChars);
+}
+
+export function requestDigestFor(conversationId, message, text, timestamp) {
+  return digest(JSON.stringify({
+    version: 1,
+    conversationId,
+    upstreamId: upstreamMessageId(message),
+    timestamp,
+    direction: String(message?.direction || ''),
+    text: String(text || ''),
+  }));
+}
+
+function cleanReply(value, fallback = IMESSAGE_REPLIES.missingEvidence) {
+  const text = redactV2Text(String(value || '')).replace(/[—–]/g, '-').replace(/\0/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  if (!text) return fallback;
+  const controlReply = /^Action class: [a-z][a-z0-9_-]*\.\s+Exact objective: [\s\S]+?\s+This could make a real change or contact another service\. Reply "(?:confirm|deny) [a-f0-9]{32}"/i.test(text)
+    || /^I still need confirmation for the pending action\.\s+Reply confirm [a-f0-9]{32} or deny [a-f0-9]{32}\.$/i.test(text);
+  const safe = sanitizeImessageCompletion(text, '');
+  if (!safe && !controlReply) return fallback;
+  const candidate = safe || text;
+  return candidate
+    .replace(/(?:~|\/)(?:home|Users|tmp)\/[A-Za-z0-9_.@/:-]+/g, '[private path]')
+    .replace(/\b(?:task|thread|session|correlation)[ _-]?(?:id)?\s*[:=]\s*[A-Za-z0-9._:-]{6,}\b/gi, '[private id]')
+    .replace(/\b(?:photon|pi|worker|daemon|gateway|routing|handoff|prompt|model)\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim().slice(0, maxCompletionChars) || fallback;
+}
+
+function conversationDirectory(conversationId, stateRoot) {
+  return path.join(stateRoot, 'imessage', 'conversations', conversationId);
+}
+
+async function ensurePrivateDirectory(directory) {
+  const existing = await lstat(directory).catch((error) => error?.code === 'ENOENT' ? undefined : null);
+  if (existing === null || (existing && (!existing.isDirectory() || existing.isSymbolicLink()))) throw new Error('private directory is not a real directory');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const verified = await lstat(directory);
+  if (!verified.isDirectory() || verified.isSymbolicLink()) throw new Error('private directory is not a real directory');
+  await chmod(directory, 0o700);
+}
+
+async function atomicJsonWrite(file, value) {
+  const directory = path.dirname(file);
+  await ensurePrivateDirectory(directory);
+  const temporary = `${file}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  const content = JSON.stringify(value, null, 2);
+  let handle;
+  try {
+    handle = await open(temporary, 'wx', 0o600);
+    await handle.writeFile(content, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await chmod(temporary, 0o600);
+    await rename(temporary, file);
+    await chmod(file, 0o600);
+    const directoryHandle = await open(directory, 'r');
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+async function readJson(file) {
+  try {
+    const info = await lstat(file);
+    if (!info.isFile() || (info.mode & 0o077) !== 0 || info.size > 256 * 1024) return undefined;
+    return JSON.parse(await readFile(file, 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function deliveryIncomplete(status) {
+  return incompleteStatuses.has(status);
+}
+
+function deliveryFile(directory, deliveryId) {
+  return path.join(directory, 'deliveries', `${deliveryId}.json`);
+}
+
+function boundedDelivery(record) {
+  const next = { ...record };
+  if (deliveryIncomplete(next.status)) next.rawMessage = String(next.rawMessage || '').slice(0, maxMessageChars);
+  else delete next.rawMessage;
+  if (next.completionReply) next.completionReply = cleanReply(next.completionReply);
+  next.taskIds = Array.isArray(next.taskIds) ? next.taskIds.filter((id) => safeId(id)).slice(0, 32) : [];
+  return next;
+}
+
+async function writeDelivery(file, record) {
+  await atomicJsonWrite(file, boundedDelivery(record));
+}
+
+async function listDeliveryFiles(directory) {
+  let entries = [];
+  try { entries = await readdir(path.join(directory, 'deliveries'), { withFileTypes: true }); } catch { return []; }
+  return entries.filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/.test(entry.name)).map((entry) => path.join(directory, 'deliveries', entry.name));
+}
+
+async function validateSessionFile(file) {
+  try {
+    const info = await lstat(file);
+    if (!info.isFile() || (info.mode & 0o077) !== 0 || info.size > 16 * 1024 * 1024) return false;
+    const text = await readFile(file, 'utf8');
+    for (const line of text.split('\n').filter(Boolean)) JSON.parse(line);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return true;
+    return false;
+  }
+}
+
+async function ensurePrivateFile(file) {
+  await ensurePrivateDirectory(path.dirname(file));
+  const existing = await lstat(file).catch((error) => error?.code === 'ENOENT' ? undefined : null);
+  if (existing === null || (existing && !existing.isFile())) throw new Error('private file is not a regular file');
+  const handle = await open(file, 'a', 0o600);
+  try { await handle.sync(); } finally { await handle.close(); }
+  await chmod(file, 0o600);
+}
+
+async function recoverStaleRunning(stateRoot) {
+  const base = path.join(stateRoot, 'imessage', 'conversations');
+  let conversations = [];
+  try { conversations = await readdir(base, { withFileTypes: true }); } catch { return; }
+  for (const entry of conversations) {
+    if (!entry.isDirectory() || !/^imessage-[a-f0-9]{32}$/.test(entry.name)) continue;
+    const directory = path.join(base, entry.name);
+    for (const file of await listDeliveryFiles(directory)) {
+      const record = await readJson(file);
+      if (!record || record.status !== 'running') continue;
+      record.status = 'interrupted';
+      record.interruptedAt = isoNow();
+      delete record.runningAt;
+      delete record.rawMessage;
+      await writeDelivery(file, record);
+    }
+  }
+}
+
+function workspaceFromEnvironment() {
+  const workspaceRootSetting = String(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(os.homedir(), 'workflows')).trim();
+  const workspaceCwdSetting = String(process.env.MI_IMESSAGE_WORKSPACE_CWD || workspaceRootSetting).trim();
+  try {
+    const rootPath = realpathSync(workspaceRootSetting);
+    const cwdPath = realpathSync(workspaceCwdSetting);
+    const relative = path.relative(rootPath, cwdPath);
+    if (rootPath === os.homedir() || rootPath !== path.resolve(workspaceRootSetting) || cwdPath !== path.resolve(workspaceCwdSetting)) return undefined;
+    if (!statSync(rootPath).isDirectory() || !statSync(cwdPath).isDirectory()) return undefined;
+    if (relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)) return undefined;
+    return { root: rootPath, cwd: cwdPath };
+  } catch { return undefined; }
+}
+
+function reducedEnvironment(extra = {}) {
+  const allowed = ['PATH', 'HOME', 'USER', 'LOGNAME', 'HOSTNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'TMP', 'TEMP', 'PI_PROVIDER', 'PI_MODEL', 'PI_CONFIG_DIR', 'PI_GATEWAY_URL', 'AGENT_GATEWAY_URL'];
+  const env = {};
+  for (const key of allowed) if (process.env[key] !== undefined) env[key] = process.env[key];
+  return { ...env, ...extra };
+}
+
+function coordinatorTaskIds(taskIds) {
+  return [...new Set(taskIds.filter((id) => safeId(id)))];
+}
+
+function taskIsTerminal(task) {
+  return Boolean(task?.finishedAt || terminalTaskStatuses.has(String(task?.status || '').toLowerCase()));
+}
+
+function daemonRequest(socketPath, payload, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    let buffer = '';
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error('daemon timeout')); }, timeoutMs);
+    socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`));
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      if (!buffer.includes('\n')) return;
+      clearTimeout(timer);
+      socket.destroy();
+      try {
+        const response = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
+        if (response.ok !== true) reject(new Error('daemon rejected request'));
+        else resolve(response);
+      } catch { reject(new Error('daemon sent invalid response')); }
+    });
+    socket.on('error', () => { clearTimeout(timer); reject(new Error('daemon unavailable')); });
+  });
+}
+
+async function ensureDaemon(socketPath, reviewedDaemonPath = '') {
+  try { await daemonRequest(socketPath, { type: 'health' }, 800); return true; } catch {}
+  const daemonPath = reviewedDaemonPath || process.env.MI_DAEMON_PATH || path.join(root, 'pi', 'extensions', 'mi-daemon.mjs');
+  try {
+    const child = spawn(process.execPath, [daemonPath], { cwd: root, env: reducedEnvironment({ MI_ROOT: root, MI_SOCKET_PATH: socketPath, MI_RUNTIME_DIR: process.env.MI_RUNTIME_DIR }), detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch { return false; }
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try { await daemonRequest(socketPath, { type: 'health' }, 500); return true; } catch { await new Promise((resolve) => setTimeout(resolve, 100)); }
+  }
+  return false;
+}
+
+async function writeCapabilityGrant(directory, workspace, diverNotesAccess) {
+  const grantsDirectory = path.join(directory, 'runtime');
+  await ensurePrivateDirectory(grantsDirectory);
+  const createdAt = isoNow();
+  const grants = [{
+    id: `imessage-${Date.now().toString(36)}`,
+    resource: `file://${workspace.cwd}`,
+    rights: ['read'],
+    constraints: { recursive: true, profile: 'mi-main-orchestrator' },
+    principal: { id: 'mi-imessage', type: 'imessage', displayName: 'Mi iMessage runtime' },
+    createdAt,
+    expiresAt: new Date(Date.now() + 6 * 60 * 60_000).toISOString(),
+  }];
+  if (diverNotesAccess === 'read' || diverNotesAccess === 'write') grants.push({
+    id: `imessage-diver-notes-${Date.now().toString(36)}`,
+    resource: 'diver-notes://vault',
+    rights: diverNotesAccess === 'write' ? ['read', 'write'] : ['read'],
+    constraints: { exact: true, profile: 'diver-notes' },
+    principal: { id: 'mi-imessage', type: 'imessage', displayName: 'Mi iMessage runtime' },
+    createdAt,
+    expiresAt: new Date(Date.now() + 6 * 60 * 60_000).toISOString(),
+  });
+  const file = path.join(grantsDirectory, `capabilities-${Date.now().toString(36)}.json`);
+  await atomicJsonWrite(file, { profile: 'mi-main-orchestrator', grants });
+  return file;
+}
+
+async function writeCoordinatorPolicy(file, { correlationId, objective, workspace, allowWrite, advisorSelections, socketPath }) {
+  await atomicJsonWrite(file, {
+    version: 1, correlationId, objective, workspaceRoot: workspace.root, workspaceCwd: workspace.cwd,
+    socketPath, allowWrite: allowWrite === true, advisorSelections, advisorTaskIds: [],
+  });
+}
+
+async function readPolicyTaskIds(file) {
+  const value = await readJson(file);
+  return Array.isArray(value?.advisorTaskIds) ? coordinatorTaskIds(value.advisorTaskIds) : [];
+}
+
+async function waitForDaemonTasks(ids, request, timeoutMs, onTimeout) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = [];
+  while (Date.now() < deadline) {
+    let listed;
+    try { listed = await request({ type: 'list_tasks' }); } catch {
+      return { ok: false, reason: 'missing-evidence' };
+    }
+    latest = ids.map((id) => (listed.tasks || []).find((task) => task?.id === id));
+    if (latest.some((task) => !task)) return { ok: false, reason: 'missing-evidence' };
+    if (latest.every(taskIsTerminal)) return { ok: true, tasks: latest };
+    await new Promise((resolve) => setTimeout(resolve, Math.min(taskPollMs, Math.max(1, deadline - Date.now()))));
+  }
+  await onTimeout(ids);
+  return { ok: false, reason: 'timeout' };
+}
+
+export class ImessageRuntime {
+  constructor({ stateRoot = path.join(root, 'state'), sendReply, daemonRequest: request = daemonRequest, spawnRpc = runMiCoordinatorRpc } = {}) {
+    this.stateRoot = stateRoot;
+    this.sendReply = sendReply;
+    this.daemonRequest = request;
+    this.spawnRpc = spawnRpc;
+    this.queues = new Map();
+    this.deliveryLocks = new Map();
+    this.children = new Set();
+    this.active = 0;
+    this.waiting = [];
+  }
+
+  async initialize() {
+    await ensurePrivateDirectory(path.join(this.stateRoot, 'imessage'));
+    await ensurePrivateDirectory(path.join(this.stateRoot, 'imessage', 'conversations'));
+    await recoverStaleRunning(this.stateRoot);
+  }
+
+  async acquireConversationSlot() {
+    if (this.active < maxConversations) { this.active += 1; return; }
+    await new Promise((resolve) => this.waiting.push(resolve));
+    this.active += 1;
+  }
+
+  releaseConversationSlot() {
+    this.active = Math.max(0, this.active - 1);
+    const next = this.waiting.shift();
+    if (next) next();
+  }
+
+  async shutdown() {
+    for (const child of this.children) {
+      try { if (child.exitCode === null) child.kill('SIGTERM'); } catch {}
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    for (const child of this.children) {
+      try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {}
+    }
+  }
+
+  enqueue(conversationId, work) {
+    const previous = this.queues.get(conversationId) || Promise.resolve();
+    const current = previous.then(() => work(), () => work());
+    const tracked = current.catch(() => undefined);
+    this.queues.set(conversationId, tracked);
+    return current.finally(() => {
+      if (this.queues.get(conversationId) === tracked) this.queues.delete(conversationId);
+    });
+  }
+
+  async sendAndMark(record, file, reply, sendReply = this.sendReply) {
+    const text = cleanReply(reply);
+    if (!sendReply) return false;
+    let accepted = false;
+    try { accepted = await sendReply(text); } catch { accepted = false; }
+    if (!accepted) return false;
+    record.status = 'sent';
+    record.sentAt = isoNow();
+    record.completionReply = text;
+    delete record.rawMessage;
+    try {
+      await writeDelivery(file, record);
+    } catch {
+      // Photon already accepted the reply. Keep the in-memory success and let
+      // the retained completed record replay once if this durable write failed.
+      console.error('Mi iMessage delivery state write failed after Photon success.');
+    }
+    return true;
+  }
+
+  async replayUnsent(directory, sendReply = this.sendReply, exclude = '') {
+    const records = [];
+    for (const file of await listDeliveryFiles(directory)) {
+      const record = await readJson(file);
+      if (!record || record.conversationId !== path.basename(directory) || record.status !== 'completed' || file.endsWith(`${exclude}.json`)) continue;
+      records.push({ file, record });
+    }
+    records.sort((a, b) => String(a.record.receivedAt).localeCompare(String(b.record.receivedAt)));
+    for (const entry of records) {
+      if (!await this.sendAndMark(entry.record, entry.file, entry.record.completionReply, sendReply)) return false;
+    }
+    return true;
+  }
+
+  async handleEvent({ space, message, sendReply = this.sendReply }) {
+    const preliminaryConversationId = conversationIdFor(space, message);
+    if (!preliminaryConversationId) return this.handleEventInternal({ space, message, sendReply });
+    const preliminaryDeliveryId = deliveryIdFor(preliminaryConversationId, message);
+    const lockFile = preliminaryDeliveryId
+      ? deliveryFile(conversationDirectory(preliminaryConversationId, this.stateRoot), preliminaryDeliveryId)
+      : '';
+    const active = lockFile ? this.deliveryLocks.get(lockFile) : undefined;
+    if (active) return active;
+    const work = this.enqueue(preliminaryConversationId, () => this.handleEventInternal({ space, message, sendReply }));
+    if (!lockFile) return work;
+    this.deliveryLocks.set(lockFile, work);
+    try { return await work; } finally { if (this.deliveryLocks.get(lockFile) === work) this.deliveryLocks.delete(lockFile); }
+  }
+
+  async handleEventInternal({ space, message, sendReply = this.sendReply }) {
+    const text = messageTextFor(message);
+    if (!text) return { ok: true, ignored: true };
+    const conversationId = conversationIdFor(space, message);
+    const upstreamId = upstreamMessageId(message);
+    const timestamp = stableMessageTimestamp(message);
+    if (!conversationId || !upstreamId || !timestamp) {
+      if (sendReply) {
+        try { await sendReply(IMESSAGE_REPLIES.retryIdentity); } catch {}
+      }
+      return { ok: false, reason: 'missing-identity' };
+    }
+    const deliveryId = deliveryIdFor(conversationId, message);
+    const requestDigest = requestDigestFor(conversationId, message, text, timestamp);
+    const directory = conversationDirectory(conversationId, this.stateRoot);
+    const file = deliveryFile(directory, deliveryId);
+    try {
+      await ensurePrivateDirectory(directory);
+      await ensurePrivateDirectory(path.join(directory, 'deliveries'));
+    } catch {
+      try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+      return { ok: false, reason: 'state-unavailable', deliveryId, conversationId };
+    }
+    const deliveryInfo = await lstat(file).catch((error) => error?.code === 'ENOENT' ? undefined : null);
+    if (deliveryInfo === null || (deliveryInfo && !deliveryInfo.isFile())) {
+      try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+      return { ok: false, reason: 'invalid-delivery-state', deliveryId, conversationId };
+    }
+    let record = await readJson(file);
+    if (deliveryInfo && !record) {
+      try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+      return { ok: false, reason: 'invalid-delivery-state', deliveryId, conversationId };
+    }
+    if (record) {
+      if (record.requestDigest !== requestDigest) {
+        try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+        return { ok: false, reason: 'payload-conflict', deliveryId, conversationId };
+      }
+      if (record.status === 'sent' || record.status === 'running') return { ok: true, duplicate: true, status: record.status, deliveryId, conversationId };
+      if (record.status === 'interrupted') {
+        if (!record.interruptionNotifiedAt) {
+          let sent = false;
+          try { sent = Boolean(sendReply && await sendReply(IMESSAGE_REPLIES.interruption)); } catch {}
+          if (sent) {
+            record.interruptionNotifiedAt = isoNow();
+            await writeDelivery(file, record).catch(() => undefined);
+          }
+          return { ok: sent, status: 'interrupted', deliveryId, conversationId };
+        }
+        return { ok: false, duplicate: true, status: 'interrupted', deliveryId, conversationId };
+      }
+      if (record.status === 'completed') {
+        const sent = await this.sendAndMark(record, file, record.completionReply, sendReply);
+        return { ok: sent, replay: true, status: sent ? 'sent' : 'completed', deliveryId, conversationId };
+      }
+      if (record.status !== 'received') {
+        try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+        return { ok: false, reason: 'invalid-delivery-state', deliveryId, conversationId };
+      }
+    } else {
+      record = {
+        schemaVersion: deliverySchemaVersion,
+        deliveryId,
+        conversationId,
+        requestDigest,
+        status: 'received',
+        receivedAt: isoNow(),
+        rawMessage: text,
+        taskIds: [],
+      };
+      try { await writeDelivery(file, record); } catch {
+        try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+        return { ok: false, reason: 'state-unavailable', deliveryId, conversationId };
+      }
+    }
+    await this.acquireConversationSlot();
+    try {
+      if (!await this.replayUnsent(directory, sendReply, deliveryId)) return { ok: false, reason: 'send-failure', deliveryId, conversationId };
+      const current = await readJson(file);
+      if (!current || current.status !== 'received') return { ok: true, duplicate: true, status: current?.status || 'unknown', deliveryId, conversationId };
+      current.status = 'running';
+      current.runningAt = isoNow();
+      await writeDelivery(file, current);
+      const result = await this.runTurn(current, directory);
+      current.taskIds = coordinatorTaskIds(result.taskIds || []);
+      if (result.status === 'sent') return { ...result, deliveryId, conversationId };
+      current.status = 'completed';
+      current.completedAt = isoNow();
+      current.completionReply = cleanReply(result.reply, IMESSAGE_REPLIES.missingEvidence);
+      delete current.rawMessage;
+      await writeDelivery(file, current);
+      const sent = await this.sendAndMark(current, file, current.completionReply, sendReply);
+      return { ok: sent, status: sent ? 'sent' : 'completed', deliveryId, conversationId, reply: current.completionReply, taskIds: current.taskIds };
+    } catch (error) {
+      console.error('Mi iMessage runtime turn failed.');
+      const current = await readJson(file) || record;
+      current.status = 'completed';
+      current.completedAt = isoNow();
+      current.completionReply = IMESSAGE_REPLIES.startFailure;
+      delete current.rawMessage;
+      await writeDelivery(file, current).catch(() => undefined);
+      const sent = await this.sendAndMark(current, file, current.completionReply, sendReply).catch(() => false);
+      return { ok: sent, status: sent ? 'sent' : 'completed', deliveryId, conversationId, reply: current.completionReply, error: 'runtime-failure' };
+    } finally {
+      this.releaseConversationSlot();
+    }
+  }
+
+  async runTurn(record, directory) {
+    const message = record.rawMessage || '';
+    const workspace = workspaceFromEnvironment();
+    const confirmationOptions = { statePath: path.join(this.stateRoot, 'pending-confirmations.json') };
+    const route = v2RouteDecision({ message, workspace, coordinatorObjectiveMaxChars, confirmationObjectiveMaxChars });
+    if (route.kind === 'cancel') {
+      await clearPendingConfirmation(record.conversationId, confirmationOptions).catch(() => undefined);
+      return { reply: IMESSAGE_REPLIES.confirmationCancelled, taskIds: [] };
+    }
+    const pending = await readPendingConfirmation(record.conversationId, confirmationOptions).catch(() => null);
+    if (pending) {
+      const confirmation = await classifyConfirmationReply({ threadId: record.conversationId, reply: message }, confirmationOptions).catch(() => ({ kind: 'unclear' }));
+      if (confirmation.kind === 'deny') return { reply: IMESSAGE_REPLIES.confirmationCancelled, taskIds: [] };
+      if (confirmation.kind === 'confirm') {
+        if (!workspace) return { reply: IMESSAGE_REPLIES.workspace, taskIds: [] };
+        return this.runCoordinator({ ...record, rawMessage: pending.objective || pending.summary }, directory, {
+          objective: pending.objective || pending.summary,
+          confirmedObjective: pending.objective || pending.summary,
+          actionClass: pending.actionClass || 'confirmed-high-impact',
+          allowWrite: false,
+          advisorSelections: directAdvisorSelections(pending.objective || pending.summary),
+          workspace,
+        });
+      }
+      if (confirmation.kind === 'not_found' || confirmation.kind === 'unclear') {
+        return { reply: `I still need confirmation for the pending action. Reply confirm ${pending.id} or deny ${pending.id}.`, taskIds: [] };
+      }
+    }
+    if (route.kind === 'confirmation-command') return { reply: IMESSAGE_REPLIES.confirmationMissing, taskIds: [] };
+    if (route.kind === 'never-delegate') return { reply: IMESSAGE_REPLIES.prohibited, taskIds: [] };
+    if (route.kind === 'confirm-too-long' || route.kind === 'objective-too-long') return { reply: IMESSAGE_REPLIES.objectiveTooLong, taskIds: [] };
+    if (route.kind === 'clarify') return { reply: IMESSAGE_REPLIES.clarify, taskIds: [] };
+    if (route.kind === 'workspace-refused') return { reply: IMESSAGE_REPLIES.workspace, taskIds: [] };
+    if (route.kind === 'confirm') {
+      const pendingAction = await createPendingConfirmation({
+        threadId: record.conversationId,
+        summary: route.objective,
+        riskReason: 'High-impact iMessage action',
+        objective: route.objective,
+        actionClass: route.actionClass,
+      }, confirmationOptions);
+      return { reply: `Action class: ${route.actionClass}.\n\nExact objective: ${route.objective}\n\nThis could make a real change or contact another service. Reply "confirm ${pendingAction.id}" to approve or "deny ${pendingAction.id}" to cancel.`, taskIds: [] };
+    }
+    const plan = { ...(route.plan || {}), workspace, cwd: workspace.cwd, workspaceRoot: workspace.root };
+    const diverNotes = diverNotesPreflight({ message, plan });
+    if (diverNotes.reply) return { reply: diverNotes.reply, taskIds: [] };
+    return this.runCoordinator(record, directory, { ...plan, diverNotesAccess: diverNotes.access });
+  }
+
+  async runCoordinator(record, directory, plan) {
+    const correlationId = randomUUID();
+    const workspace = plan.workspace;
+    if (!workspace) return { reply: IMESSAGE_REPLIES.workspace, taskIds: [] };
+    const sessionPath = path.join(directory, 'session.jsonl');
+    if (!await validateSessionFile(sessionPath)) return { reply: IMESSAGE_REPLIES.sessionFailure, taskIds: [] };
+    try { await ensurePrivateFile(sessionPath); } catch { return { reply: IMESSAGE_REPLIES.sessionFailure, taskIds: [] }; }
+    const reviewed = reviewedMiExtensionPaths({
+      root,
+      daemonPath: process.env.MI_DAEMON_PATH,
+      capabilityGuardPath: process.env.MI_CAPABILITY_GUARD,
+      capabilityAdapterPath: process.env.MI_CAPABILITY_ADAPTER,
+      diverNotesPath: process.env.MI_DIVER_NOTES_EXTENSION,
+      requireDaemon: true,
+      requireGuard: true,
+      requireAdapter: true,
+      requireDiverNotes: true,
+    });
+    const grants = await writeCapabilityGrant(directory, workspace, plan.diverNotesAccess || 'none');
+    const policy = path.join(directory, 'runtime', 'coordinator-policy.json');
+    const socketPath = process.env.MI_SOCKET_PATH || path.join(process.env.MI_RUNTIME_DIR || path.join(os.homedir(), '.pi', 'agent', 'mi'), 'main.sock');
+    await writeCoordinatorPolicy(policy, {
+      correlationId, objective: plan.objective, workspace, allowWrite: plan.allowWrite,
+      advisorSelections: [...new Set(plan.advisorSelections || [])].filter((name) => name === 'Seth' || name === 'Alex'), socketPath,
+    });
+    const launch = miCoordinatorLaunch({
+      piCommand: process.env.PI_CMD || 'pi', cwd: workspace.cwd, sessionPath,
+      model: process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low',
+      capabilityGuardPath: reviewed.capabilityGuardPath,
+      capabilityAdapterPath: reviewed.capabilityAdapterPath,
+      diverNotesPath: reviewed.diverNotesPath,
+      env: reducedEnvironment({
+        MI_ROOT: root, MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: grants,
+        MI_CAPABILITY_AUDIT_FILE: path.join(directory, 'runtime', 'capability-audit.jsonl'),
+        MI_COORDINATOR_POLICY_FILE: policy, MI_SOCKET_PATH: socketPath,
+      }),
+    });
+    const taskIds = new Set();
+    const startedAt = Date.now();
+    const result = await this.spawnRpc({
+      launch, requestId: correlationId,
+      prompt: miCoordinatorPrompt({ message: record.rawMessage, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass, advisorSelections: plan.advisorSelections, diverNotesAccess: plan.diverNotesAccess }),
+      timeoutMs: coordinatorTimeoutMs,
+      onSpawn: (child) => {
+        this.children.add(child);
+        child.once?.('close', () => this.children.delete(child));
+        child.once?.('exit', () => this.children.delete(child));
+      },
+      onEvent: (event) => { for (const id of coordinatorDelegatedTasks(event)) taskIds.add(id); },
+    });
+    await chmod(sessionPath, 0o600).catch(() => undefined);
+    for (const id of await readPolicyTaskIds(policy)) taskIds.add(id);
+    const ids = coordinatorTaskIds([...taskIds]);
+    if (ids.length) {
+      record.taskIds = ids;
+      await writeDelivery(deliveryFile(directory, record.deliveryId), record).catch(() => undefined);
+      const remaining = Math.max(1000, coordinatorTimeoutMs - (Date.now() - startedAt));
+      let daemonReady = false;
+      try { await this.daemonRequest(socketPath, { type: 'health' }, 800); daemonReady = true; } catch { daemonReady = await ensureDaemon(socketPath, reviewed.daemonPath); }
+      if (!daemonReady) return { reply: IMESSAGE_REPLIES.missingEvidence, taskIds: ids };
+      const waited = await waitForDaemonTasks(ids, (request) => this.daemonRequest(socketPath, request), remaining, async (known) => {
+        await Promise.allSettled(known.map((taskId) => this.daemonRequest(socketPath, { type: 'stop_task', taskId }, 5000)));
+      });
+      if (!waited.ok) return { reply: waited.reason === 'timeout' ? IMESSAGE_REPLIES.timeout : IMESSAGE_REPLIES.missingEvidence, taskIds: ids };
+      const failedTask = waited.tasks.some((task) => Boolean(task.error) || ['error', 'stopped', 'inactive'].includes(String(task.status || '').toLowerCase()));
+      const findings = waited.tasks.map((task) => task.text || '').filter(Boolean).join('\n\n');
+      const reply = failedTask ? IMESSAGE_REPLIES.interruption : cleanReply(result.ok ? (findings || result.text) : '', result.ok ? IMESSAGE_REPLIES.missingEvidence : result.reason === 'timeout' ? IMESSAGE_REPLIES.timeout : IMESSAGE_REPLIES.interruption);
+      return { reply, taskIds: ids };
+    }
+    if (!result.ok) {
+      console.error(`Mi iMessage coordinator failed: ${result.reason}`);
+      const reply = result.reason === 'timeout' ? IMESSAGE_REPLIES.timeout
+        : ['exited-SIGTERM', 'exited-SIGINT', 'exited-SIGKILL'].includes(result.reason) ? IMESSAGE_REPLIES.interruption
+          : result.reason === 'spawn-error' ? IMESSAGE_REPLIES.startFailure : IMESSAGE_REPLIES.startFailure;
+      return { reply, taskIds: [] };
+    }
+    const reply = cleanReply(result.text, IMESSAGE_REPLIES.missingEvidence);
+    await emitTurnEvent(root, { stage: 'terminal', outcome: 'ok', route: 'imessage', modelProfile: 'none', turn: correlationId }).catch(() => undefined);
+    return { reply, taskIds: [] };
+  }
+}
+
+export async function createImessageRuntime(options = {}) {
+  const runtime = new ImessageRuntime(options);
+  await runtime.initialize();
+  return runtime;
+}
+
+export function actionableIdentityStatus(space, message) {
+  const text = messageTextFor(message);
+  return { actionable: Boolean(text), conversationId: conversationIdFor(space, message), upstreamId: upstreamMessageId(message), timestamp: stableMessageTimestamp(message) };
+}
+
+export { cleanReply, recoverStaleRunning, validateSessionFile };

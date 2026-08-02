@@ -10,14 +10,15 @@ By default it runs no more than once every 15 minutes. It checks:
 
 - `mi-photon-bridge.service` status;
 - recent Photon service logs;
-- the Photon bridge's loopback notification endpoint; and
-- recent Mi-thread iMessage activity.
+- the Photon bridge's loopback notification endpoint;
+- stale `received` or `running` delivery records; and
+- completed replies that Photon did not confirm as sent.
 
 Set `MI_IMESSAGE_MONITOR_ENABLED=false` to turn it off. Change the interval with `MI_IMESSAGE_MONITOR_INTERVAL_MS`.
 
 ## Repair limits
 
-A repair attempt restarts `mi-photon-bridge.service` and the user services in `MI_IMESSAGE_REPAIR_USER_SERVICES`. The default user services are `mi-web-chat.service,mi-daemon.service`. It then checks whether the bridge recovered.
+A repair attempt restarts only `mi-photon-bridge.service`. It then checks whether the bridge recovered. The monitor does not restart Web chat or the daemon without a separate observed failure path.
 
 The system service restart works only when the narrow rule from this script is installed:
 
@@ -43,7 +44,7 @@ It removes URLs, redacts secret-like text, and limits stored details and preview
 Use normal service commands without printing service environments:
 
 ```bash
-systemctl --user status mi-tick.timer mi-web-chat.service mi-daemon.service
+systemctl --user status mi-tick.timer mi-daemon.service
 sudo systemctl status mi-photon-bridge.service
 sudo journalctl -u mi-photon-bridge.service -n 100
 ```

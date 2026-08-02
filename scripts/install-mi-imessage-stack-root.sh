@@ -13,23 +13,6 @@ cd "$APP_DIR"
 
 ./scripts/install-mi-photon-service-root.sh
 
-# A legacy one-setting drop-in can silently override the canonical loopback URL.
-# Remove only that obsolete shape; preserve every operator drop-in containing
-# any other setting.
-PHOTON_OVERRIDE="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service.d/override.conf"
-if [[ -f "$PHOTON_OVERRIDE" ]]; then
-  # This is the sole obsolete address shape Mi owns. Never remove an arbitrary
-  # administrator override merely because it contains MI_WEB_URL.
-  known_obsolete=$'[Service]\nEnvironment=MI_WEB_URL=http://localhost:8787'
-  if [[ "$(cat "$PHOTON_OVERRIDE")" == "$known_obsolete" ]]; then
-    rm -f "$PHOTON_OVERRIDE"
-    rmdir --ignore-fail-on-non-empty "$(dirname "$PHOTON_OVERRIDE")"
-    echo "Removed known obsolete Photon loopback spelling."
-  else
-    echo "Preserved unknown or modified Photon override." >&2
-  fi
-fi
-
 # Files only. Do not reload or restart Photon as part of installation.
 echo "Installed Mi iMessage bridge files without activating services."
 echo "Status: sudo systemctl status mi-photon-bridge"

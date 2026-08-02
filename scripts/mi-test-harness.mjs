@@ -198,7 +198,7 @@ export async function startWebChat(env, { port = 0 } = {}) {
   const actualPort = port || 19000 + Math.floor(Math.random() * 20000);
   const child = spawn(process.execPath, ['scripts/mi-web-chat.mjs'], {
     cwd: repoRoot,
-    env: { ...env, MI_WEB_HOST: '127.0.0.1', MI_WEB_PORT: String(actualPort), MI_WEB_HTTPS_PORT: '0' },
+    env: { MI_WEB_MAINTENANCE: '1', ...env, MI_WEB_HOST: '127.0.0.1', MI_WEB_PORT: String(actualPort), MI_WEB_HTTPS_PORT: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';

@@ -21,7 +21,7 @@ case "${1:-}" in
   *) echo 'Usage: install-mi-stack-root.sh [--check|--dry-run]' >&2; exit 2 ;;
 esac
 
-stages=(production-gateway gateway-client production-registry tailscale-web user-units photon-loopback generated-entrypoints readiness)
+stages=(production-gateway gateway-client production-registry user-units photon-loopback generated-entrypoints readiness)
 if [[ "$MODE" == dry-run ]]; then
   printf 'Mi stack dry-run (no changes):\n'
   printf '  %s\n' "${stages[@]}"
@@ -34,13 +34,6 @@ if [[ "$MODE" == check ]]; then
   failed=0
   check_file "$TARGET_HOME/install-mi-stack.sh" 'canonical entrypoint' || failed=1
   [[ $(stat -c '%a' "$TARGET_HOME/install-mi-stack.sh" 2>/dev/null || true) == 700 ]] || { echo 'mismatch: canonical entrypoint mode'; failed=1; }
-  runtime="$TARGET_HOME/.config/systemd/user/mi-web-chat.service.d/10-mi-runtime.conf"
-  check_file "$runtime" 'Mi web runtime drop-in' || failed=1
-  if [[ -f "$runtime" ]]; then
-    check_contains "$runtime" 'Environment=MI_GATEWAY_CLIENT=' 'gateway helper path' || failed=1
-    check_contains "$runtime" 'Environment=PI_CMD=' 'legacy PI_CMD rollback' || failed=1
-    check_contains "$runtime" 'Environment=PATH=' 'NVM PATH' || failed=1
-  fi
   daemon_unit="$TARGET_HOME/.config/systemd/user/mi-daemon.service"
   check_file "$daemon_unit" 'Mi daemon user unit' || failed=1
   if [[ -f "$daemon_unit" ]]; then
@@ -59,7 +52,7 @@ if [[ "$MODE" == check ]]; then
     check_contains "$tick_unit" 'Environment=MI_IMESSAGE_MONITOR_ENABLED=false' 'tick repair monitor disabled' || failed=1
   fi
   photon="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service"
-  check_contains "$photon" 'Environment=MI_WEB_URL=http://127.0.0.1:8787' 'Photon loopback URL' || failed=1
+  check_contains "$photon" 'Environment=MI_ROOT=' 'Photon Mi root' || failed=1
   node_bin="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
   registry_dir="${MI_GATEWAY_CONFIG_DIR:-$TARGET_HOME/.pi/agent}"
   if [[ -x "$node_bin" && -f "$registry_dir/settings.json" && -f "$registry_dir/models.json" ]]; then
@@ -69,8 +62,7 @@ if [[ "$MODE" == check ]]; then
   fi
   printf '%s\n' \
     'Expected gateway aliases: coding-main (high), mi-concierge (medium); eval aliases absent' \
-    'Expected Photon URL: http://127.0.0.1:8787' \
-    'Expected TLS paths: assistant/state/tls/<tailscale-dns>.{crt,key}' \
+    'Expected Photon service: mi-photon-bridge.service' \
     'Expected helper: ~/.local/share/mi/mi-gateway-client.py' \
     'Expected PATH: supported NVM bin, then system bins'
   if command -v systemctl >/dev/null && [[ -z "$SYSTEM_ROOT" ]]; then
@@ -165,8 +157,6 @@ backup_path() {
   fi
 }
 while IFS= read -r path; do backup_path "$path"; done <<PATHS
-$TARGET_HOME/.config/systemd/user/mi-web-chat.service
-$TARGET_HOME/.config/systemd/user/mi-web-chat.service.d
 $TARGET_HOME/.config/systemd/user/mi-daemon.service
 $TARGET_HOME/.config/systemd/user/mi-tick.service
 $TARGET_HOME/.config/systemd/user/mi-tick.timer
@@ -245,7 +235,6 @@ run_stage gateway-client as_user env \
 run_stage production-registry as_user env MI_GATEWAY_CONFIG_DIR="$TARGET_HOME/.pi/agent" "$STACK_NODE_BIN" "$ROOT/scripts/install-mi-gateway-models.mjs"
 # A staged install writes reviewed units only. It never starts web, Photon,
 # daemon, or tick work; activation is a separate operator step.
-run_stage tailscale-web as_user env MI_APP_DIR="$ROOT" MI_WEB_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-web-chat-systemd.sh"
 run_stage user-units as_user env MI_APP_DIR="$ROOT" MI_USER_UNITS_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-user-units.sh"
 run_stage photon-loopback env MI_APP_DIR="$ROOT" MI_SYSTEM_ROOT="$SYSTEM_ROOT" MI_PHOTON_NO_SYSTEMD=1 "$ROOT/scripts/install-mi-imessage-stack-root.sh"
 run_stage generated-entrypoints env MI_STACK_HOME="$TARGET_HOME" "$ROOT/scripts/install-mi-home-entrypoints.sh"

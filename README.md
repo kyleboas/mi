@@ -89,7 +89,7 @@ A lock at `state/tick.lock` prevents overlapping runs. The systemd timer runs ev
 
 When the Photon bridge is running, tick notices can use its local-only outbound endpoint. A new install writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and does not start the timer. Keep it false until an operator chooses to send notices. Pushover is opt-in through `MI_PUSHOVER_NOTIFY=1` or `MI_PUSHOVER_FALLBACK=1`.
 
-The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, and recent Mi thread activity. A repair attempt restarts the Photon bridge and the user services named by `MI_IMESSAGE_REPAIR_USER_SERVICES`, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
+The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, durable deliveries, and recent Mi thread activity. A repair attempt restarts only the Photon bridge, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
 
 Add reminder crons explicitly:
 
@@ -128,35 +128,31 @@ Inside that Pi session, the Mi extension exposes a single slash command: `/mi`.
 
 Mi can be reached from native iMessage through Photon, the same managed iMessage relay used by Hermes Agent when no Mac/BlueBubbles server is available.
 
-The bridge is only a transport adapter. By default `/api/imessage` uses the minimal V2 concierge: each inbound turn gets one fresh, read-only assistant call with a capped context bundle (recent thread history including results, preferences, durable memory, active/recent work, and a compact safe-state/project snapshot). Cached context is orientation, not live proof. Mi replies naturally, starts existing background work for substantive tasks, and asks one short question before consequential or genuinely ambiguous action. Worker mechanics stay out of the thread; task acknowledgements and completions are correlated by task id.
+Photon is the only normal Mi service. iMessage is the only normal user interface. The bridge authenticates Photon events, derives one durable conversation identity, and calls `scripts/mi-imessage-runtime.mjs` directly.
 
-Set `MI_IMESSAGE_V2=0` for an immediate rollback to the complete legacy V1 regex route. V1 remains intact in this release; its `MI_IMESSAGE_ASK_FIRST=1` behavior still applies only when V1 is enabled. V2 does not automatically write preferences or add new proactive messages.
+Each conversation stores one private Pi session at `state/imessage/conversations/<conversation-id>/session.jsonl`. Pi starts only for a turn, resumes that file, and exits after the RPC turn. The runtime serializes turns per conversation, bounds concurrent conversations, records delivery state, and removes completed raw message text.
 
-Minimal memory is backed by the existing `/home/kyle/mi/memory.md` file. V2 consults a bounded slice as context. The legacy V1 path also supports explicit leading `remember ...`, `save ...`, or `note ...` writes under `## Captured via iMessage`; secret-like content is refused, and writes are allowed only through local or token-authorized `/api/imessage` calls.
+The runtime requires an upstream message ID and a stable timestamp. It rejects incomplete events with a fixed retry request before Pi starts. It replays completed but unsent replies before later turns. A successful Photon send followed by a failed durable state write can produce one duplicate after restart. The runtime never retries interrupted work automatically.
 
-Setup uses the complete Mi stack installer below. It derives the current Tailscale DNS name for TLS and configures Photon to reach Mi only through `http://127.0.0.1:8787`; no provider credential is placed in the repository or Pi configuration.
+The normal stack has no Web chat dependency. Web chat remains a loopback maintenance tool and requires `MI_WEB_MAINTENANCE=1`. Do not expose it as a second user interface. No provider credential is placed in the repository or Pi configuration.
 
 Optional env:
 
-- `MI_PHOTON_THREAD=main` — Mi thread to use.
-- `MI_PHOTON_MAX_REPLY_CHARS=1200` — soft cap for text-message-sized replies.
-- `PHOTON_ALLOW_ALL_USERS=true` — dev only; do not use for a terminal-capable assistant.
-- `MI_PHOTON_MAX_WAIT_MS=1800000` — how long the bridge waits for a background-worker result after sending its acknowledgement; defaults to 30 minutes.
-- `MI_IMESSAGE_V2=0` — immediately use the retained legacy V1 iMessage router instead of the default minimal V2 concierge.
-- `MI_IMESSAGE_MODEL` — override V2's default `vps-gateway/mi-concierge` local gateway model. The default is an authenticated request to the sole local LiteLLM listener (`127.0.0.1:4000`); it is not a direct provider bypass.
-- `MI_IMESSAGE_COMPLETION_TIMEOUT_MS=15000` — timeout for the separate, no-tools completion formatter. V2 worker findings are never sent directly: Mi invokes the authenticated `vps-gateway/mi-concierge` route through `/home/kyle/bin/pi-gateway`, then applies a deterministic 480-character safety gate. Formatter failures send a safe fallback, never raw findings.
-- `MI_IMESSAGE_ASK_FIRST=1` — legacy V1 opt-in to always asking before iMessage starts tool-backed work.
-- `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint for Mi proactive notices.
-- `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — send Mi proactive notifications to iMessage through the local Photon notify endpoint.
-- `MI_IMESSAGE_MONITOR_ENABLED=false` — disable the tick-owned iMessage repair monitor.
-- `MI_IMESSAGE_MONITOR_INTERVAL_MS=900000` — monitor cadence; default is 15 minutes.
-- `MI_IMESSAGE_REPAIR_USER_SERVICES=mi-web-chat.service,mi-daemon.service` — user services restarted during safe iMessage repair attempts.
+- `MI_PHOTON_MAX_REPLY_CHARS=1200` — bound user-facing reply text.
+- `MI_PHOTON_TYPING_DELAY_MS=100` — delay cosmetic typing feedback.
+- `MI_IMESSAGE_WORKSPACE_ROOT` and `MI_IMESSAGE_WORKSPACE_CWD` — approved workspace paths.
+- `MI_IMESSAGE_CONCURRENCY=4` — maximum concurrent conversations.
+- `MI_IMESSAGE_COORDINATOR_TIMEOUT_MS=90000` — maximum Pi and delegated-task time.
+- `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint.
+- `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — opt in to proactive iMessage notices.
+- `MI_IMESSAGE_MONITOR_ENABLED=false` — disable the tick-owned repair monitor.
+- `MI_IMESSAGE_MONITOR_INTERVAL_MS=900000` — monitor cadence. The default is 15 minutes.
 
-The bridge also exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify` by default. `mi tick` uses that endpoint for opt-in proactive iMessage notifications; it does not expose Photon credentials to the tick process. For V2 work, generic daemon reports are retained only in daemon task state; the bridge polls solely for one correlation-bound user-visible completion per acknowledgement/generation. Workers may optionally end with the versioned structured completion envelope (`version`, `status`, `userSummary`, optional internal details). Only a validated summary can skip the formatter; internal details never enter threads, context, or Photon. Sanitized lifecycle metadata is bounded in `state/mi-turn-events.jsonl` and contains no message text or identifiers.
+The bridge exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify`. The monitor checks durable deliveries, Photon logs and service state, the notify endpoint, and stale thread activity. It restarts only `mi-photon-bridge.service` by default. It does not restart Web chat or the daemon.
 
 ### Local Codex subscription gateway
 
-`vps-gateway/mi-concierge` is Mi V2's production-only foreground route. The authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical implicit-high route for every other gateway client. These are the only durable production aliases; tracked production callers do not require `coding-fast`. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path. Pi runs offline, without sessions, tools, extensions, skills, prompt templates, or themes, and receives a scrubbed environment rather than gateway variables.
+`vps-gateway/mi-concierge` is the production route for focused Pi turns. The authenticated LiteLLM listener maps it immutably to `openai-codex/gpt-5.6-sol` with `--thinking medium`. Shared `vps-gateway/coding-main` remains unchanged on its historical implicit-high route for every other gateway client. These are the only durable production aliases. Neither route has an OpenRouter, Cloudflare, or OpenAI API-key path. The runtime loads only reviewed extensions and passes a scrubbed environment.
 
 The canonical stack first installs the gateway client and its non-secret `coding-main` Pi registry baseline, then installs the production `mi-concierge` alias. The alias stage fails closed if that baseline cannot be established. The tracked modular scripts remain internal implementation and test units.
 
@@ -180,9 +176,9 @@ Normal installation and repair has one user-facing command (run normally; it req
 /home/kyle/install-mi-stack.sh
 ```
 
-Use `/home/kyle/install-mi-stack.sh --check` for a non-secret configuration summary or `--dry-run` to list stages without mutation. The operation installs files only: it does not reload, enable, start, stop, or restart the gateway, web, Photon, daemon, or timer. Check paths, sandbox settings, and disabled notice and repair-monitor flags first. Then, after separate approval, run the needed daemon-reload command and start gateway, Mi daemon, and Photon in separate commands. Keep the timer, notices, and repair monitor off. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and safe-cleanup behavior.
+Use `/home/kyle/install-mi-stack.sh --check` for a non-secret configuration summary or `--dry-run` to list stages without mutation. The operation installs files only. It does not reload, enable, start, stop, or restart the gateway, Photon, daemon, or timer. Normal readiness checks only the gateway and Photon. Start services only after Kyle approves the commands. The runtime starts the daemon on demand when delegated work needs it. See [`docs/mi-stack.md`](docs/mi-stack.md) for rollback and recovery limits.
 
-The installer creates the system Photon bridge unit and the user web, daemon, and tick units. The Photon unit loads its broker-managed secret file with `EnvironmentFile=`. It does not print credential values into the agent shell.
+The installer creates the system Photon bridge unit and user daemon and tick units. It does not install the maintenance Web unit. Install that unit separately with `MI_WEB_MAINTENANCE=1` when maintenance access is required. The Photon unit loads its broker-managed secret file with `EnvironmentFile=`. It does not print credential values into the agent shell.
 
 For automatic repair from unprivileged `mi tick`, install the narrow sudoers rule that permits only restarting `mi-photon-bridge.service`:
 
@@ -204,16 +200,16 @@ npm run test:mi-surfaces
 npm run test:quality
 ```
 
-`test:quality` covers assistant behavior shape: routing choices, worker handoff/follow-up decisions, iMessage status replies, result relay behavior, and acknowledgement wording invariants. It does not prove live LLM prose quality because all workers and Mi replies are faked.
+`test:quality` covers assistant behavior shape: guarded routing choices, worker handoff and follow-up decisions, delivery recovery, and acknowledgement wording invariants. It does not prove live LLM prose quality because all workers and Mi replies are faked.
 
 Live smoke tests are opt-in only. Keep any real LLM/iMessage/notification/service checks behind `MI_LIVE_SMOKE=1`. The live script prints only present/missing flag names, never secret values. By default it only preflights; select checks explicitly:
 
 ```bash
 MI_LIVE_SMOKE=1 npm run test:live
-MI_LIVE_SMOKE=1 MI_WEB_URL=http://127.0.0.1:8787 MI_LIVE_WEB_HEALTH=1 npm run test:live
+MI_LIVE_SMOKE=1 MI_WEB_MAINTENANCE=1 MI_WEB_URL=http://127.0.0.1:8787 MI_LIVE_WEB_HEALTH=1 npm run test:live
 ```
 
-Real iMessage API smoke is additionally gated by `MI_LIVE_IMESSAGE_SMOKE=1`.
+Real iMessage smoke requires a direct Photon test harness and Kyle's separate approval. The Web smoke script does not call an iMessage HTTP route.
 
 Security check:
 

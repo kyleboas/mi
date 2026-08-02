@@ -1,131 +1,53 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
-import os from 'node:os';
-import path from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { v2RiskClassification, v2RouteDecision } from './mi-web-chat-v2-route.mjs';
 
 const source = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
-const routingSource = await readFile(new URL('./mi-imessage-routing.mjs', import.meta.url), 'utf8');
 const photonSource = await readFile(new URL('./mi-photon-bridge.mjs', import.meta.url), 'utf8');
-const notifySource = await readFile(new URL('../src/notify.ts', import.meta.url), 'utf8');
+const runtimeSource = await readFile(new URL('./mi-imessage-runtime.mjs', import.meta.url), 'utf8');
+const coordinatorSource = await readFile(new URL('./mi-imessage-coordinator.mjs', import.meta.url), 'utf8');
 
-assert.match(source, /const IMESSAGE_DELIVERY_RESPONSE_TTL_MS = 10 \* 60 \* 1000/, 'iMessage delivery responses have a clear TTL');
-assert.match(source, /const MAX_IMESSAGE_DELIVERY_RESPONSES = 1000/, 'iMessage delivery responses have a clear capacity limit');
-assert.match(source, /while \(imessageDeliveryResponses\.size > MAX_IMESSAGE_DELIVERY_RESPONSES\)[\s\S]*delete\(imessageDeliveryResponses\.keys\(\)\.next\(\)\.value\)/, 'delivery cache evicts the oldest entries first');
-assert.match(source, /now - entry\.createdAt >= IMESSAGE_DELIVERY_RESPONSE_TTL_MS/, 'delivery cache removes expired entries before lookup');
-assert.match(source, /function messageLooksConversational\(message\)[\s\S]*what\\s\+time\\s\+is\\s\+it/, 'web chat routing must classify time questions as conversational');
-assert.match(source, /function messageLooksConversational\(message\)[\s\S]*let me see it/, 'web chat routing must classify view-only requests as conversational');
-assert.match(source, /function messageLooksConversational\(message\)[\s\S]*handoff[\s\S]*worker/, 'web chat routing must classify handoff meta-questions as conversational');
-assert.match(source, /function shouldStartBackgroundWorker\(message\)[\s\S]*messageLooksConversational\(message\)[\s\S]*return false/, 'conversational messages must not start background workers');
-assert.doesNotMatch(source, /return estimatedWorkSeconds\(message\) >= workerThresholdSeconds;/, 'worker routing must not be only a naive duration threshold');
-assert.match(source, /function messageLooksLikeInlineMiWork\(message\)[\s\S]*draft\|write\|rewrite\|compose\|wordsmith[\s\S]*return true/, 'writing/drafting requests must be handled inline unless they are code work');
-assert.match(source, /function workerRoutingDecision\(message\)[\s\S]*messageLooksLikeInlineMiWork\(message\)[\s\S]*start: false, reason: 'inline-chat'/, 'inline chat/drafting requests must stay in Mi instead of worker');
-assert.match(source, /function workerRoutingDecision\(message\)[\s\S]*localTarget && \(actionable \|\| complaint\)[\s\S]*repo\/app work/, 'local actionable complaints can still start workers');
-assert.match(source, /function messageLooksActionable\(message\)[\s\S]*inspect\|check\|verify[\s\S]*save\|remember\|remind\|schedule/, 'check/inspect and save/reminder requests must be actionable so web chat routes them to workers');
-assert.match(source, /function workerRoutingDecision\(message\)[\s\S]*research\|investigate\|inspect\|check\|verify/, 'local check/inspect/verify requests must route to workers instead of no-tool chat');
-assert.match(source, /function contextAwareWorkerRoutingDecision\(threadId, message\)[\s\S]*you should be able to[\s\S]*contextual tool-backed task/, 'web chat must route contextual “you should be able to” / tool-access corrections to workers');
-assert.match(source, /function contextAwareWorkerRoutingDecision\(threadId, message\)[\s\S]*tool access is allowed[\s\S]*heartbeat\|monitor/, 'web chat must pass “tool access is allowed / implement it” follow-ups to workers with context');
-assert.match(source, /function contextAwareWorkerRoutingDecision\(threadId, message\)[\s\S]*corner\\s\*case[\s\S]*contextual routing\/worker behavior feedback/, 'web chat must route contextual “fix that” routing-principle feedback to a dedicated routing worker instead of brittle one-off rules');
-assert.match(source, /if \(decision\.start && \(messageLooksLikeRoutingFeedback\(message\) \|\| \/routing\\\/worker behavior feedback\//, 'routing/worker behavior feedback must start a dedicated worker before active-worker follow-up capture');
-assert.match(source, /function messageLooksLikeWorkerFollowup\(message, worker\)[\s\S]*messageLooksConversational\(message\)[\s\S]*return false/, 'conversational messages must not continue background workers');
-assert.match(source, /if \(activeWorker && messageLooksLikeWorkerFollowup\(message, activeWorker\)\)/, 'active workers must only receive smartly detected follow-ups');
-assert.doesNotMatch(source, /if \(activeWorker\) return continueBackgroundWorker/, 'active workers must not capture every chat message');
-assert.match(source, /const miDaemonSystemdUnit = process\.env\.MI_DAEMON_SYSTEMD_UNIT \|\| 'mi-daemon\.service'/, 'web chat has a dedicated Mi daemon systemd unit name');
-assert.match(source, /async function startMiDaemonWithSystemd\(\)[\s\S]*systemctl'[\s\S]*'--user', 'start', unit[\s\S]*waitForMiDaemonHealth/, 'web chat starts Mi daemon via user systemd before falling back to child process');
-assert.match(source, /async function recentThreadContextForWorker\(threadId, currentMessage\)[\s\S]*readMessages\(threadId, 16\)[\s\S]*needsPronounContext \? 10 : 4[\s\S]*slice\(-12\)[\s\S]*remaining = 3600/, 'background worker handoff context must include a larger recent window for pronoun/follow-up handoffs while still being capped');
-assert.match(source, /filter\(\(message\) => message\.role !== 'assistant' \|\| !\['web-worker-ack'\]/, 'background worker context must omit noisy worker acks but keep worker results for reply context');
-assert.match(source, /async function buildWorkerFollowupPrompt\(threadId, message\)[\s\S]*Plan for the background worker:[\s\S]*Relevant chat context, newest last:[\s\S]*message: workerPrompt/, 'worker follow-ups must pass a plan plus recent Mi web context, not just the raw latest sentence');
-assert.match(source, /Handoff reason: \$\{decision\.reason/, 'background worker prompts must include why Mi routed to a worker');
-assert.match(source, /function handoffActionSummary\(message\)[\s\S]*tighten Mi routing and background-task behavior/, 'worker acknowledgements must summarize the actual request');
-assert.match(source, /function workerAck\(message, kind = 'start', decision = workerRoutingDecision\(message\), worker = undefined\)[\s\S]*cleaner, scannable format[\s\S]*make those replies sound natural[\s\S]*pickAck/, 'worker acknowledgements must be natural, specific, and non-repetitive');
-assert.doesNotMatch(source, /handoffReasonSentence\(decision\)/, 'worker acknowledgements must not combine generic action and reason sentences');
-assert.match(source, /function workerPlanForMessage\(message, problem = ''\)[\s\S]*Reformat the briefing as a concise, scannable daily brief[\s\S]*workerPlanForMessage\(message, problem\)/, 'briefing formatting follow-ups must pass a formatting-specific plan to the worker');
-const forbiddenAckPhrases = new RegExp(['I’ll work on “\\$\\{quoted\\}”', 'sent that context to the active worker', 'I sent that context'].join('|'));
-assert.doesNotMatch(source, forbiddenAckPhrases, 'worker acknowledgements must not echo truncated prompts or mention internal context forwarding');
-assert.match(source, /body: JSON\.stringify\(\{ thread, name: file\.name, type: file\.type, dataUrl, attachOnly: true \}\)/, 'photo picker must upload as an attachment draft instead of sending immediately');
-assert.match(source, /if \(body\.send === true\)[\s\S]*queueSendJob\(threadId, message\)/, 'photo upload endpoint must only send immediately when explicitly requested');
-assert.match(source, /return sendJson\(res, 200, \{ ok: true, filePath, attached: true/, 'default photo upload endpoint behavior must attach only');
-assert.match(source, /const decision = await contextAwareWorkerRoutingDecision\(threadId, message\);[\s\S]*startBackgroundWorker\(threadId, message, \{ decision \}\)/, 'runWebTurn must pass the routing decision into the handoff ack/prompt');
-const imessageHandler = source.slice(source.indexOf("url.pathname === '/api/imessage'"), source.indexOf("return sendJson(res, 404"));
-assert.match(imessageHandler, /const imessageHistory = await readMessages\(threadId, 20\);[\s\S]*const memoryPayload = imessageRememberPayload\(message, imessageHistory\);[\s\S]*saveImessageMemory\(memoryPayload, threadId\)[\s\S]*source: saved\.ok \? 'imessage-memory' : 'imessage-memory-refused'/, 'iMessage handles explicit memory saves before normal chat and persists the turn');
-assert.match(imessageHandler, /imessageMemoryWriteAllowed\(req\)[\s\S]*memory writes require local or token-authorized access/, 'iMessage memory writes require local or token-authorized access');
-assert.match(source, /function localNetworkAddresses\(\)[\s\S]*os\.networkInterfaces\(\)[\s\S]*::ffff:\$\{entry\.address\}/, 'iMessage memory writes allow local interface addresses used by the Photon bridge');
-assert.match(imessageHandler, /const workDecision = imessageWorkDecision\(message, imessageHistory, \{ askFirst: imessageAskFirst \}\);[\s\S]*workDecision\.action === 'fetch' && workDecision\.kind === 'detect-candidates'[\s\S]*fetchDetectCandidatesFromResearch\(\)[\s\S]*source: 'imessage-data'[\s\S]*handoff: false/, 'iMessage detect-candidate list requests fetch live data directly without handoff');
-assert.match(imessageHandler, /const workDecision = imessageWorkDecision\(message, imessageHistory, \{ askFirst: imessageAskFirst \}\);[\s\S]*workDecision\.action === 'start'[\s\S]*startBackgroundWorker\(threadId, targetMessage, \{ appendUser: false[\s\S]*handoff: true/, 'iMessage starts confirmed work and returns handoff true');
-assert.match(source, /const imessageAskFirst = \/\^\(1\|true\|yes\|on\)\$\/i\.test\(process\.env\.MI_IMESSAGE_ASK_FIRST \|\| ''\)/, 'iMessage ask-first mode is opt-in and defaults off');
-assert.match(source, /import\('\.\/mi-imessage-routing\.mjs'\)/, 'iMessage routing is lazy-loaded from the pure behavioral module only for V1');
-assert.match(routingSource, /function imessageLooksLikeQuestion\(message\)[\s\S]*\[\?？\][\s\S]*can\|could\|would\|will\|should\|did/, 'iMessage questions must be detected so questions do not auto-start work');
-assert.match(routingSource, /function imessageWorkDecision\(message, threadMessages = \[\], options = \{\}\)[\s\S]*imessageIsBareUrl\(message\)[\s\S]*pending[\s\S]*action: 'ask'[\s\S]*action: 'chat'[\s\S]*question && !explicitGoAhead[\s\S]*action: 'ask'/, 'iMessage decision keeps bare URLs as chat unless attached to pending work and asks on work questions');
-assert.match(routingSource, /export function imessageDetectCandidatesQuery\(message\)[\s\S]*tokenLooksLikeCandidate[\s\S]*tokenLooksLikeDetect[\s\S]*action: 'fetch', kind: 'detect-candidates'/, 'iMessage detects active detect-candidate list questions including typos as direct data fetches');
-assert.match(routingSource, /function imessageClearDirective\(message\)[\s\S]*add[\s\S]*candidate\|canidate[\s\S]*action: 'start', targetMessage, reason: 'iMessage clear directive'/, 'iMessage clear detect-candidate directives start work without requiring another yes');
-assert.match(routingSource, /function imessageLooksLikeConfirmation\(message\)[\s\S]*you do that[\s\S]*targetMessage: pending/, 'iMessage confirmations must use recent pending work instead of starting bare yes globally');
-assert.match(routingSource, /function imessagePriorWorkStatusReply\(threadMessages = \[\], message = ''\)[\s\S]*Pending means it is saved for review and report consideration[\s\S]*Not yet, I’m still on it and will follow up here/, 'iMessage status questions about prior work must answer from local work state instead of falling to chat');
-assert.match(imessageHandler, /imessageLooksLikePriorWorkStatusQuestion\(message\)[\s\S]*imessagePriorWorkStatusReply\(imessageHistory, message\)[\s\S]*source: 'imessage-status'/, 'iMessage status questions must be handled before conversational chat');
-assert.match(routingSource, /function imessageWorkAck\(\)[\s\S]*On it\. I’ll follow up here\./, 'iMessage work acknowledgements are generic rather than action-specific');
-assert.match(routingSource, /function imessageNormalizeDisplayText\(text\)[\s\S]*replace\(\/\\r\\n\?\/g, '\\n'\)[\s\S]*replace\(\/\[ \\t\\f\\v\]\{2,\}\/g, ' '\)[\s\S]*replace\(\/\\n\{3,\}\/g, '\\n\\n'\)/, 'iMessage display cleanup must preserve real newlines while compacting repeated inline spaces');
-assert.match(source, /Use real line breaks when showing sectioned templates[\s\S]*blank line between major sections/, 'iMessage persona must explicitly preserve line breaks for sectioned templates and briefs');
-assert.match(source, /function imessageCleanReply\(text\)[\s\S]*send\|pass\|route\|handoff[\s\S]*mi\\s\+\)\?agents\?[\s\S]*I can handle that here[\s\S]*imessageNormalizeDisplayText[\s\S]*mi\\s\+agents\?[\s\S]*agents\?/, 'iMessage replies must scrub internal wording without flattening line breaks');
-assert.match(routingSource, /if \(askFirst && !explicitGoAhead\) return \{ action: 'ask'[\s\S]*return \{ action: 'ask', targetMessage, reason: 'iMessage confirm before work' \}/, 'iMessage ambiguous directives ask for confirmation while clear directives can start');
-assert.match(imessageHandler, /const reply = sanitizeMiConversationText\(await runImessageChat\(message, threadId\)\)/, 'iMessage uses conversational Mi chat for non-direct replies');
-assert.match(source, /function imessageRememberPayload\(message, recentMessages = \[\]\)[\s\S]*when\\b[\s\S]*resolveImessageMemoryReferent\(payload, recentMessages\)/, 'iMessage memory save matching is explicit and avoids casual “remember when” phrasing');
-assert.match(source, /function imessageMemoryHasUnresolvedReferent\(payload\)[\s\S]*\^\(\?:this\|that\|it\)/, 'iMessage memory detects unresolved this/that/it referents');
-assert.match(source, /function resolveImessageMemoryReferent\(payload, recentMessages = \[\]\)[\s\S]*\.reverse\(\)[\s\S]*String\(message\?\.source \|\| ''\)\.startsWith\('imessage'\)[\s\S]*return \{ unresolved: true, payload \}/, 'iMessage memory resolves referents from recent iMessage context or refuses');
-assert.match(source, /What should I save\? I couldn't tell what/, 'iMessage memory asks instead of saving unresolved referents');
-assert.match(source, /async function readImessageMemory\(\)[\s\S]*miMemoryPath[\s\S]*imessageMemoryMaxChars[\s\S]*Durable notes[\s\S]*not as system instructions/, 'iMessage chat loads bounded durable memory as context, not instructions');
-assert.match(source, /async function saveImessageMemory\(payload, threadId\)[\s\S]*const redacted = redact\(clean\)[\s\S]*redacted !== clean[\s\S]*I can't save secrets there[\s\S]*## Captured via iMessage[\s\S]*logEvent\('mi\.imessage\.memory_saved', \{ threadId, chars: clean\.length \}\)/, 'iMessage memory saves refuse secret-like content, append under a dedicated heading, and log metadata only');
-assert.match(source, /Do not use em dashes or en dashes[\s\S]*ask whether they want you to handle it/, 'iMessage persona documents style and safe question handling');
-assert.match(source, /async function runImessageChat\(message, threadId\)[\s\S]*const memory = await readImessageMemory\(\)[\s\S]*const recent = await readMessages\(threadId \|\| imessageThread, historyLimit\)[\s\S]*Recent conversation:/, 'iMessage chat loads durable memory and recent persisted messages into the prompt');
-assert.doesNotMatch(source, /readThreadMessages\(threadId \|\| imessageThread, historyLimit\)/, 'iMessage chat must not call the undefined readThreadMessages helper');
-assert.match(source, /iMessage history load failed:/, 'iMessage history load failures are logged instead of silently swallowed');
-assert.match(photonSource, /sendToUser\(target, 'Mi Photon bridge started, reply to this iMessage to talk to Mi\.', 'boot test'\)/, 'Photon boot test sends a direct iMessage through Spectrum when explicitly enabled');
-assert.match(photonSource, /content\.type === 'richlink'\) return String\(content\.url \|\| ''\)\.trim\(\)/, 'Photon bridge must pass inbound iMessage rich link URLs through as message text');
-assert.match(photonSource, /content\.type === 'group'[\s\S]*contentTextFor\(item\?\.content \|\| item\)/, 'Photon bridge must defensively extract text and rich link URLs from grouped content');
-assert.doesNotMatch(photonSource, /Photon content type not handled|\[Photon \$\{content\.type\} received/, 'Photon bridge must not inject internal bridge placeholders into Mi chat');
-assert.match(photonSource, /\[the user sent an attachment\][\s\S]*\[the user sent a voice message\][\s\S]*\[the user sent something I can't read here\]/, 'Photon bridge fallbacks must be user-facing when a non-text iMessage arrives');
-assert.doesNotMatch(source.replace(/\[—–\]/g, ''), /—/, 'Mi web chat must not contain user-visible em-dash literals');
-assert.doesNotMatch(photonSource.replace(/\[—–\]/g, ''), /—/, 'Photon bridge must not contain user-visible em-dash literals');
-assert.match(photonSource, /server\.listen\(notifyPort, notifyHost/, 'Photon bridge exposes a local-only outbound iMessage notification endpoint');
-assert.match(photonSource, /localOnly\(req\)/, 'Photon notify endpoint rejects non-local callers');
-assert.match(notifySource, /MI_PROACTIVE_IMESSAGE_NOTIFY/, 'Mi notifications can opt into iMessage delivery');
-assert.match(notifySource, /127\.0\.0\.1:\$\{process\.env\.MI_PHOTON_NOTIFY_PORT \|\| '8788'\}\/notify/, 'Mi notifications use the local Photon notify endpoint by default');
+assert.match(source, /MI_WEB_MAINTENANCE/, 'Web chat has an explicit maintenance gate');
+assert.match(source, /!webMaintenance && url\.pathname !== '\/api\/health'/, 'default Web routes stay unavailable');
+assert.doesNotMatch(source, /\/api\/imessage|\/api\/messages|runImessageChat|loadLegacyImessageRouting|MI_IMESSAGE_V2|MI_IMESSAGE_ASK_FIRST/, 'Web chat has no iMessage routing or polling');
+assert.doesNotMatch(photonSource, /MI_WEB_URL|\/api\/imessage|\/api\/messages|poll/, 'Photon has no Web relay or result polling');
+assert.match(photonSource, /createImessageRuntime/, 'Photon calls the focused runtime directly');
+assert.match(runtimeSource, /stateRoot = path\.join\(root, 'state'\)/, 'runtime stores state below state/imessage');
+assert.match(runtimeSource, /recoverStaleRunning/, 'runtime recovers stale running deliveries');
+assert.match(runtimeSource, /sendAndMark/, 'runtime marks delivery sent only after Photon success');
+assert.match(coordinatorSource, /'--session', sessionPath/, 'coordinator uses the exact session path');
+assert.doesNotMatch(coordinatorSource, /--session-dir|--no-session/, 'coordinator has no session fallback');
+assert.equal(v2RouteDecision({ message: 'hello', workspace: { root: '/tmp/work', cwd: '/tmp/work' } }).kind, 'coordinator');
+assert.equal(v2RiskClassification('delete all data').kind, 'never-delegate');
+assert.equal(v2RiskClassification('send Kyle a message').kind, 'confirm');
+assert.equal(v2RouteDecision({ message: 'cancel', workspace: { root: '/tmp/work', cwd: '/tmp/work' } }).kind, 'cancel');
 
-// This executes the real daemon-start path. Missing, symlinked, and escaped
-// reviewed paths must fail before mkdir, systemctl, helper, or child spawn.
-const daemonStartTemp = await mkdtemp(path.join(os.tmpdir(), 'mi-web-daemon-start-'));
+const root = await mkdtemp(join(tmpdir(), 'mi-web-maintenance-route-'));
+const port = String(24000 + Math.floor(Math.random() * 5000));
+const child = spawn(process.execPath, ['scripts/mi-web-chat.mjs'], {
+  cwd: new URL('..', import.meta.url).pathname,
+  env: { ...process.env, MI_ROOT: root, HOME: root, MI_WEB_HOST: '127.0.0.1', MI_WEB_PORT: port, MI_WEB_HTTPS_PORT: '0', MI_WEB_MAINTENANCE: '0' },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
 try {
-  const privateRoot = path.join(daemonStartTemp, 'private-mi');
-  const extensions = path.join(privateRoot, 'pi', 'extensions');
-  await mkdir(extensions, { recursive: true });
-  const makeReviewedFiles = async () => {
-    for (const name of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await writeFile(path.join(extensions, name), 'export {};\\n');
-  };
-  const runInvalidStart = (extra = {}) => {
-    const calls = path.join(daemonStartTemp, `calls-${Math.random().toString(36).slice(2)}`);
-    const result = spawnSync(process.execPath, ['scripts/mi-web-chat.mjs'], {
-      cwd: path.resolve(import.meta.dirname, '..'),
-      env: { ...process.env, MI_ROOT: privateRoot, MI_WEB_CHAT_TEST_START_DAEMON: '1', MI_WEB_CHAT_TEST_SPAWN_LOG: calls, ...extra },
-      encoding: 'utf8',
-    });
-    assert.notEqual(result.status, 0, result.stderr);
-    assert.equal(spawnSync('test', ['-e', calls]).status, 1, `invalid start made a side effect: ${result.stderr}`);
-  };
-  await writeFile(path.join(extensions, 'mi-daemon.mjs'), 'export {};\\n');
-  await writeFile(path.join(extensions, 'mi-orchestrator-adapter.ts'), 'export {};\\n');
-  runInvalidStart();
-  await makeReviewedFiles();
-  const guard = path.join(extensions, 'mi-capability-guard.ts');
-  await rm(guard);
-  await writeFile(path.join(daemonStartTemp, 'outside-guard.ts'), 'export {};\\n');
-  await symlink(path.join(daemonStartTemp, 'outside-guard.ts'), guard);
-  runInvalidStart();
-  await rm(guard);
-  await writeFile(guard, 'export {};\\n');
-  const escaped = path.join(daemonStartTemp, 'escaped-daemon.mjs');
-  await writeFile(escaped, 'export {};\\n');
-  runInvalidStart({ MI_DAEMON_PATH: escaped });
+  const base = `http://127.0.0.1:${port}`;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try { if ((await fetch(`${base}/api/health`)).ok) break; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200, 'health remains available for diagnostics');
+  const ui = await fetch(`${base}/`);
+  assert.equal(ui.status, 404, 'Web UI is unavailable without maintenance mode');
+  const mutable = await fetch(`${base}/api/send`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: 'not allowed' }) });
+  assert.equal(mutable.status, 404, 'mutable Web routes are unavailable without maintenance mode');
 } finally {
-  await rm(daemonStartTemp, { recursive: true, force: true });
+  child.kill('SIGTERM');
+  await new Promise((resolve) => child.once('exit', resolve));
+  await rm(root, { recursive: true, force: true });
 }
-
-console.log('Mi web chat routing checks passed.');
+console.log('Mi Web maintenance routing checks passed.');

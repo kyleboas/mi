@@ -7,6 +7,7 @@ const flueSource = await readFile(new URL('../src/flue.ts', import.meta.url), 'u
 const capabilitySource = await readFile(new URL('../src/capabilities.ts', import.meta.url), 'utf8');
 const guardSource = await readFile(new URL('../pi/extensions/mi-capability-guard.ts', import.meta.url), 'utf8');
 const webChatSource = await readFile(new URL('../scripts/mi-web-chat.mjs', import.meta.url), 'utf8');
+const imessageRuntimeSource = await readFile(new URL('../scripts/mi-imessage-runtime.mjs', import.meta.url), 'utf8');
 const notifySource = await readFile(new URL('../src/notify.ts', import.meta.url), 'utf8');
 
 assert.doesNotMatch(cronSource, /shell:\s*true/, 'Mi cron must not execute commands through a shell');
@@ -28,9 +29,9 @@ assert.match(flueSource, /env: reducedPiEnv\(/, 'Mi chat fallback must use a red
 assert.match(flueSource, /'--no-extensions', '--extension', guard/, 'Mi chat fallback must disable ambient extensions and load only the capability guard');
 assert.doesNotMatch(flueSource, /env: process\.env/, 'Mi chat fallback must not pass full process.env');
 
-assert.match(webChatSource, /process\.env\.MI_CHAT_TOOLS \|\| 'read,grep,find,ls'/, 'iMessage chat fallback must deny raw bash by default');
-assert.match(webChatSource, /MI_CAPABILITY_GRANTS_FILE: grantsFile/, 'iMessage chat fallback must pass an explicit capability grant file');
-assert.match(webChatSource, /env: reducedPiEnv\(/, 'iMessage chat fallback must use a reduced env');
+assert.match(webChatSource, /MI_WEB_MAINTENANCE/, 'Web chat requires explicit maintenance mode');
+assert.match(imessageRuntimeSource, /MI_CAPABILITY_GRANTS_FILE: grants/, 'iMessage runtime passes explicit capability grants');
+assert.match(imessageRuntimeSource, /reducedEnvironment\(/, 'iMessage runtime uses a reduced Pi environment');
 assert.match(notifySource, /MI_PUSHOVER_NOTIFY \|\| process\.env\.MI_PUSHOVER_FALLBACK/, 'Pushover notifications must be opt-in only');
 assert.match(notifySource, /if \(!pushoverEnabled\(\)\) return \{ skipped: true \}/, 'Pushover must skip before reading credentials unless explicitly enabled');
 assert.match(webChatSource, /if \(!pushoverEnabled\(\)\) return false/, 'Mi web chat Pushover must be opt-in only');
@@ -57,9 +58,8 @@ assert.match(daemonSource, /profile === "advisor-read"[\s\S]*--skill", advisorRo
 assert.match(daemonSource, /trustedAdvisorSkillRoot\(\)[\s\S]*rights: \["read"\]/, 'advisor skill grants are resolved and read-only');
 assert.match(guardSource, /isTrustedAdvisorReadGrant[\s\S]*profile === 'advisor-read'/, 'guard makes the narrow trusted advisor read exception explicitly');
 assert.match(guardSource, /PROTECTED_PATH_NAMES[\s\S]*credentials[\s\S]*config/, 'Capability guard must exclude credential, configuration, and state paths');
-assert.match(webChatSource, /MI_IMESSAGE_WORKSPACE_CWD/, 'iMessage workspace cwd uses the durable workspace-specific setting');
-assert.doesNotMatch(webChatSource, /MI_IMESSAGE_WORK_CWD/, 'iMessage workspace cwd does not accept the legacy alternate setting');
-assert.match(webChatSource, /url\.pathname === '\/api\/worker-state'[\s\S]*activeCoordinatorCount/, 'web chat exposes only content-free coordinator counts for restart safety');
+assert.match(imessageRuntimeSource, /MI_IMESSAGE_WORKSPACE_CWD/, 'iMessage runtime uses the durable workspace-specific setting');
+assert.match(webChatSource, /url\.pathname === '\/api\/worker-state'[\s\S]*activeCoordinatorCount/, 'web chat exposes only content-free worker counts for maintenance');
 assert.match(guardSource, /return \{ block: true, reason: decision\.reason \}/, 'Capability guard must block denied tool calls');
 assert.match(guardSource, /appendFileSync\(auditPath/, 'Capability guard must audit allow/deny decisions');
 

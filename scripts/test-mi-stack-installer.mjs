@@ -29,8 +29,8 @@ await writeFile(path.join(bin, 'sudo'), `#!/bin/bash\necho sudo >> ${JSON.string
 await writeFile(path.join(bin, 'systemctl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(systemctlCalls)}\nexit 0\n`);
 await chmod(path.join(bin, 'sudo'), 0o700);
 await chmod(path.join(bin, 'systemctl'), 0o700);
-const stageNames = ['production-gateway', 'gateway-client', 'production-registry', 'tailscale-web', 'user-units', 'photon-loopback', 'generated-entrypoints', 'readiness'];
-const userStages = new Set(['gateway-client', 'production-registry', 'tailscale-web', 'user-units']);
+const stageNames = ['production-gateway', 'gateway-client', 'production-registry', 'user-units', 'photon-loopback', 'generated-entrypoints', 'readiness'];
+const userStages = new Set(['gateway-client', 'production-registry', 'user-units']);
 const stageLog = path.join(tmp, 'stage-log');
 const stageEnvLog = path.join(tmp, 'stage-env-log');
 for (const name of stageNames.filter((name) => name !== 'generated-entrypoints')) {
@@ -233,15 +233,15 @@ const rollbackSettingsBefore = Buffer.from('{\n  "enabledModels": ["other/model"
 const rollbackModelsBefore = Buffer.from('{\n  "providers": {"other": {"models": [{"id": "model"}]}}\n}\n');
 await writeFile(path.join(rollbackDir, 'settings.json'), rollbackSettingsBefore);
 await writeFile(path.join(rollbackDir, 'models.json'), rollbackModelsBefore);
-for (const name of stageNames.filter((name) => !['gateway-client', 'production-registry', 'tailscale-web'].includes(name))) {
+for (const name of stageNames.filter((name) => !['gateway-client', 'production-registry', 'photon-loopback'].includes(name))) {
   await writeFile(path.join(rollbackStages, name), '#!/bin/sh\nexit 0\n');
   await chmod(path.join(rollbackStages, name), 0o700);
 }
-await writeFile(path.join(rollbackStages, 'tailscale-web'), `#!/bin/sh\nprintf 'changed\\n' > ${JSON.stringify(path.join(rollbackDir, 'settings.json'))}\nprintf 'changed\\n' > ${JSON.stringify(path.join(rollbackDir, 'models.json'))}\nexit 24\n`);
-await chmod(path.join(rollbackStages, 'tailscale-web'), 0o700);
+await writeFile(path.join(rollbackStages, 'photon-loopback'), `#!/bin/sh\nprintf 'changed\\n' > ${JSON.stringify(path.join(rollbackDir, 'settings.json'))}\nprintf 'changed\\n' > ${JSON.stringify(path.join(rollbackDir, 'models.json'))}\nexit 24\n`);
+await chmod(path.join(rollbackStages, 'photon-loopback'), 0o700);
 result = run([], { MI_STACK_HOME: rollbackHome, MI_SYSTEM_ROOT: rollbackRoot, MI_STACK_STAGE_COMMAND_DIR: rollbackStages });
 assert.notEqual(result.status, 0);
-assert.match(result.stderr, /stage tailscale-web; restoring/);
+assert.match(result.stderr, /stage photon-loopback; restoring/);
 assert.deepEqual(await readFile(path.join(rollbackDir, 'settings.json')), rollbackSettingsBefore, 'post-registry failure restores settings byte-for-byte');
 assert.deepEqual(await readFile(path.join(rollbackDir, 'models.json')), rollbackModelsBefore, 'post-registry failure restores models byte-for-byte');
 assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'post-registry rollback preserves service state byte-for-byte');
@@ -272,19 +272,19 @@ assert.equal(result.status, 0, result.stderr);
 assert.match(result.stderr, /Preserved unknown or modified obsolete entrypoint/);
 assert.match(await readFile(unknown, 'utf8'), /operator-owned/);
 
-// Photon is forced to loopback and removes only its exact known predecessor.
+// Photon has no Web relay setting and preserves operator-owned overrides.
 const photonSecret = path.join(root, 'etc/agent-secrets/projects/assistant/photon.secret');
 const photonOverride = path.join(root, 'etc/systemd/system/mi-photon-bridge.service.d/override.conf');
 await mkdir(path.dirname(photonSecret), { recursive: true });
 await mkdir(path.dirname(photonOverride), { recursive: true });
 await writeFile(photonSecret, 'PHOTON_PROJECT_ID=test-project\nPHOTON_PROJECT_SECRET=test-secret\nPHOTON_ALLOWED_USERS=test-user\n');
-await writeFile(photonOverride, '[Service]\nEnvironment=MI_WEB_URL=http://localhost:8787\n');
+await writeFile(photonOverride, '[Service]\nEnvironment=OPERATOR_SETTING=preserve\n');
 result = spawnSync('bash', [path.join(repo, 'scripts/install-mi-imessage-stack-root.sh')], {
   env: { ...env, MI_APP_DIR: repo, MI_SYSTEM_ROOT: root }, encoding: 'utf8',
 });
 assert.equal(result.status, 0, result.stderr);
-assert.match(await readFile(path.join(root, 'etc/systemd/system/mi-photon-bridge.service'), 'utf8'), /MI_WEB_URL=http:\/\/127\.0\.0\.1:8787/);
-assert.equal(spawnSync('test', ['-e', photonOverride]).status, 1, 'exact obsolete Photon override is removed');
+assert.doesNotMatch(await readFile(path.join(root, 'etc/systemd/system/mi-photon-bridge.service'), 'utf8'), /MI_WEB_URL/);
+assert.match(await readFile(photonOverride, 'utf8'), /OPERATOR_SETTING/, 'operator Photon overrides are preserved');
 assert.equal(await readFile(serviceState, 'utf8'), beforeServiceState, 'Photon file install preserves active and enabled states byte-for-byte');
 assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'Photon file install makes no systemctl call');
 await mkdir(path.dirname(photonOverride), { recursive: true });
@@ -310,7 +310,7 @@ await copyFile(path.join(repo, 'systemd/mi-web-chat.service.d/10-mi-runtime.conf
 await writeFile(path.join(home, '.config/systemd/user/mi-daemon.service'), `[Service]\nExecStart=${process.execPath} ${path.join(repo, 'pi/extensions/mi-daemon.mjs')}\nPrivateTmp=true\nProtectSystem=full\nEnvironment=PATH=${path.dirname(process.execPath)}:/usr/bin:/bin\n`);
 await writeFile(path.join(home, '.config/systemd/user/mi-tick.service'), '[Service]\nEnvironment=MI_PROACTIVE_IMESSAGE_NOTIFY=false\nEnvironment=MI_IMESSAGE_MONITOR_ENABLED=false\n');
 await mkdir(path.join(root, 'etc/systemd/system'), { recursive: true });
-await writeFile(path.join(root, 'etc/systemd/system/mi-photon-bridge.service'), '[Service]\nEnvironment=MI_WEB_URL=http://127.0.0.1:8787\n');
+await writeFile(path.join(root, 'etc/systemd/system/mi-photon-bridge.service'), '[Service]\nEnvironment=MI_ROOT=/home/kyle/assistant\n');
 const registry = path.join(home, '.pi/agent');
 await mkdir(registry, { recursive: true });
 await writeFile(path.join(registry, 'settings.json'), JSON.stringify({ enabledModels: ['vps-gateway/coding-main', 'vps-gateway/mi-concierge'] }));
@@ -320,7 +320,7 @@ result = run(['--check'], { MI_GATEWAY_CONFIG_DIR: registry, MI_NODE_BIN: proces
 assert.equal(result.status, 0, result.stderr);
 assert.equal((await readFile(sudoCount, 'utf8')).trim().split('\n').filter(Boolean).length, sudoChecksBefore + 1, 'non-root check crosses sudo exactly once');
 const checkSudoCall = (await readFile(sudoCalls, 'utf8')).trim().split('\n').at(-1);
-assert.match(checkSudoCall, /env -i MI_APP_DIR=\/home\/kyle\/.pi\/worktrees\/mi-pi-clean-integration/);
+assert.match(checkSudoCall, new RegExp(`env -i MI_APP_DIR=${repo.replace(/[./]/g, '\\$&')}`));
 assert.match(checkSudoCall, /MI_STACK_HOME=/);
 assert.match(checkSudoCall, /PATH=\/usr\/local\/sbin:.*install-mi-stack-root\.sh --check$/);
 assert.doesNotMatch(checkSudoCall, /ROOT_XDG_LEAK|inherited-home|inherited-config/);

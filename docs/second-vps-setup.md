@@ -32,7 +32,7 @@ Prepare a supported Linux VPS with:
 - a separate Photon project connected to the new iMessage number; and
 - sudo access for installation.
 
-The web installer calls `tailscale status` and `tailscale cert`. The staged stack check verifies files and safeguards. It does not require the web, Photon, or tick units to be active; the first activation starts only the daemon.
+The explicit maintenance Web installer calls `tailscale status` and `tailscale cert`. The normal stack check verifies files and safeguards. It does not install or require Web chat. Activation starts only services that Kyle separately approves.
 
 The gateway installer renders account paths from explicit settings. It rejects placeholders, relative or unclean paths, symlinks, account-home mismatches, and unexpected owners before changing gateway files or restarting the service.
 
@@ -160,7 +160,7 @@ sudo env \
   "$MI_ROOT/scripts/install-mi-stack.sh"
 ```
 
-The script installs the production gateway, then the brokered gateway client and its non-secret `coding-main` Pi registry baseline, then the production Pi aliases, Tailscale web unit, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It writes files only: it does not reload, enable, start, stop, or restart those services. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
+The script installs the production gateway, then the brokered gateway client and its non-secret `coding-main` Pi registry baseline, then the production Pi aliases, Mi daemon, tick timer, Photon bridge, and generated home entrypoint. It does not install Web chat in the normal stack. It writes files only and does not reload, enable, start, stop, or restart services. It makes owner-only backups of replaced Mi unit files and drop-in folders. Preview its stages first if needed:
 
 ```bash
 MI_APP_DIR="$MI_ROOT" "$MI_ROOT/scripts/install-mi-stack.sh" --dry-run
@@ -168,7 +168,7 @@ MI_APP_DIR="$MI_ROOT" "$MI_ROOT/scripts/install-mi-stack.sh" --dry-run
 
 Add private service settings through systemd drop-ins, not `.env` files. Set these values in the matching units:
 
-- `mi-web-chat.service`: `MI_ROOT`, `MI_IMESSAGE_WORKSPACE_ROOT`, `MI_IMESSAGE_WORK_CWD`, and, if needed, `MI_ADVISOR_SKILL_PATH`.
+- the explicit maintenance `mi-web-chat.service`: set `MI_WEB_MAINTENANCE=1`, `MI_ROOT`, and approved workspace paths.
 - `mi-daemon.service`: `MI_ROOT`, `MI_WORKFLOWS_DIR`, and `MI_ADVISOR_SKILL_PATH`.
 - `mi-tick.service`: `MI_ROOT`, notification choices, and monitor choice.
 - `mi-photon-bridge.service`: `MI_ROOT`.
@@ -191,15 +191,14 @@ sudo systemctl daemon-reload
 systemctl --user daemon-reload
 ```
 
-Start gateway, Mi daemon, and Photon only in separate approved commands:
+Start gateway and Photon only in separate approved commands. Photon is the only normal user-facing service. The runtime starts the daemon on demand:
 
 ```bash
 sudo systemctl start llm-gateway.service
-systemctl --user start mi-daemon.service
 sudo systemctl start mi-photon-bridge.service
 ```
 
-Leave the timer, web service, proactive notices, and repair monitor off until each has separate approval. Enabling a unit for boot is a separate approval too.
+Leave the timer, maintenance Web service, proactive notices, and repair monitor off until each has separate approval. Enabling a unit for boot is a separate approval too.
 
 ## 8. Ownership and modes
 
@@ -223,7 +222,7 @@ When the bridge has passed non-send checks, install the narrow repair rule:
 sudo MI_USER="$MI_USER" "$MI_ROOT/scripts/install-mi-imessage-repair-sudoers-root.sh"
 ```
 
-It permits only a restart of `mi-photon-bridge.service`. The monitor also restarts the user services in `MI_IMESSAGE_REPAIR_USER_SERVICES`, which defaults to the web and daemon services.
+It permits only a restart of `mi-photon-bridge.service`. The monitor restarts only `mi-photon-bridge.service`. It does not restart Web chat or the daemon.
 
 Keep `MI_PROACTIVE_IMESSAGE_NOTIFY=false` if this instance should not send automatic iMessages. Turn on the repair monitor only after the new number and allowed-user list are confirmed. Pushover stays opt-in.
 

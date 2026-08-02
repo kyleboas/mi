@@ -315,7 +315,7 @@ try {
   const hardenedUnits = ['mi-daemon.service', 'mi-tick.service', 'mi-tick.timer'];
   const hardenedBytes = await Promise.all(hardenedUnits.map((name) => file(path.join(unitDir, name))));
   for (const [name, prepare, pattern] of [
-    ['unreviewed tick service drop-in', async () => { await mkdir(tickDirs[0], { mode: 0o700 }); await chmod(tickDirs[0], 0o700); await writeFile(path.join(tickDirs[0], '90-mi-staged-activation.conf'), '[Service]\nEnvironment=MI_IMESSAGE_V2=1\n'); }, /refusing unknown hardened tick service drop-in directory bundle/],
+    ['unreviewed tick service drop-in', async () => { await mkdir(tickDirs[0], { mode: 0o700 }); await chmod(tickDirs[0], 0o700); await writeFile(path.join(tickDirs[0], '90-mi-staged-activation.conf'), '[Service]\nEnvironment=MI_OLD_ROUTE=1\n'); }, /refusing unknown hardened tick service drop-in directory bundle/],
     ['unreviewed tick timer drop-in', async () => { await mkdir(tickDirs[1], { mode: 0o700 }); await chmod(tickDirs[1], 0o700); await writeFile(path.join(tickDirs[1], '50-interval.conf'), '[Timer]\nOnCalendar=\nOnCalendar=*:0/5\n'); }, /refusing unknown hardened tick timer drop-in directory bundle/],
     ['loosened tick service drop-in directory', async () => { await mkdir(tickDirs[0]); await chmod(tickDirs[0], 0o755); }, /hardened tick service drop-in directory has an unexpected mode/],
     ['linked tick timer drop-in directory', async () => { await symlink(path.join(temp, 'linked-dropin-target'), tickDirs[1]); }, /symlink component/],
@@ -335,7 +335,7 @@ try {
   await rm(path.join(unitDir, 'mi-tick.service'));
   await mkdir(tickDirs[0], { mode: 0o700 });
   await chmod(tickDirs[0], 0o700);
-  await writeFile(path.join(tickDirs[0], '90-mi-staged-activation.conf'), '[Service]\nEnvironment=MI_IMESSAGE_V2=1\n');
+  await writeFile(path.join(tickDirs[0], '90-mi-staged-activation.conf'), '[Service]\nEnvironment=MI_OLD_ROUTE=1\n');
   result = run(home);
   assert.notEqual(result.status, 0, 'an absent tick base under leftover drop-ins is rejected');
   assert.match(result.stderr, /refusing unknown hardened tick service drop-in directory bundle/);

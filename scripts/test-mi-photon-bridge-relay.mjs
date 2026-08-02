@@ -1,227 +1,101 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-const repoRoot = new URL('..', import.meta.url).pathname;
-
-const bridgeSource = await readFile(join(repoRoot, 'scripts', 'mi-photon-bridge.mjs'), 'utf8');
-assert.match(bridgeSource, /await sendToUser\(target, message, 'notification'\)/, 'notify endpoint sends the message body without a title heading');
-assert.match(bridgeSource, /const pollMs = Number\(process\.env\.MI_PHOTON_POLL_MS \|\| 250\)/, 'Photon defaults to a 250ms local worker-result poll while preserving its override');
-assert.match(bridgeSource, /boundedEnvironmentInteger\('MI_PHOTON_TYPING_DELAY_MS', 100, 0, 5000\)/, 'Photon defaults prompt typing feedback to 100ms and bounds overrides');
-assert.match(bridgeSource, /function startTypingBestEffort\(space, delayMs = photonTypingDelayMs\)/, 'Photon uses the bounded setting for asynchronous prompt typing');
-
-async function readJsonl(path) {
-  if (!existsSync(path)) return [];
-  const text = await readFile(path, 'utf8');
-  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk.toString('utf8'); });
-    req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
-      catch (error) { reject(error); }
-    });
-    req.on('error', reject);
-  });
-}
-
-function startMiServer(workerReply) {
-  const { source, text } = workerReply;
-  const calls = [];
-  let resultAvailableAt = 0;
-  let messagesPolls = 0;
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url || '/', 'http://127.0.0.1');
-      if (req.method === 'POST' && url.pathname === '/api/imessage') {
-        const body = await readBody(req);
-        calls.push({ method: req.method, path: url.pathname, body, at: Date.now() });
-        resultAvailableAt = Date.now() + Number(workerReply.delayMs || 0);
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, reply: 'On it. I’ll follow up here.', handoff: true, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}) }));
-        return;
-      }
-      if (req.method === 'GET' && url.pathname === '/api/messages') {
-        messagesPolls += 1;
-        calls.push({ method: req.method, path: url.pathname, thread: url.searchParams.get('thread'), messagesPolls, at: Date.now() });
-        const messages = messagesPolls >= 2 && Date.now() >= resultAvailableAt
-          ? ([
-            ...(workerReply.raw ? [{ role: 'assistant', source: 'mi-worker-result', text: workerReply.raw, ts: new Date().toISOString() }] : []),
-            ...(workerReply.interleaved ? [{ role: 'assistant', source: 'mi-worker-result', text: workerReply.interleaved, taskId: 'other-task', ts: new Date().toISOString() }] : []),
-            { role: 'assistant', source, text, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}), ts: new Date().toISOString() },
-          ])
-          : [];
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ messages }));
-        return;
-      }
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'not found' }));
-    } catch (error) {
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: error?.message || String(error) }));
-    }
-  });
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      resolve({
-        server,
-        calls,
-        baseUrl: `http://127.0.0.1:${server.address().port}`,
-        get resultAvailableAt() { return resultAvailableAt; },
-        close: () => new Promise((done) => server.close(done)),
-      });
-    });
-  });
-}
-
-function runBridge(env) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['scripts/mi-photon-bridge.mjs'], {
-      cwd: repoRoot,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      reject(new Error(`mi-photon-bridge timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-    }, 10000);
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on('exit', (code, signal) => {
-      clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`mi-photon-bridge exited ${code || signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-    });
-  });
-}
-
-async function runRelayCase(root, name, workerReply) {
-  const dir = join(root, name);
-  await mkdir(dir, { recursive: true });
-  const eventsPath = join(dir, 'events.json');
-  const sendsPath = join(dir, 'sends.jsonl');
+const repoRoot = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const root = await mkdtemp(join(tmpdir(), 'mi-photon-runtime-'));
+const miRoot = join(root, 'assistant');
+const work = join(root, 'work');
+const bin = join(root, 'bin');
+const events = join(root, 'events.json');
+const sends = join(root, 'sends.jsonl');
+const prompts = join(root, 'prompts.jsonl');
+try {
+  await mkdir(join(miRoot, 'pi', 'extensions'), { recursive: true, mode: 0o700 });
+  await cp(join(repoRoot, 'pi', 'extensions'), join(miRoot, 'pi', 'extensions'), { recursive: true });
+  await mkdir(work, { recursive: true, mode: 0o700 });
+  await mkdir(bin, { recursive: true, mode: 0o700 });
+  const fakePi = join(bin, 'pi');
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { appendFile, mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+let buffer = '';
+let settled = false;
+process.stdin.on('data', async (chunk) => {
+  buffer += chunk.toString();
+  if (settled || !buffer.includes('\\n')) return;
+  settled = true;
+  const session = process.argv[process.argv.indexOf('--session') + 1];
+  await mkdir(dirname(session), { recursive: true });
+  await appendFile(session + '.prompts', JSON.stringify({ argv: process.argv.slice(2) }) + '\\n');
+  await writeFile(session, JSON.stringify({ type: 'session', prompt: JSON.parse(buffer).message }) + '\\n', { mode: 0o600 });
+  console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'The durable answer.' }] } }));
+  console.log(JSON.stringify({ type: 'agent_settled' }));
+});
+`, { mode: 0o755 });
   const event = {
-    space: { id: workerReply.spaceId || `${name}-space`, phone: '+15551234567', ...(workerReply.typingStartDelayMs ? { typingStartDelayMs: workerReply.typingStartDelayMs } : {}) },
-    message: {
-      ...(workerReply.omitMessageId ? {} : { id: workerReply.messageId || `${name}-message` }),
-      direction: 'inbound',
-      sender: { id: '+15551234567' },
-      ...(workerReply.timestamp === undefined ? {} : { timestamp: workerReply.timestamp }),
-      content: { type: 'text', text: workerReply.body || 'check detect status' },
-    },
+    space: { id: 'space-one', phone: '+15551234567' },
+    message: { id: 'upstream-one', timestamp: '2026-01-01T00:00:00Z', direction: 'inbound', sender: { id: '+15551234567' }, content: { type: 'text', text: 'check the status' } },
   };
-  await writeFile(eventsPath, JSON.stringify(workerReply.repeatIdentical ? [event, structuredClone(event)] : [event], null, 2));
-  await writeFile(sendsPath, '');
-
-  const mi = await startMiServer(workerReply);
-  try {
-    const result = await runBridge({
+  const missingIdentity = {
+    space: { id: 'space-one', phone: '+15551234567' },
+    message: { timestamp: '2026-01-01T00:00:01Z', direction: 'inbound', sender: { id: '+15551234567' }, content: { type: 'text', text: 'retry me' } },
+  };
+  await writeFile(events, JSON.stringify([event, structuredClone(event), missingIdentity]));
+  await writeFile(sends, '');
+  const child = spawn(process.execPath, ['scripts/mi-photon-bridge.mjs'], {
+    cwd: repoRoot,
+    env: {
       ...process.env,
+      MI_ROOT: miRoot,
+      MI_IMESSAGE_WORKSPACE_ROOT: work,
+      MI_IMESSAGE_WORKSPACE_CWD: work,
+      MI_DAEMON_PATH: join(miRoot, 'pi', 'extensions', 'mi-daemon.mjs'),
+      PI_CMD: fakePi,
       PHOTON_PROJECT_ID: 'test-project',
       PHOTON_PROJECT_SECRET: 'test-secret',
       PHOTON_ALLOWED_USERS: '+15551234567',
       PHOTON_BOOT_TEST_SEND: '0',
-      MI_WEB_URL: mi.baseUrl,
-      MI_PHOTON_THREAD: 'main',
-      MI_PHOTON_POLL_MS: '25',
-      MI_PHOTON_MAX_WAIT_MS: '3000',
-      MI_PHOTON_MAX_REPLY_CHARS: '1200',
       MI_PHOTON_NOTIFY_PORT: '0',
       MI_PHOTON_TEST: '1',
-      MI_PHOTON_TEST_EVENTS: eventsPath,
-      MI_PHOTON_TEST_SENDS: sendsPath,
-      ...(workerReply.env || {}),
-    });
-    assert.match(result.stdout, /imessage handoff - polling for (?:task|legacy worker) result/, `${name}: bridge should poll after handoff`);
-
-    const allSends = await readJsonl(sendsPath);
-    const sends = allSends.filter((entry) => entry.kind === 'message');
-    const expectedMessages = workerReply.repeatIdentical ? 2 : 1;
-    assert.equal(sends.length, expectedMessages, `${name}: bridge should send only the completed worker result for each inbound event`);
-    assert.equal(sends.filter((entry) => entry.text === 'On it. I’ll follow up here.').length, 0, `${name}: internal handoff acknowledgement must not reach iMessage`);
-    assert.equal(sends.filter((entry) => entry.text === workerReply.text).length, expectedMessages);
-    for (const sent of sends) assert.equal(sent.phone, '+15551234567');
-    if (workerReply.delayMs) {
-      assert.ok(Date.parse(sends[0].ts) >= mi.resultAvailableAt, `${name}: reply must wait for the completed worker result`);
-      const firstPoll = mi.calls.find((call) => call.method === 'GET' && call.path === '/api/messages');
-      assert.ok(firstPoll && firstPoll.at <= Date.parse(sends[0].ts), `${name}: result polling must precede the only reply`);
-    }
-
-    const inboundCall = mi.calls.find((call) => call.method === 'POST' && call.path === '/api/imessage');
-    assert.ok(inboundCall && inboundCall.body.message === (workerReply.body || 'check detect status') && inboundCall.body.thread === 'main', `${name}: bridge should forward inbound iMessage to Mi web`);
-    if (workerReply.repeatIdentical) {
-      const inboundCalls = mi.calls.filter((call) => call.method === 'POST' && call.path === '/api/imessage');
-      assert.equal(inboundCalls.length, 2, `${name}: identical events without identity must both be processed`);
-      assert.equal(inboundCalls[0].body.deliveryId, undefined, `${name}: no identity must fail toward processing without inventing a dedupe id`);
-      assert.equal(inboundCalls[1].body.deliveryId, undefined, `${name}: no identity must not retain plaintext or a guessed id`);
-    } else {
-      assert.equal(typeof inboundCall.body.deliveryId, 'string', `${name}: bridge should send a bounded delivery identifier`);
-      assert.ok(/^[A-Za-z0-9._:-]{1,200}$/.test(inboundCall.body.deliveryId), `${name}: delivery identifier uses the web API format`);
-    }
-    assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
-    return { deliveryId: inboundCall.body.deliveryId, sends: allSends, inboundAt: inboundCall.at, result };
-  } finally {
-    await mi.close();
-  }
-}
-
-const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
-try {
-  // Leave enough scheduling room for the child bridge to send its acknowledgement
-  // under the full test suite's CPU load before the fake result becomes ready.
-  const retryIdOne = await runRelayCase(root, 'delayed-exact-task-id-one', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 1000, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
-  const retryIdTwo = await runRelayCase(root, 'delayed-exact-task-id-two', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 1000, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
-  assert.equal(retryIdOne.deliveryId, retryIdTwo.deliveryId, 'retrying the same upstream event reuses its delivery identifier');
-  await runRelayCase(root, 'identical-no-identity', { source: 'mi-worker-result', omitMessageId: true, repeatIdentical: true, taskId: 'wanted-task', text: 'Both distinct messages must be processed.' });
-  const fallbackIdOne = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, timestamp: '2026-01-01T00:00:00.000Z', taskId: 'wanted-task', text: 'Fallback identifier result.' });
-  const fallbackIdTwo = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, timestamp: '2026-01-01T00:00:00.000Z', taskId: 'wanted-task', text: 'Fallback identifier result.' });
-  assert.equal(fallbackIdOne.deliveryId, fallbackIdTwo.deliveryId, 'fallback digest stays stable when the upstream event has no id');
-  const differentBucketMessage = await runRelayCase(root, 'fallback-different-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'a different message', text: 'Fallback identifier result.' });
-  const sameBucketMessage = await runRelayCase(root, 'fallback-same-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'check detect status', text: 'Fallback identifier result.' });
-  assert.notEqual(differentBucketMessage.deliveryId, sameBucketMessage.deliveryId, 'fallback digest distinguishes same-bucket message content');
-  assert.match(fallbackIdOne.deliveryId, /^photon-[a-f0-9]{32}$/, 'fallback identifier is a bounded digest and does not contain message text');
-  await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
-  await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
-
-  const defaultTyping = await runRelayCase(root, 'typing-default', { source: 'mi-worker-result', taskId: 'typing-default', delayMs: 350, text: 'Typing feedback default.' });
-  const defaultStart = defaultTyping.sends.find((entry) => entry.kind === 'typing-start');
-  assert.ok(defaultStart, 'default prompt typing feedback starts before a delayed worker result');
-  assert.match(defaultTyping.result.stdout, /photon typing scheduled delay=100ms/, 'default prompt typing retains the bounded 100ms feedback delay');
-
-  const overriddenTyping = await runRelayCase(root, 'typing-override', { source: 'mi-worker-result', taskId: 'typing-override', delayMs: 350, text: 'Typing feedback override.', env: { MI_PHOTON_TYPING_DELAY_MS: '0' } });
-  const overriddenStart = overriddenTyping.sends.find((entry) => entry.kind === 'typing-start');
-  assert.ok(overriddenStart, 'a valid typing override starts prompt feedback');
-  assert.match(overriddenTyping.result.stdout, /photon typing scheduled delay=0ms/, 'a zero-delay override is applied without retaining the default delay');
-
-  for (const invalid of ['-1', '5001', '1.5', 'not-a-number']) {
-    const invalidTyping = await runRelayCase(root, `typing-invalid-${invalid.replace(/[^a-z0-9]/gi, '-')}`, { source: 'mi-worker-result', taskId: `typing-invalid-${invalid}`, delayMs: 250, text: 'Invalid typing fallback.', env: { MI_PHOTON_TYPING_DELAY_MS: invalid } });
-    const invalidStart = invalidTyping.sends.find((entry) => entry.kind === 'typing-start');
-    assert.match(invalidTyping.result.stderr, /Invalid MI_PHOTON_TYPING_DELAY_MS; using safe default 100ms\./, `${invalid}: invalid values fail closed to the safe default`);
-    assert.ok(invalidStart, `${invalid}: invalid values still provide prompt typing feedback`);
-    assert.match(invalidTyping.result.stdout, /photon typing scheduled delay=100ms/, `${invalid}: invalid values retain safe prompt feedback timing`);
-  }
-
-  const noFinalDelay = await runRelayCase(root, 'typing-does-not-delay-final-send', { source: 'mi-worker-result', taskId: 'typing-final', text: 'Final reply is not blocked.', typingStartDelayMs: 300, env: { MI_PHOTON_TYPING_DELAY_MS: '0' } });
-  const delayedTypingStart = noFinalDelay.sends.find((entry) => entry.kind === 'typing-start');
-  const finalMessage = noFinalDelay.sends.find((entry) => entry.kind === 'message');
-  assert.ok(delayedTypingStart && finalMessage, 'typing and final reply are both emitted');
-  assert.ok(Date.parse(finalMessage.ts) < Date.parse(delayedTypingStart.ts), 'an in-flight typing RPC never delays the final send');
-  console.log('Mi Photon bridge relay checks passed.');
+      MI_PHOTON_TEST_EVENTS: events,
+      MI_PHOTON_TEST_SENDS: sends,
+      MI_IMESSAGE_COORDINATOR_TIMEOUT_MS: '5000',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  const status = await new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+  assert.equal(status, 0, `${stdout}\n${stderr}`);
+  const sent = (await readFile(sends, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse).filter((entry) => entry.kind === 'message');
+  assert.equal(sent.length, 2, 'duplicate delivery starts no second Pi turn');
+  assert.ok(sent.some((entry) => entry.text === 'The durable answer.'), `runtime sends the completed Pi reply: ${JSON.stringify(sent)}\n${stdout}\n${stderr}`);
+  assert.ok(sent.some((entry) => entry.text === 'Please retry that message. I need its upstream ID and timestamp before I can process it.'), 'missing upstream identity gets the fixed retry request');
+  const conversationRoot = join(miRoot, 'state', 'imessage', 'conversations');
+  assert.ok(existsSync(conversationRoot), 'runtime state was created under state/imessage');
+  const conversations = await (await import('node:fs/promises')).readdir(conversationRoot);
+  const promptLines = (await readFile(join(conversationRoot, conversations[0], 'session.jsonl.prompts'), 'utf8')).trim().split('\n').filter(Boolean);
+  assert.equal(promptLines.length, 1, 'one upstream delivery creates exactly one Pi prompt');
+  const args = JSON.parse(promptLines[0]).argv;
+  assert.ok(args.includes('--session'), 'Pi receives a durable session path');
+  assert.ok(!args.includes('--session-dir') && !args.includes('--no-session'), 'Pi receives no session fallback flags');
+  assert.equal(conversations.length, 1, 'space identity creates one conversation directory');
+  const deliveryRoot = join(conversationRoot, conversations[0], 'deliveries');
+  const deliveryFiles = await (await import('node:fs/promises')).readdir(deliveryRoot);
+  assert.equal(deliveryFiles.length, 1, 'delivery state is retained');
+  const record = JSON.parse(await readFile(join(deliveryRoot, deliveryFiles[0]), 'utf8'));
+  assert.equal(record.status, 'sent', 'delivery is marked sent after Photon send success');
+  assert.equal('rawMessage' in record, false, 'completed delivery state erases raw message text');
+  assert.equal((await stat(join(conversationRoot, conversations[0]))).mode & 0o777, 0o700, 'conversation directory is private');
+  assert.equal((await stat(join(deliveryRoot, deliveryFiles[0]))).mode & 0o777, 0o600, 'delivery record is private');
+  console.log('Mi Photon direct runtime checks passed.');
 } finally {
   await rm(root, { recursive: true, force: true });
 }

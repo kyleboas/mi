@@ -13,6 +13,7 @@ safe_path() {
   esac
 }
 require_safe_path() { safe_path "$1" || fail "unsafe path for $2"; }
+[[ "${MI_WEB_MAINTENANCE:-0}" == 1 ]] || fail 'set MI_WEB_MAINTENANCE=1 for the explicit maintenance Web mode'
 require_below() {
   case "$1" in "$2"/*) ;; *) fail "$3 must be under $2" ;; esac
 }
@@ -171,6 +172,7 @@ After=network-online.target llm-gateway.service
 Type=simple
 WorkingDirectory=$ROOT
 Environment=MI_ROOT=$ROOT
+Environment=MI_WEB_MAINTENANCE=1
 ExecStartPre=/usr/bin/tailscale cert --cert-file $CERT_PATH --key-file $KEY_PATH $DNS_NAME
 ExecStart=/usr/bin/env node $ROOT/scripts/mi-web-chat.mjs
 Restart=on-failure

@@ -19,7 +19,7 @@ Preview or inspect without mutation or sudo:
 /home/kyle/install-mi-stack.sh --check
 ```
 
-The check reports fixed expected values only: the two production aliases, Photon loopback URL, TLS path shape, helper path, and PATH shape. It also checks that the daemon uses its reviewed private extension path and sandbox settings. It does not dump process environments, registry contents, host DNS names, prompts, or credentials. Gateway readiness uses the existing authenticated local health helper.
+The check reports fixed expected values only: the two production aliases, Photon service, helper path, and PATH shape. It also checks that the daemon uses its reviewed private extension path and sandbox settings. It does not dump process environments, registry contents, host DNS names, prompts, or credentials. Gateway readiness uses the existing authenticated local health helper.
 
 Production install first writes the tracked non-secret `coding-main` baseline through the gateway-client stage, then adds `mi-concierge` (medium). It removes installed `mi-eval-*` aliases and overlay state, and preserves unrelated Pi registry providers/models/settings. The production alias stage fails instead of guessing a missing baseline. Evaluation remains an explicit separate cycle:
 
@@ -29,7 +29,7 @@ npm run eval:mi-models
 sudo /home/kyle/uninstall-mi-model-eval-gateway.sh
 ```
 
-The legacy V1 router remains available through `MI_IMESSAGE_V2=0`; the production registry installed by the stack continues to support shared/V1 callers.
+Normal iMessage operation does not use Web chat or a legacy router. The focused runtime owns durable conversation sessions and delivery recovery.
 
 ## Safe cleanup manifest
 
@@ -42,11 +42,11 @@ The canonical installer archives only a wrapper whose SHA-256 matches its known 
 - `~/install-mi-model-eval-gateway.sh` — replace from tracked source only when ownership matches.
 - `~/uninstall-mi-model-eval-gateway.sh` — replace from tracked source only when ownership matches.
 
-The web installer similarly removes only exact known Mi-owned predecessor drop-ins and preserves unrelated content. Photon removes only the exact obsolete `localhost` loopback drop-in; arbitrary administrator files are never removed.
+The Web installer removes only exact known Mi-owned predecessor drop-ins and preserves unrelated content.
 
 ## First safe activation
 
-The stack install writes files only. It does not reload, enable, start, stop, or restart the gateway, web service, Photon bridge, daemon, or timer. It writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and `MI_IMESSAGE_MONITOR_ENABLED=false` into the tick unit.
+The stack install writes files only. It does not reload, enable, start, stop, or restart the gateway, Photon bridge, daemon, or timer. It does not install the maintenance Web unit. It writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and `MI_IMESSAGE_MONITOR_ENABLED=false` into the tick unit.
 
 First check the installed paths and sandbox settings: the daemon path must stay under the reviewed Mi root, `PrivateTmp=true`, `ProtectSystem=full`, the service-user PATH must be fixed, writable paths must be limited to the reviewed state, runtime, Mi home, and workflow folders, and both tick settings must be false.
 
@@ -58,15 +58,14 @@ sudo systemctl daemon-reload
 systemctl --user daemon-reload
 ```
 
-Start each approved service in a separate command. Gateway and Photon approval is separate from Mi daemon approval:
+Start the gateway and Photon in separate approved commands. The runtime starts the daemon on demand when delegated work needs it:
 
 ```bash
 sudo systemctl start llm-gateway.service
-systemctl --user start mi-daemon.service
 sudo systemctl start mi-photon-bridge.service
 ```
 
-Leave `mi-tick.timer`, the web service, proactive notices, and the repair monitor off until each has later, separate approval. Enabling a unit for startup is also a separate approval.
+Leave `mi-tick.timer`, proactive notices, and the repair monitor off until each has later, separate approval. Install Web chat only for explicit maintenance with `MI_WEB_MAINTENANCE=1`. Enabling a unit for startup is also a separate approval.
 
 ## Rollback
 

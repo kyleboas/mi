@@ -17,7 +17,7 @@ Runtime assistants do not silently rewrite their own rules.
 - Read access is the default for scoped workers.
 - A write worker is limited to its approved workspace.
 - Deploying, publishing, merging, deleting data, changing secrets, spending money, and sending outside messages need a clear approval path.
-- The iMessage coordinator loads only the Mi capability guard and the reviewed Mi adapter. It disables normal extension, skill, theme, prompt-template, and context-file discovery.
+- The iMessage runtime loads only the reviewed Mi capability guard, adapter, and Diver Notes extension. It disables normal extension, skill, theme, prompt-template, and context-file discovery.
 - Direct advisor work loads only the reviewed advisor skill and gives it read access.
 - Mi has no public control webhook by default.
 
@@ -68,7 +68,7 @@ Mi reads Pi sessions from `~/.pi/agent/sessions`. It stores its daemon runtime u
 
 `mi tick` runs due reminder crons, removes expired capability grants, runs memory consolidation when due, and calls the iMessage repair monitor. Its lock is `state/tick.lock` under `MI_ROOT`.
 
-The stack timer runs every minute. The iMessage monitor has its own interval and defaults to 15 minutes. The monitor may restart only the Photon bridge and the named local Mi user services. The system bridge restart needs the narrow sudoers rule from `scripts/install-mi-imessage-repair-sudoers-root.sh`.
+The stack timer runs every minute. The iMessage monitor has its own interval and defaults to 15 minutes. The monitor may restart only the Photon bridge. The system bridge restart needs the narrow sudoers rule from `scripts/install-mi-imessage-repair-sudoers-root.sh`.
 
 The Photon bridge offers a loopback-only notification endpoint. Tick can use it when `MI_PROACTIVE_IMESSAGE_NOTIFY=true`. Pushover remains opt-in.
 
@@ -78,12 +78,13 @@ Default locations are split by purpose:
 
 - `~/assistant/state` or `$MI_ROOT/state`: threads, events, approvals, memory, tick lock, web data, and iMessage monitor records.
 - `~/mi/state`: reminder crons, cron logs, task rows, and dismissed task rows.
-- `~/.pi/agent/mi`: daemon socket, daemon log, short-lived capability grants, and coordinator policy/session files.
-- `~/.pi/agent/sessions`: Pi sessions.
+- `~/.pi/agent/mi`: daemon socket, daemon log, short-lived capability grants, and coordinator policy files.
+- `$MI_ROOT/state/imessage/conversations`: private per-conversation Pi sessions and delivery records.
+- `~/.pi/agent/sessions`: general Pi sessions.
 - `~/mi/memory.md` and `~/mi/preferences.md`: the small user-facing memory and preference files used by chat.
 
 These paths contain private data. Do not copy them when making a clean second instance.
 
 ## Installation
 
-The complete stack installer adds the production gateway registry, brokered gateway helper, Tailscale web service, Mi daemon, tick timer, Photon bridge, and generated home entrypoints. See [the stack guide](mi-stack.md). For a clean second VPS and a different phone number, use [the second VPS guide](second-vps-setup.md).
+The complete stack installer adds the production gateway registry, brokered gateway helper, Mi daemon, tick timer, Photon bridge, and generated home entrypoints. It does not install Web chat in the normal stack. Install Web chat separately with `MI_WEB_MAINTENANCE=1` for explicit maintenance. See [the stack guide](mi-stack.md). For a clean second VPS and a different phone number, use [the second VPS guide](second-vps-setup.md).

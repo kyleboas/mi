@@ -20,6 +20,7 @@ const run = (home, root, config = path.join(home, '.config')) => spawnSync('bash
     HOME: home,
     XDG_CONFIG_HOME: config,
     MI_APP_DIR: root,
+    MI_WEB_MAINTENANCE: '1',
     PATH: `${bin}:${process.env.PATH}`,
   },
   encoding: 'utf8',
@@ -114,6 +115,7 @@ try {
   assert.doesNotMatch(unit, /hermes/);
   assert.match(unit, /Wants=llm-gateway\.service/);
   assert.match(unit, /After=network-online\.target llm-gateway\.service/);
+  assert.match(unit, /Environment=MI_WEB_MAINTENANCE=1/);
   const expectedNvmPiBin = `${home}/.nvm/versions/node/v24.15.0/bin`;
   assert.match(dropin, /Environment=MI_GATEWAY_CLIENT=.*\.local\/share\/mi\/mi-gateway-client\.py/);
   assert.match(dropin, /Environment=PI_CMD=.*\/bin\/pi-gateway/);
@@ -133,8 +135,9 @@ try {
   assert.equal(await readFile(systemctlCalls, 'utf8'), '', 'web unit install writes files without daemon-reload, enable, start, or restart');
 
   const stackInstaller = await readFile(path.resolve(import.meta.dirname, 'install-mi-imessage-stack-root.sh'), 'utf8');
-  assert.match(stackInstaller, /known_obsolete=.*localhost:8787/, 'stack installer identifies one exact obsolete loopback spelling');
-  assert.match(stackInstaller, /Preserved unknown or modified Photon override/, 'stack installer preserves arbitrary administrator files');
+  assert.doesNotMatch(stackInstaller, /MI_WEB_URL|localhost:8787/, 'Photon installer has no Web relay dependency');
+  const webInstaller = await readFile(path.resolve(import.meta.dirname, 'install-mi-web-chat-systemd.sh'), 'utf8');
+  assert.match(webInstaller, /MI_WEB_MAINTENANCE/, 'Web installer requires explicit maintenance mode');
   console.log('Mi web chat systemd installer checks passed.');
 } finally {
   await rm(tmp, { recursive: true, force: true });

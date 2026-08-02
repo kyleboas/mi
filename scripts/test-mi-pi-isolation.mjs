@@ -87,8 +87,11 @@ try {
   const guard = path.join(repo, 'pi/extensions/mi-capability-guard.ts');
   const adapter = path.join(repo, 'pi/extensions/mi-orchestrator-adapter.ts');
   const diverNotes = path.join(repo, 'pi/extensions/mi-diver-notes.ts');
-  const coordinator = miCoordinatorLaunch({ piCommand: 'pi', cwd: repo, runtimeDir: temp, model: 'test', capabilityGuardPath: guard, capabilityAdapterPath: adapter, diverNotesPath: diverNotes });
+  const sessionPath = path.join(temp, 'state', 'imessage', 'conversations', 'imessage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'session.jsonl');
+  const coordinator = miCoordinatorLaunch({ piCommand: 'pi', cwd: repo, sessionPath, model: 'test', capabilityGuardPath: guard, capabilityAdapterPath: adapter, diverNotesPath: diverNotes });
   assert.ok(coordinator.args.includes('--no-extensions'), 'the coordinator disables ambient extensions');
+  assert.ok(coordinator.args.includes('--session') && coordinator.args.includes(sessionPath), 'the coordinator uses one durable session path');
+  assert.ok(!coordinator.args.includes('--session-dir') && !coordinator.args.includes('--no-session'), 'the coordinator has no session fallback');
   assert.deepEqual(coordinator.args.filter((entry) => entry === '--extension'), ['--extension', '--extension', '--extension'], 'the coordinator adds exactly three reviewed extensions');
   assert.deepEqual(coordinator.args.slice(-6), ['--extension', guard, '--extension', adapter, '--extension', diverNotes], 'the coordinator loads only the reviewed private extensions');
 
