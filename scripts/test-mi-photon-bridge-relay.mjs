@@ -11,6 +11,9 @@ const repoRoot = new URL('..', import.meta.url).pathname;
 
 const bridgeSource = await readFile(join(repoRoot, 'scripts', 'mi-photon-bridge.mjs'), 'utf8');
 assert.match(bridgeSource, /await sendToUser\(target, message, 'notification'\)/, 'notify endpoint sends the message body without a title heading');
+assert.match(bridgeSource, /const pollMs = Number\(process\.env\.MI_PHOTON_POLL_MS \|\| 250\)/, 'Photon defaults to a 250ms local worker-result poll while preserving its override');
+assert.match(bridgeSource, /boundedEnvironmentInteger\('MI_PHOTON_TYPING_DELAY_MS', 100, 0, 5000\)/, 'Photon defaults prompt typing feedback to 100ms and bounds overrides');
+assert.match(bridgeSource, /function startTypingBestEffort\(space, delayMs = photonTypingDelayMs\)/, 'Photon uses the bounded setting for asynchronous prompt typing');
 
 async function readJsonl(path) {
   if (!existsSync(path)) return [];
@@ -113,7 +116,7 @@ async function runRelayCase(root, name, workerReply) {
   const eventsPath = join(dir, 'events.json');
   const sendsPath = join(dir, 'sends.jsonl');
   const event = {
-    space: { id: workerReply.spaceId || `${name}-space`, phone: '+15551234567' },
+    space: { id: workerReply.spaceId || `${name}-space`, phone: '+15551234567', ...(workerReply.typingStartDelayMs ? { typingStartDelayMs: workerReply.typingStartDelayMs } : {}) },
     message: {
       ...(workerReply.omitMessageId ? {} : { id: workerReply.messageId || `${name}-message` }),
       direction: 'inbound',
@@ -142,10 +145,12 @@ async function runRelayCase(root, name, workerReply) {
       MI_PHOTON_TEST: '1',
       MI_PHOTON_TEST_EVENTS: eventsPath,
       MI_PHOTON_TEST_SENDS: sendsPath,
+      ...(workerReply.env || {}),
     });
     assert.match(result.stdout, /imessage handoff - polling for (?:task|legacy worker) result/, `${name}: bridge should poll after handoff`);
 
-    const sends = (await readJsonl(sendsPath)).filter((entry) => entry.kind === 'message');
+    const allSends = await readJsonl(sendsPath);
+    const sends = allSends.filter((entry) => entry.kind === 'message');
     const expectedMessages = workerReply.repeatIdentical ? 2 : 1;
     assert.equal(sends.length, expectedMessages, `${name}: bridge should send only the completed worker result for each inbound event`);
     assert.equal(sends.filter((entry) => entry.text === 'On it. I’ll follow up here.').length, 0, `${name}: internal handoff acknowledgement must not reach iMessage`);
@@ -169,7 +174,7 @@ async function runRelayCase(root, name, workerReply) {
       assert.ok(/^[A-Za-z0-9._:-]{1,200}$/.test(inboundCall.body.deliveryId), `${name}: delivery identifier uses the web API format`);
     }
     assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
-    return inboundCall.body.deliveryId;
+    return { deliveryId: inboundCall.body.deliveryId, sends: allSends, inboundAt: inboundCall.at, result };
   } finally {
     await mi.close();
   }
@@ -177,19 +182,45 @@ async function runRelayCase(root, name, workerReply) {
 
 const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
 try {
-  const retryIdOne = await runRelayCase(root, 'delayed-exact-task-id-one', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
-  const retryIdTwo = await runRelayCase(root, 'delayed-exact-task-id-two', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
-  assert.equal(retryIdOne, retryIdTwo, 'retrying the same upstream event reuses its delivery identifier');
+  // Leave enough scheduling room for the child bridge to send its acknowledgement
+  // under the full test suite's CPU load before the fake result becomes ready.
+  const retryIdOne = await runRelayCase(root, 'delayed-exact-task-id-one', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 1000, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  const retryIdTwo = await runRelayCase(root, 'delayed-exact-task-id-two', { source: 'mi-worker-result', messageId: 'same-upstream-message', taskId: 'wanted-task', delayMs: 1000, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
+  assert.equal(retryIdOne.deliveryId, retryIdTwo.deliveryId, 'retrying the same upstream event reuses its delivery identifier');
   await runRelayCase(root, 'identical-no-identity', { source: 'mi-worker-result', omitMessageId: true, repeatIdentical: true, taskId: 'wanted-task', text: 'Both distinct messages must be processed.' });
   const fallbackIdOne = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, timestamp: '2026-01-01T00:00:00.000Z', taskId: 'wanted-task', text: 'Fallback identifier result.' });
   const fallbackIdTwo = await runRelayCase(root, 'fallback-retry', { source: 'mi-worker-result', omitMessageId: true, timestamp: '2026-01-01T00:00:00.000Z', taskId: 'wanted-task', text: 'Fallback identifier result.' });
-  assert.equal(fallbackIdOne, fallbackIdTwo, 'fallback digest stays stable when the upstream event has no id');
+  assert.equal(fallbackIdOne.deliveryId, fallbackIdTwo.deliveryId, 'fallback digest stays stable when the upstream event has no id');
   const differentBucketMessage = await runRelayCase(root, 'fallback-different-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'a different message', text: 'Fallback identifier result.' });
   const sameBucketMessage = await runRelayCase(root, 'fallback-same-content', { source: 'mi-worker-result', omitMessageId: true, taskId: 'wanted-task', spaceId: 'same-space', timestamp: '2026-01-01T00:00:00.000Z', body: 'check detect status', text: 'Fallback identifier result.' });
-  assert.notEqual(differentBucketMessage, sameBucketMessage, 'fallback digest distinguishes same-bucket message content');
-  assert.match(fallbackIdOne, /^photon-[a-f0-9]{32}$/, 'fallback identifier is a bounded digest and does not contain message text');
+  assert.notEqual(differentBucketMessage.deliveryId, sameBucketMessage.deliveryId, 'fallback digest distinguishes same-bucket message content');
+  assert.match(fallbackIdOne.deliveryId, /^photon-[a-f0-9]{32}$/, 'fallback identifier is a bounded digest and does not contain message text');
   await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
   await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
+
+  const defaultTyping = await runRelayCase(root, 'typing-default', { source: 'mi-worker-result', taskId: 'typing-default', delayMs: 350, text: 'Typing feedback default.' });
+  const defaultStart = defaultTyping.sends.find((entry) => entry.kind === 'typing-start');
+  assert.ok(defaultStart, 'default prompt typing feedback starts before a delayed worker result');
+  assert.match(defaultTyping.result.stdout, /photon typing scheduled delay=100ms/, 'default prompt typing retains the bounded 100ms feedback delay');
+
+  const overriddenTyping = await runRelayCase(root, 'typing-override', { source: 'mi-worker-result', taskId: 'typing-override', delayMs: 350, text: 'Typing feedback override.', env: { MI_PHOTON_TYPING_DELAY_MS: '0' } });
+  const overriddenStart = overriddenTyping.sends.find((entry) => entry.kind === 'typing-start');
+  assert.ok(overriddenStart, 'a valid typing override starts prompt feedback');
+  assert.match(overriddenTyping.result.stdout, /photon typing scheduled delay=0ms/, 'a zero-delay override is applied without retaining the default delay');
+
+  for (const invalid of ['-1', '5001', '1.5', 'not-a-number']) {
+    const invalidTyping = await runRelayCase(root, `typing-invalid-${invalid.replace(/[^a-z0-9]/gi, '-')}`, { source: 'mi-worker-result', taskId: `typing-invalid-${invalid}`, delayMs: 250, text: 'Invalid typing fallback.', env: { MI_PHOTON_TYPING_DELAY_MS: invalid } });
+    const invalidStart = invalidTyping.sends.find((entry) => entry.kind === 'typing-start');
+    assert.match(invalidTyping.result.stderr, /Invalid MI_PHOTON_TYPING_DELAY_MS; using safe default 100ms\./, `${invalid}: invalid values fail closed to the safe default`);
+    assert.ok(invalidStart, `${invalid}: invalid values still provide prompt typing feedback`);
+    assert.match(invalidTyping.result.stdout, /photon typing scheduled delay=100ms/, `${invalid}: invalid values retain safe prompt feedback timing`);
+  }
+
+  const noFinalDelay = await runRelayCase(root, 'typing-does-not-delay-final-send', { source: 'mi-worker-result', taskId: 'typing-final', text: 'Final reply is not blocked.', typingStartDelayMs: 300, env: { MI_PHOTON_TYPING_DELAY_MS: '0' } });
+  const delayedTypingStart = noFinalDelay.sends.find((entry) => entry.kind === 'typing-start');
+  const finalMessage = noFinalDelay.sends.find((entry) => entry.kind === 'message');
+  assert.ok(delayedTypingStart && finalMessage, 'typing and final reply are both emitted');
+  assert.ok(Date.parse(finalMessage.ts) < Date.parse(delayedTypingStart.ts), 'an in-flight typing RPC never delays the final send');
   console.log('Mi Photon bridge relay checks passed.');
 } finally {
   await rm(root, { recursive: true, force: true });

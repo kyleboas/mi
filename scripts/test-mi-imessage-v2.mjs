@@ -64,8 +64,13 @@ async function handle(request) {
   await startAdvisorWorkers();
   await startNamedWorkers(request.message);
   const respond = () => {
+    process.stdout.write(JSON.stringify({ type: 'agent_start' }) + '\n');
+    process.stdout.write(JSON.stringify({ type: 'message_update', message: { role: 'assistant' } }) + '\n');
     process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'INTERNAL COORDINATOR PROMPT MUST NOT REACH THE PHONE' }] } }) + '\n');
-    process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'The requested work is complete.' }] } }) + '\n');
+    if (!String(request.message || '').includes('Trigger coordinator error')) {
+      const text = String(request.message || '').includes('Return an internal coordinator phrase') ? 'The Pi worker used a tool.' : 'The requested work is complete.';
+      process.stdout.write(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text }] } }) + '\n');
+    }
     process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\n');
   };
   if (String(request.message || '').includes('Hello one.')) setTimeout(respond, 180);
@@ -89,7 +94,15 @@ process.stdin.on('end', () => {
   await mkdir(join(fixture.miRoot, 'pi', 'extensions'), { recursive: true });
   await writeFile(join(fixture.miRoot, 'pi', 'extensions', 'mi-capability-guard.ts'), 'export default function () {}\n');
   await writeFile(join(fixture.miRoot, 'pi', 'extensions', 'mi-orchestrator-adapter.ts'), 'export default function () {}\n');
-  return { workspaceRoot, workspace };
+  await writeFile(join(fixture.miRoot, 'pi', 'extensions', 'mi-diver-notes.ts'), 'export default function () {}\n');
+  const formatter = join(fixture.bin, 'mi-completion-formatter');
+  await writeFile(formatter, String.raw`#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.MI_GATEWAY_URL, 'called\n');
+process.stdout.write('A concise fallback summary.');
+`, { mode: 0o755 });
+  await chmod(formatter, 0o755);
+  return { workspaceRoot, workspace, formatter };
 }
 
 const fixture = await createHermeticMiEnv('mi-imessage-v2-');
@@ -97,7 +110,8 @@ let daemon;
 let web;
 try {
   const piLog = join(fixture.root, 'pi.jsonl');
-  const { workspaceRoot, workspace } = await installCoordinatorFixtures(fixture, piLog);
+  const { workspaceRoot, workspace, formatter } = await installCoordinatorFixtures(fixture, piLog);
+  const formatterLog = join(fixture.root, 'formatter.log');
   let nextAdvisorTask = 0;
   const advisorTasks = [];
   daemon = await startFakeDaemon(fixture.env.MI_SOCKET_PATH, (request) => {
@@ -119,9 +133,12 @@ try {
   await Promise.all([utimes(stalePolicy, staleAt, staleAt), utimes(staleSession, staleAt, staleAt)]);
   web = await startWebChat({
     ...fixture.env,
-    MI_IMESSAGE_V2: '1', PI_CMD: fixture.fakePi, MI_GATEWAY_CLIENT: fixture.fakePi,
-    MI_WEB_MAX_MESSAGE_CHARS: '6000', MI_WEB_WORKER_POLL_MS: '20', MI_IMESSAGE_COORDINATOR_GLOBAL_LIMIT: '1', MI_IMESSAGE_WORKSPACE_ROOT: workspaceRoot, MI_IMESSAGE_WORK_CWD: workspace,
+    MI_IMESSAGE_V2: '1', PI_CMD: fixture.fakePi, MI_GATEWAY_CLIENT: formatter, MI_GATEWAY_URL: formatterLog,
+    MI_WEB_MAX_MESSAGE_CHARS: '6000', MI_WEB_WORKER_POLL_MS: '20', MI_IMESSAGE_COORDINATOR_GLOBAL_LIMIT: '1', MI_IMESSAGE_WORKSPACE_ROOT: workspaceRoot, MI_IMESSAGE_WORKSPACE_CWD: workspace,
   });
+
+  const idleWorkerState = (await httpJson(web.baseUrl, '/api/worker-state')).json;
+  assert.deepEqual(idleWorkerState, { ok: true, activeCoordinatorCount: 0, activeWorkerCount: 0 }, 'restart safety endpoint exposes only active worker counts');
 
   async function coordinatorTurn(message, thread = 'main') {
     const result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { thread, message } })).json;
@@ -133,12 +150,30 @@ try {
     return result;
   }
 
+  const localGreeting = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'hello' } })).json;
+  assert.equal(localGreeting.handoff, false, 'an exact greeting stays local');
+  assert.equal(localGreeting.reply, 'Hi. What can I help with?', 'an exact greeting receives the fixed safe reply');
+  const capabilities = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'what can you do?' } })).json;
+  assert.equal(capabilities.handoff, false, 'an exact capability question stays local');
+  assert.match(capabilities.reply, /approved local files.*guarded technical work.*confirmation before consequential actions/i, 'capability reply states only guarded abilities');
+  const beforeLocalPi = (await readJsonl(piLog)).length;
+  const mixedGreeting = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Hello, check the daemon logs.' } })).json;
+  assert.equal(mixedGreeting.handoff, true, 'a mixed greeting and request must not take the local path');
+  await waitFor(async () => (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages.some((entry) => entry.source === 'mi-worker-result' && entry.taskId === mixedGreeting.taskId), { timeoutMs: 4000, message: 'mixed greeting completion' });
+  assert.ok((await readJsonl(piLog)).length > beforeLocalPi, 'mixed greeting reaches the isolated coordinator');
+  const pendingLocal = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Send Kyle a message.' } })).json;
+  const pendingGreeting = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'hello' } })).json;
+  assert.equal(pendingGreeting.handoff, false, 'a pending confirmation never starts a local handoff');
+  assert.match(pendingGreeting.reply, new RegExp(`confirm ${pendingLocal.confirmationId}`), 'pending confirmation takes precedence over a local greeting');
+  await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: `deny ${pendingLocal.confirmationId}` } });
+  assert.equal(existsSync(formatterLog), false, 'safe direct coordinator finals bypass the concierge formatter');
+
   const advisorTurns = [];
   for (const message of ['Hello Mi.', 'Ask Seth how I should position this.', 'Ask Alex how I should price this.', 'Ask the advisors how I should position this.', '/skill:advisor ask Seth about the offer.', 'Ask Terra and Luna to inspect the workflow.']) {
     advisorTurns.push(await coordinatorTurn(message));
   }
   let coordinatorCalls = (await readJsonl(piLog)).filter((entry) => entry.request.type === 'prompt');
-  assert.equal(coordinatorCalls.length, 6, 'ordinary, named advisor, multi-advisor, skill, and named-worker requests all use the coordinator');
+  assert.equal(coordinatorCalls.length, 7, 'mixed chat, ordinary, named advisor, multi-advisor, skill, and named-worker requests all use the coordinator');
   for (const call of coordinatorCalls) {
     for (const flag of ['--no-extensions', '--no-skills', '--no-context-files', '--no-prompt-templates', '--no-themes']) {
       assert.ok(call.argv.includes(flag), `coordinator isolates ${flag}`);
@@ -161,11 +196,27 @@ try {
   assert.notEqual(both[0].message, both[1].message, 'both-advisor requests have different lane instructions');
   const deliveredAdvisorResults = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages.filter((entry) => entry.source === 'mi-worker-result' && advisorTurns.some((turn) => entry.taskId === turn.taskId));
   assert.equal(deliveredAdvisorResults.length, advisorTurns.length, 'every coordinator task, including multi-advisor work, delivers exactly one result');
+  const formatterCallsBeforeFallback = existsSync(formatterLog) ? (await readFile(formatterLog, 'utf8')).trim().split('\n').filter(Boolean).length : 0;
+
+  const internal = await coordinatorTurn('Return an internal coordinator phrase.');
+  const internalResult = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages.find((entry) => entry.taskId === internal.taskId && entry.source === 'mi-worker-result');
+  assert.equal(internalResult.text, 'A concise fallback summary.', 'internal coordinator output retains the formatter fallback');
+  const failed = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Trigger coordinator error.' } })).json;
+  assert.equal(failed.handoff, true, 'a coordinator error starts one bounded turn');
+  await waitFor(async () => (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages
+    .some((entry) => entry.source === 'mi-worker-error' && entry.taskId === failed.taskId), { timeoutMs: 4000, message: 'coordinator error completion' });
+  const failedResult = (await httpJson(web.baseUrl, '/api/messages?thread=main')).json.messages.find((entry) => entry.taskId === failed.taskId && entry.source === 'mi-worker-error');
+  assert.equal(failedResult.text, 'A concise fallback summary.', 'error coordinator output retains the formatter fallback');
+  assert.equal((await readFile(formatterLog, 'utf8')).trim().split('\n').filter(Boolean).length, formatterCallsBeforeFallback + 2, 'rejected and error finals retain the formatter fallback');
+  const timingEvents = await readJsonl(join(fixture.miRoot, 'state', 'mi-turn-events.jsonl'));
+  for (const stage of ['coordinator-child-spawn', 'coordinator-agent-start', 'coordinator-first-assistant-delta', 'coordinator-rpc-complete', 'coordinator-final']) {
+    assert.ok(timingEvents.some((event) => event.stage === stage && Number.isInteger(event.durationMs)), `timing event ${stage} is emitted with a bounded integer duration`);
+  }
 
   assert.equal(existsSync(stalePolicy), false, 'old inactive coordinator policies are cleaned up');
   assert.equal(existsSync(staleSession), false, 'old inactive coordinator transcripts are cleaned up');
 
-  const beforeRisk = coordinatorCalls.length;
+  const beforeRisk = (await readJsonl(piLog)).filter((entry) => entry.request.type === 'prompt').length;
   for (const message of ['An email to the team about this.', 'A tweet about the launch.', 'Post this update publicly.', 'rm the old folder.', 'Wipe the old account.', 'Remove all customer data.', 'Transfer the files to the vendor.', 'Can you make dinner?']) {
     const result = (await httpJson(web.baseUrl, '/api/imessage', { method: 'POST', body: { message } })).json;
     assert.equal(result.handoff, false, `${message}: risky wording is gated before coordinator launch`);
@@ -237,7 +288,7 @@ try {
   await installCoordinatorFixtures(missing, piLog);
   missingWeb = await startWebChat({
     ...missing.env, MI_IMESSAGE_V2: '1', PI_CMD: missing.fakePi, MI_GATEWAY_CLIENT: missing.fakePi,
-    MI_IMESSAGE_WORKSPACE_ROOT: join(missing.root, 'missing-root'), MI_IMESSAGE_WORK_CWD: join(missing.root, 'missing-root'),
+    MI_IMESSAGE_WORKSPACE_ROOT: join(missing.root, 'missing-root'), MI_IMESSAGE_WORKSPACE_CWD: join(missing.root, 'missing-root'),
   });
   const result = (await httpJson(missingWeb.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Hello Mi.' } })).json;
   assert.equal(result.handoff, false, 'missing workspace fails closed');
@@ -253,7 +304,8 @@ let recoveredDaemon;
 let recoveredWeb;
 try {
   const piLog = join(recovered.root, 'pi.jsonl');
-  const { workspaceRoot, workspace } = await installCoordinatorFixtures(recovered, piLog);
+  const { workspaceRoot, workspace, formatter } = await installCoordinatorFixtures(recovered, piLog);
+  const formatterLog = join(recovered.root, 'formatter.log');
   await mkdir(join(recovered.miRoot, 'state', 'threads'), { recursive: true });
   await writeFile(join(recovered.miRoot, 'state', 'web-workers.json'), JSON.stringify([{
     id: 'coordinator-recovered', threadId: 'main', taskId: 'recovered-turn', correlationId: 'recovered-turn', name: 'iMessage coordinator',
@@ -262,8 +314,8 @@ try {
   }]));
   recoveredDaemon = await startFakeDaemon(recovered.env.MI_SOCKET_PATH, (request) => request.type === 'list_tasks' ? { tasks: [] } : { text: 'ok' });
   recoveredWeb = await startWebChat({
-    ...recovered.env, MI_IMESSAGE_V2: '1', PI_CMD: recovered.fakePi, MI_GATEWAY_CLIENT: recovered.fakePi,
-    MI_WEB_WORKER_POLL_MS: '20', MI_IMESSAGE_WORKSPACE_ROOT: workspaceRoot, MI_IMESSAGE_WORK_CWD: workspace,
+    ...recovered.env, MI_IMESSAGE_V2: '1', PI_CMD: recovered.fakePi, MI_GATEWAY_CLIENT: formatter, MI_GATEWAY_URL: formatterLog,
+    MI_WEB_WORKER_POLL_MS: '20', MI_IMESSAGE_WORKSPACE_ROOT: workspaceRoot, MI_IMESSAGE_WORKSPACE_CWD: workspace,
   });
   await waitFor(async () => (await httpJson(recoveredWeb.baseUrl, '/api/messages?thread=main')).json.messages
     .some((entry) => entry.source === 'mi-worker-error' && entry.taskId === 'recovered-turn'), { timeoutMs: 4000, message: 'restored coordinator failure delivery' });
@@ -284,7 +336,7 @@ try {
   await symlink(outside, join(workspaceRoot, 'escape'));
   escapedWeb = await startWebChat({
     ...escaped.env, MI_IMESSAGE_V2: '1', PI_CMD: escaped.fakePi, MI_GATEWAY_CLIENT: escaped.fakePi,
-    MI_IMESSAGE_WORKSPACE_ROOT: workspaceRoot, MI_IMESSAGE_WORK_CWD: join(workspaceRoot, 'escape'),
+    MI_IMESSAGE_WORKSPACE_ROOT: workspaceRoot, MI_IMESSAGE_WORKSPACE_CWD: join(workspaceRoot, 'escape'),
   });
   const result = (await httpJson(escapedWeb.baseUrl, '/api/imessage', { method: 'POST', body: { message: 'Hello Mi.' } })).json;
   assert.equal(result.handoff, false, 'workspace symlink escape fails closed');

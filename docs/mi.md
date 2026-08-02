@@ -58,7 +58,7 @@ The removed proactive check-in, monitor registry runner, daily brief, and automa
 - `/resume` adds a known Pi session to the view.
 - `/open` opens the selected session in Pi.
 - `/model` chooses a model for new work.
-- `^F` shows full output.
+- `^F` shows full output. Arrow keys switch tasks, while PageUp/PageDown scroll a cached terminal-sized output view so replies stay responsive for large sessions.
 - `^M` selects tasks to clear.
 - `/mi <question>` asks Mi about the selected task without steering it.
 

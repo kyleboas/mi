@@ -49,6 +49,9 @@ const MI_AGENT_ANIMATION_MS = Number(process.env.MI_AGENT_ANIMATION_MS || 250);
 const MI_WORKING_RENDER_MS = Number(process.env.MI_WORKING_RENDER_MS || PI_LOADER_INTERVAL_MS);
 const MI_WORKER_HANDOFF_RECENT_MESSAGES = Number(process.env.MI_WORKER_HANDOFF_RECENT_MESSAGES || 25);
 const MI_SESSION_TAIL_BYTES = Number(process.env.MI_SESSION_TAIL_BYTES || 256 * 1024);
+// Bound ^F reads so old, large sessions do not slow typing in the agent view.
+// Set 0 only when an unbounded transcript is specifically needed.
+const MI_SESSION_FULL_BYTES = Number(process.env.MI_SESSION_FULL_BYTES ?? 2 * 1024 * 1024);
 const MI_SESSION_ACTIVITY_REFRESH_MS = Number(process.env.MI_SESSION_ACTIVITY_REFRESH_MS || 1000);
 let resolveModelScopeModule: Promise<any> | undefined;
 let scopedModelsSelectorModule: Promise<any> | undefined;
@@ -649,7 +652,9 @@ function readSessionFullTranscript(sessionFile: string) {
     const stats = statSync(sessionFile);
     const cached = sessionFullTranscriptCache.get(sessionFile);
     if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) return cached.value;
-    const raw = readSessionOutputSync(sessionFile, true);
+    const raw = MI_SESSION_FULL_BYTES > 0 && stats.size > MI_SESSION_FULL_BYTES
+      ? readSessionTailSync(sessionFile, MI_SESSION_FULL_BYTES)
+      : readSessionOutputSync(sessionFile, true);
     const items: Array<{ role: 'user' | 'assistant'; text: string }> = [];
     for (const line of raw.trim().split(/\r?\n/)) {
       let record: any;
@@ -710,11 +715,15 @@ function renderFullOutputLines(task: MiTask, fallbackText: string, width: number
   if (cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.width === width && cached.fallbackText === fallbackText) return cached.lines;
 
   const transcript = sessionFile && !isTaskActive(task) && !isStoppedPiSessionWithoutFinal(task) ? readSessionFullTranscript(sessionFile) : [];
+  const truncated = transcript.length > 0 && MI_SESSION_FULL_BYTES > 0 && size > MI_SESSION_FULL_BYTES;
   const lines = transcript.length > 0
-    ? transcript.flatMap((item, index) => [
-        ...(index > 0 ? [''] : []),
-        ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
-      ])
+    ? [
+        ...(truncated ? [fgDim(truncateText(`… earlier history omitted (showing last ${Math.round(MI_SESSION_FULL_BYTES / 1024)}KB)`, width))] : []),
+        ...transcript.flatMap((item, index) => [
+          ...(index > 0 ? [''] : []),
+          ...(item.role === 'user' ? renderPiUserMessage(item.text, width) : renderPiLastOutputMessage(item.text, width)),
+        ]),
+      ]
     : renderPiLastOutputMessage(fallbackText || 'No result yet.', width);
   fullOutputRenderCache.set(cacheKey, { size, mtimeMs, width, fallbackText, lines });
   if (fullOutputRenderCache.size > 50) fullOutputRenderCache.delete(fullOutputRenderCache.keys().next().value as string);
@@ -969,6 +978,7 @@ async function miAgentsCommand() {
   let btwAnswer = '';
   let fullLastOutputMode = false;
   let fullLastOutputScroll = 0;
+  let fullLastOutputMaxScroll = 0;
   let agentSubmitting = false;
   let multiSelectMode = false;
   const selectedTaskKeys = new Set<string>();
@@ -1450,6 +1460,8 @@ async function miAgentsCommand() {
       ? (delta > 0 ? 0 : indexes.length - 1)
       : Math.max(0, Math.min(indexes.length - 1, current + delta));
     selected = indexes[next];
+    // Each task opens at its newest output in the full-output view.
+    fullLastOutputScroll = 0;
     requestRender();
   }
 
@@ -1612,11 +1624,17 @@ async function miAgentsCommand() {
         lines.push('');
       }
       const outputLines = renderFullOutputLines(task, fullLastOutput || 'No result yet.', width);
-      // Like pi: render the conversation above the normal input footer instead
-      // of fitting it into an internal viewport. The terminal/tmux scrollback
-      // owns scrolling; because the footer is last, the visible screen lands at
-      // the latest output with input still usable.
-      lines.push(...outputLines);
+      // Repainting every stored line on each keypress makes large completed
+      // sessions slow. Render a cached terminal-sized viewport anchored at the
+      // newest output; PageUp/PageDown moves the viewport.
+      const viewportHeight = Math.max(1, height - lines.length - footerLines.length);
+      fullLastOutputMaxScroll = Math.max(0, outputLines.length - viewportHeight);
+      const scroll = Math.max(0, Math.min(fullLastOutputScroll, fullLastOutputMaxScroll));
+      fullLastOutputScroll = scroll;
+      const end = outputLines.length - scroll;
+      const visibleOutput = outputLines.slice(Math.max(0, end - viewportHeight), end);
+      for (let index = visibleOutput.length; index < viewportHeight; index++) lines.push('');
+      lines.push(...visibleOutput);
       lines.push(...footerLines);
       return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
     }
@@ -2082,7 +2100,7 @@ async function miAgentsCommand() {
       fullLastOutputMode = !fullLastOutputMode;
       if (fullLastOutputMode && selected < 0 && tasks.length > 0) selected = navigationTaskIndexes()[0] ?? 0;
       fullLastOutputScroll = 0;
-      status = fullLastOutputMode ? 'Full output • ↑/↓ switch task • ^F back' : defaultAgentStatus;
+      status = fullLastOutputMode ? 'Full output • ↑/↓ switch task • PgUp/PgDn scroll • ^F back' : defaultAgentStatus;
       if (!renderTestMode) process.stdout.write('\x1b[2J\x1b[H');
       (tui as any)?.requestRender?.(true) ?? requestRender();
       return;
@@ -2166,11 +2184,9 @@ async function miAgentsCommand() {
       return;
     }
     if (fullLastOutputMode && !inputBuffer && (isPageUpKey(data) || isPageDownKey(data))) {
-      // Do not implement an internal full-output pager. Native terminal/tmux
-      // scrollback handles long output like pi; PageUp/PageDown switch the
-      // selected task whose full output is shown.
-      if (tasks.length > 0) selected = Math.max(0, Math.min(tasks.length - 1, selected + (isPageUpKey(data) ? -1 : 1)));
-      fullLastOutputScroll = 0;
+      // The full view owns its small viewport. Arrow keys still switch tasks.
+      const page = Math.max(1, rows() - 4);
+      fullLastOutputScroll = Math.max(0, Math.min(fullLastOutputMaxScroll, fullLastOutputScroll + (isPageUpKey(data) ? page : -page)));
       requestRender();
       return;
     }

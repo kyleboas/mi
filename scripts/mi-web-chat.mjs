@@ -11,13 +11,16 @@ import path from 'node:path';
 import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
-import { buildImessageCompletionPrompt, IMESSAGE_V2_LIMITS, redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
+import { buildImessageCompletionPrompt, IMESSAGE_V2_LIMITS, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { logEvent } from '../dist/src/state.js';
 import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
 import { parseWorkerCompletion, workerCompletionInstruction } from './mi-worker-completion.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
 import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
+import { createCoordinatorCapacity, coordinatorRecordIsActive } from './mi-web-chat-coordinator-capacity.mjs';
+import { messageHasLocalWorkTarget, v2RouteDecision } from './mi-web-chat-v2-route.mjs';
+import { diverNotesPreflight } from './mi-diver-notes-intent.mjs';
 
 const home = os.homedir();
 const root = process.env.MI_ROOT || path.join(home, 'assistant');
@@ -30,9 +33,11 @@ function reviewedPrivateMiPaths() {
     daemonPath: process.env.MI_DAEMON_PATH,
     capabilityGuardPath: process.env.MI_CAPABILITY_GUARD,
     capabilityAdapterPath: process.env.MI_CAPABILITY_ADAPTER,
+    diverNotesPath: process.env.MI_DIVER_NOTES_EXTENSION,
     requireDaemon: true,
     requireGuard: true,
     requireAdapter: true,
+    requireDiverNotes: true,
   });
   return reviewedMiPaths;
 }
@@ -106,8 +111,7 @@ const activeJobs = new Map();
 const activeWorkers = new Map();
 const recentNotificationKeys = new Map();
 let backgroundWorkerMonitorInFlight = false;
-let activeCoordinatorCount = 0;
-const activeCoordinatorThreads = new Map();
+const coordinatorCapacity = createCoordinatorCapacity({ globalLimit: imessageCoordinatorGlobalLimit, threadLimit: imessageCoordinatorThreadLimit });
 const notificationDedupeMs = Number(process.env.MI_WEB_NOTIFICATION_DEDUPE_MS || 2 * 60 * 1000);
 const safePiEnvKeys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'HOSTNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'TMP', 'TEMP', 'PI_PROVIDER', 'PI_MODEL', 'PI_CONFIG_DIR', 'PI_GATEWAY_URL', 'AGENT_GATEWAY_URL'];
 
@@ -123,7 +127,7 @@ function capabilityGuardPath() {
   return reviewedPrivateMiPaths().capabilityGuardPath;
 }
 
-async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }, rights = ['read']) {
+async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal = { id: 'mi-web', type: 'web', displayName: 'Mi web chat' }, rights = ['read'], diverNotesAccess = 'none') {
   const dir = path.join(miRuntimeDir, 'capabilities');
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await chmod(dir, 0o700);
@@ -138,7 +142,14 @@ async function writeCapabilityGrantsFile(cwd, profile = 'chat-read', principal =
     createdAt,
     expiresAt: new Date(Date.parse(createdAt) + capabilityGrantTtlMs).toISOString(),
   };
-  await writeFile(file, JSON.stringify({ profile, grants: [grant] }, null, 2), { mode: 0o600 });
+  const grants = [grant];
+  if (diverNotesAccess === 'read' || diverNotesAccess === 'write') grants.push({
+    id: `${profile}-diver-notes-${Date.now().toString(36)}`,
+    resource: 'diver-notes://vault', rights: diverNotesAccess === 'write' ? ['read', 'write'] : ['read'],
+    constraints: { exact: true, profile: 'diver-notes' }, principal, createdAt,
+    expiresAt: new Date(Date.parse(createdAt) + capabilityGrantTtlMs).toISOString(),
+  });
+  await writeFile(file, JSON.stringify({ profile, grants }, null, 2), { mode: 0o600 });
   return file;
 }
 
@@ -859,12 +870,6 @@ function messageExplicitlyAddressesWorker(message) {
   return /\b(?:worker|background\s*(?:worker|task)|handoff|hand\s*off|pass\s+(?:it|this|that)\s+(?:to|on|along)|send\s+(?:it|this|that)\s+(?:to|over\s+to)\s+the\s+worker)\b/.test(text);
 }
 
-function messageHasLocalWorkTarget(message) {
-  const text = normalizedMessageText(message);
-  return /\b(?:mi|routing|app|ui|notification|notifications|reminder|reminders|calendar|cron|schedule|scheduling|video|videos|watchlist|watch\s+list|videos?\s+to\s+watch|logo|favicon|chat|pwa|site|service|typing|code|file|repo|branch|github|pull\s*request|\bpr\b|test|tests|daemon|systemd|tailscale|detect\s+candidate|detect\s+candidates|candidate|candidates|project|tacticsjournal|research|plus|icon|button|centered|aligned|alignment|background\s*worker|worker)\b/.test(text)
-    || /\b(?:code|repo|project)\/[a-z0-9_.-]+|~\/code\/[a-z0-9_.-]+|\/home\/\w+\/(?:code\/)?[a-z0-9_.-]+/.test(text);
-}
-
 function messageLooksActionable(message) {
   const text = normalizedMessageText(message);
   if (!text || text.startsWith('/')) return false;
@@ -911,8 +916,7 @@ function workerRoutingDecision(message) {
 }
 
 function workerIsActive(worker) {
-  const status = String(worker?.status || '').toLowerCase();
-  return worker && !['complete', 'completed', 'done', 'error', 'stopped'].includes(status);
+  return coordinatorRecordIsActive(worker);
 }
 
 function workerIsRecent(worker, maxAgeMs = 2 * 60 * 60 * 1000) {
@@ -994,15 +998,14 @@ async function saveActiveWorkers() {
 async function loadActiveWorkers() {
   const list = await readJsonFile(webWorkersPath, []);
   activeWorkers.clear();
-  activeCoordinatorCount = 0;
-  activeCoordinatorThreads.clear();
+  coordinatorCapacity.reset();
   for (const worker of Array.isArray(list) ? list : []) {
     if (!worker?.id || (!workerIsActive(worker) && !workerIsRecent(worker))) continue;
-    if (worker.coordinator) {
-      worker.coordinatorReserved = true;
-      activeCoordinatorCount += 1;
-      activeCoordinatorThreads.set(worker.threadId, (activeCoordinatorThreads.get(worker.threadId) || 0) + 1);
-    }
+    // Only genuinely active coordinators reserve capacity across a restart.
+    // Completed-but-recent records stay for history and deduplication; before
+    // this they exhausted the global and per-thread limits after a restart and
+    // every new request was answered with the busy reply.
+    coordinatorCapacity.adopt(worker);
     activeWorkers.set(worker.id, worker);
   }
 }
@@ -1473,8 +1476,12 @@ async function invokeMiGateway(messages, { timeoutMs, outputCap, model = imessag
   });
 }
 
+function imessageV2CompletionObjective(worker) {
+  return compactAckText(worker.subject || worker.text || 'the requested check', 700);
+}
+
 async function formatImessageV2Completion(worker, findings, isError = false) {
-  const objective = compactAckText(worker.subject || worker.text || 'the requested check', 700);
+  const objective = imessageV2CompletionObjective(worker);
   const prompt = buildImessageCompletionPrompt({ objective, findings: isError ? `The check ended with an error: ${findings || ''}` : findings });
   const result = await invokeMiGateway([{ role: 'user', content: prompt }], {
     timeoutMs: imessageCompletionTimeoutMs, outputCap: IMESSAGE_V2_LIMITS.completionProcessOutput,
@@ -2262,31 +2269,10 @@ async function runImessageChat(message, threadId) {
 }
 
 const v2WorkspaceRootSetting = String(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(home, 'workflows')).trim();
-const v2WorkspaceCwdSetting = String(process.env.MI_IMESSAGE_WORK_CWD || v2WorkspaceRootSetting).trim();
-
-function v2CanonicalObjective(value) {
-  // This is the exact bounded form that can be displayed and stored. Do not
-  // slice it: callers must refuse an objective that does not fit a store.
-  return redactV2Text(String(value || '')).replace(/\s+/g, ' ').trim();
-}
+const v2WorkspaceCwdSetting = String(process.env.MI_IMESSAGE_WORKSPACE_CWD || v2WorkspaceRootSetting).trim();
 
 function objectiveFitsCoordinatorPolicy(objective) {
   return objective.length > 0 && objective.length <= coordinatorObjectiveMaxChars;
-}
-
-function directAdvisorSelections(message) {
-  const text = v2CanonicalObjective(message).toLowerCase();
-  const skill = /^\/skill:advisor\b/.test(text);
-  const asksAll = /\bask\s+(?:the\s+)?advisors?\b|\bseth\s+(?:and|&)\s+(?:alex|hormozi)\b|\b(?:alex|hormozi)\s+(?:and|&)\s+seth\b/.test(text);
-  const asksSeth = /\bask\s+seth\b|\bwhat\s+would\s+seth\b/.test(text) || (skill && /\bseth\b/.test(text));
-  const asksAlex = /\bask\s+(?:alex|hormozi)\b|\bwhat\s+would\s+(?:alex|hormozi)\b/.test(text) || (skill && /\b(?:alex|hormozi)\b/.test(text));
-  if (asksAll || (asksSeth && asksAlex)) return ['Seth', 'Alex'];
-  if (asksSeth) return ['Seth'];
-  if (asksAlex) return ['Alex'];
-  // The advisor skill says a direct invocation without a named person may use
-  // its multi-advisor mode when independent lenses help. Use that safe,
-  // deterministic mode instead of silently choosing an identity.
-  return skill ? ['Seth', 'Alex'] : [];
 }
 
 function pathInside(root, candidate) {
@@ -2299,6 +2285,9 @@ function v2ScopedWorkspace() {
   try {
     const rootPath = realpathSync(v2WorkspaceRootSetting);
     const cwdPath = realpathSync(v2WorkspaceCwdSetting);
+    // The configured paths themselves must already be canonical. This rejects
+    // a symlinked configuration before it can become a workspace grant.
+    if (rootPath !== path.resolve(v2WorkspaceRootSetting) || cwdPath !== path.resolve(v2WorkspaceCwdSetting)) return undefined;
     if (!statSync(rootPath).isDirectory() || !statSync(cwdPath).isDirectory()) return undefined;
     // A workspace may be below home but must never be home itself or an
     // ancestor of home. Real paths prevent a configured symlink escape.
@@ -2307,46 +2296,6 @@ function v2ScopedWorkspace() {
   } catch {
     return undefined;
   }
-}
-
-function v2RiskClassification(message) {
-  const objective = v2CanonicalObjective(message);
-  const text = objective.toLowerCase();
-  if (!text) return { kind: 'clarify', objective };
-  const neverDelegate = /(?:\bdelete\b|\berase\b|\bwipe\b|\bpurge\b|\bdestroy\b|\brm\b|\b(?:remove|clear|drop)\s+(?:all\s+)?(?:data|database|account|project)\b|\bformat\s+(?:the\s+)?(?:disk|drive)\b|\bsecret\b|\btoken\b|\bpassword\b|\bpasscode\b|\bcredential\b|\bauth(?:entication)?\b|\blog\s*in\b|\bbuy\b|\bpurchase\b|\bpay\b|\bspend\b|\btransfer\s+(?:money|funds|cash)|\bwire\s+(?:money|funds))/i.test(text);
-  if (neverDelegate) return { kind: 'never-delegate', objective };
-  const needsConfirmation = /(?:\bdeploy\b|\bproduction\b|\brelease\b|\bpublish\b|\bannouncement\b|\bmerge\b|\brestart\b|\bsystemctl\b|\bservice\b|\binstall\b|\bemail\b|\bmail\b|\btweet\b|\bpost\b|\bsend\b|\bmessage\b|\b(?:tell|contact|notify|forward)\b|\btransfer\b|\bupload\b|\bshare\b)/i.test(text);
-  if (needsConfirmation) return { kind: 'confirm', objective, actionClass: 'confirmed-high-impact' };
-  return { kind: 'safe', objective };
-}
-
-function v2LooksLikeAction(message) {
-  const text = v2CanonicalObjective(message).toLowerCase();
-  if (!text || text.startsWith('/skill:')) return false;
-  return /(?:^(?:please\s+)?(?:fix|debug|investigate|inspect|check|verify|implement|update|repair|patch|make|add|create|change|remove|build|set\s*up|wire|adjust|improve|tighten|save|remember|remind|schedule|start|stop|run|handle|do|clean|move|copy|rename|configure)\b|\b(?:can you|could you|would you|please)\s+(?:fix|implement|update|repair|patch|make|add|create|change|build|handle|do|clean|move|copy|rename|configure)\b)/i.test(text);
-}
-
-function v2ActionPlan(message, workspace) {
-  const objective = v2CanonicalObjective(message);
-  const text = objective.toLowerCase();
-  const advisorSelections = directAdvisorSelections(objective);
-  const asksCoordinator = /\b(?:ask|have)\s+(?:terra|sol|luna|claude)\b/.test(text) || advisorSelections.length > 0;
-  const safeRead = /\b(?:read|inspect|check|verify|list|find|research|explain|summarize)\b/.test(text);
-  // Writing is available only for a clear local-work request. A broad phrase
-  // such as “make dinner” or “create an announcement” must not gain project
-  // write tools merely because it contains an old routing verb.
-  const safeWrite = /^(?:please\s+)?(?:fix|implement|update|repair|patch|make|add|create|change|build|wire|adjust|improve|tighten)\b/.test(text)
-    && messageHasLocalWorkTarget(objective);
-  if (!asksCoordinator && !safeRead && !safeWrite) return undefined;
-  return { objective, capability: 'coordinator', cwd: workspace.cwd, workspaceRoot: workspace.root, allowWrite: safeWrite, advisorSelections };
-}
-
-function v2Cancellation(message) {
-  return /^\s*(?:cancel(?:\s+(?:it|that|the action))?|never mind|nevermind|don['’]t do it)\s*[.!?]*\s*$/i.test(String(message || ''));
-}
-
-function v2ConfirmationCommand(message) {
-  return /^\s*(?:confirm|deny)\s+[a-f0-9]{32}\s*$/i.test(String(message || ''));
 }
 
 function v2ConfirmReply(plan, confirmationId) {
@@ -2369,6 +2318,10 @@ function coordinatorAdapterPath() {
   return reviewedPrivateMiPaths().capabilityAdapterPath;
 }
 
+function diverNotesExtensionPath() {
+  return reviewedPrivateMiPaths().diverNotesPath;
+}
+
 async function writeCoordinatorPolicyFile({ correlationId, objective, workspace, allowWrite, advisorSelections = [] }) {
   if (!objectiveFitsCoordinatorPolicy(objective)) throw new Error('The exact objective is too long to store safely.');
   const directory = path.join(miRuntimeDir, 'coordinator-policies');
@@ -2382,8 +2335,8 @@ async function writeCoordinatorPolicyFile({ correlationId, objective, workspace,
     workspaceRoot: workspace.root,
     workspaceCwd: workspace.cwd,
     socketPath: miSocketPath,
-    // The daemon independently limits writes to ~/workflows. This only asks
-    // for a scoped write when the deterministic plan classified it as safe.
+    // The daemon independently limits writes to its one configured workspace.
+    // This only asks for a scoped write when the deterministic plan classified it as safe.
     allowWrite: allowWrite === true,
     advisorSelections: [...new Set(advisorSelections)].filter((advisor) => advisor === 'Seth' || advisor === 'Alex'),
     advisorTaskIds: [],
@@ -2450,28 +2403,36 @@ async function cleanupCoordinatorArtifacts() {
 }
 
 function reserveCoordinator(threadId) {
-  if (activeCoordinatorCount >= imessageCoordinatorGlobalLimit) return false;
-  const current = activeCoordinatorThreads.get(threadId) || 0;
-  if (current >= imessageCoordinatorThreadLimit) return false;
-  activeCoordinatorCount += 1;
-  activeCoordinatorThreads.set(threadId, current + 1);
-  return true;
+  return coordinatorCapacity.reserve(threadId);
 }
 
 function releaseCoordinator(worker) {
-  if (!worker?.coordinator || !worker.coordinatorReserved) return;
-  worker.coordinatorReserved = false;
-  activeCoordinatorCount = Math.max(0, activeCoordinatorCount - 1);
-  const current = activeCoordinatorThreads.get(worker.threadId) || 0;
-  if (current <= 1) activeCoordinatorThreads.delete(worker.threadId);
-  else activeCoordinatorThreads.set(worker.threadId, current - 1);
+  coordinatorCapacity.release(worker);
+}
+
+function emitCoordinatorTiming(worker, stage, startedAtMs, modelProfile = 'coordinator', outcome = 'ok') {
+  const durationMs = Date.now() - Number(startedAtMs || 0);
+  if (!Number.isInteger(durationMs) || durationMs < 0 || durationMs > 86_400_000) return;
+  void emitTurnEvent(root, { stage, outcome, route: 'v2', modelProfile, turn: workerCorrelationId(worker), durationMs }).catch(() => undefined);
+}
+
+function isCoordinatorAssistantDelta(event) {
+  if (!['message_update', 'message_delta'].includes(event?.type)) return false;
+  return event?.message?.role === 'assistant' || event?.role === 'assistant';
 }
 
 async function finishImessageCoordinator(worker, findings, isError = false) {
   if (worker.completedAt || worker.finishing) return;
   worker.finishing = true;
   try {
-    const completion = await formatImessageV2Completion(worker, findings, isError);
+    // The isolated coordinator already has the exact iMessage-ready final
+    // answer instruction. Only reuse it after the same deterministic final
+    // gate used for formatter output; errors and rejected output retain the
+    // concierge formatter fallback.
+    const directCompletion = isError ? '' : sanitizeImessageCompletion(findings, imessageV2CompletionObjective(worker));
+    const completion = directCompletion || await formatImessageV2Completion(worker, findings, isError);
+    const completionProfile = directCompletion ? 'deterministic-final' : 'formatter-fallback';
+    emitCoordinatorTiming(worker, 'coordinator-final', worker.coordinatorStartedAtMs, completionProfile, isError ? 'error' : directCompletion ? 'ok' : 'fallback');
     worker.status = isError ? 'error' : 'complete';
     worker.completedAt = now();
     worker.updatedAt = now();
@@ -2495,7 +2456,7 @@ async function finishImessageCoordinator(worker, findings, isError = false) {
   }
 }
 
-async function startImessageCoordinator(threadId, message, plan) {
+async function startImessageCoordinator(threadId, message, plan, diverNotesAccess = 'none') {
   if (!reserveCoordinator(threadId)) {
     return { ok: true, reply: 'I’m already working on that conversation. Please wait for the result.', handoff: false, busy: true };
   }
@@ -2509,19 +2470,21 @@ async function startImessageCoordinator(threadId, message, plan) {
     const history = await recentThreadContextForWorker(threadId, message);
     const guard = capabilityGuardPath();
     const adapter = coordinatorAdapterPath();
+    const diverNotes = diverNotesExtensionPath();
     const reviewed = reviewedPrivateMiPaths();
-    if (guard !== reviewed.capabilityGuardPath || adapter !== reviewed.capabilityAdapterPath) throw new Error('Mi coordinator safety tools are unavailable.');
-    const coordinatorGrants = await writeCapabilityGrantsFile(workspace.cwd, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read']);
+    if (guard !== reviewed.capabilityGuardPath || adapter !== reviewed.capabilityAdapterPath || diverNotes !== reviewed.diverNotesPath) throw new Error('Mi coordinator safety tools are unavailable.');
+    const coordinatorGrants = await writeCapabilityGrantsFile(workspace.cwd, 'mi-main-orchestrator', { id: 'mi-imessage-coordinator', type: 'imessage', displayName: 'Mi iMessage coordinator' }, ['read'], diverNotesAccess);
     const coordinatorPolicy = await writeCoordinatorPolicyFile({ correlationId, objective: plan.objective, workspace, allowWrite: plan.allowWrite, advisorSelections: plan.advisorSelections });
     const launch = miCoordinatorLaunch({
       piCommand: process.env.PI_CMD || 'pi', cwd: workspace.cwd, runtimeDir: miRuntimeDir, model: workerModel,
-      capabilityGuardPath: guard, capabilityAdapterPath: adapter,
+      capabilityGuardPath: guard, capabilityAdapterPath: adapter, diverNotesPath: diverNotes,
       env: reducedPiEnv({ MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: coordinatorGrants, MI_CAPABILITY_AUDIT_FILE: path.join(miRuntimeDir, 'capability-audit.jsonl'), MI_COORDINATOR_POLICY_FILE: coordinatorPolicy, MI_SOCKET_PATH: miSocketPath }),
     });
     worker = {
       id: `coordinator_${correlationId}`, threadId, taskId: correlationId, correlationId, name: 'iMessage coordinator',
       status: 'running', text: message, subject: plan.objective, cwd: launch.cwd, imessageV2: true, coordinator: true, coordinatorReserved: true,
       coordinatorGrants, coordinatorPolicy, coordinatorState: 'outer-running', delegatedTaskIds: [], createdAt: now(), updatedAt: now(), awaitingResultSince: now(),
+      coordinatorStartedAtMs: Date.now(), coordinatorSpawnedAtMs: undefined, coordinatorAgentStartedAtMs: undefined, coordinatorFirstAssistantDeltaAtMs: undefined,
       // A truthy in-memory marker prevents the monitor from treating the short
       // state-save/ack gap as a service-restart orphan before spawn runs.
       process: { starting: true },
@@ -2533,10 +2496,22 @@ async function startImessageCoordinator(threadId, message, plan) {
     void runMiCoordinatorRpc({
       launch,
       requestId: correlationId,
-      prompt: miCoordinatorPrompt({ message, context: history, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass, advisorSelections: plan.advisorSelections }),
+      prompt: miCoordinatorPrompt({ message, context: history, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass, advisorSelections: plan.advisorSelections, diverNotesAccess }),
       timeoutMs: imessageCoordinatorTimeoutMs,
-      onSpawn: (child) => { worker.process = child; },
+      onSpawn: (child) => {
+        worker.process = child;
+        worker.coordinatorSpawnedAtMs = Date.now();
+        emitCoordinatorTiming(worker, 'coordinator-child-spawn', worker.coordinatorStartedAtMs);
+      },
       onEvent: (event) => {
+        if (event?.type === 'agent_start' && !worker.coordinatorAgentStartedAtMs) {
+          worker.coordinatorAgentStartedAtMs = Date.now();
+          emitCoordinatorTiming(worker, 'coordinator-agent-start', worker.coordinatorStartedAtMs);
+        }
+        if (isCoordinatorAssistantDelta(event) && !worker.coordinatorFirstAssistantDeltaAtMs) {
+          worker.coordinatorFirstAssistantDeltaAtMs = Date.now();
+          emitCoordinatorTiming(worker, 'coordinator-first-assistant-delta', worker.coordinatorStartedAtMs);
+        }
         const delegatedTaskIds = coordinatorDelegatedTasks(event);
         if (delegatedTaskIds.length === 0) return;
         addCoordinatorTaskIds(worker, delegatedTaskIds);
@@ -2549,6 +2524,7 @@ async function startImessageCoordinator(threadId, message, plan) {
       // second restart failure.
       worker.formatting = true;
       delete worker.process;
+      emitCoordinatorTiming(worker, 'coordinator-rpc-complete', worker.coordinatorStartedAtMs, 'coordinator', result.ok ? 'ok' : 'error');
       if (!result.ok) console.error('iMessage coordinator RPC failed:', result.reason);
       // Direct advisor workers start inside the reviewed adapter before the
       // coordinator speaks, so their IDs arrive through the scoped policy.
@@ -2588,7 +2564,12 @@ async function startImessageCoordinator(threadId, message, plan) {
 
 async function handleImessageV2(threadId, message) {
   await emitTurnEvent(root, { stage: 'inbound', outcome: 'ok', route: 'v2', modelProfile: 'none', turn: message }).catch(() => undefined);
-  if (v2Cancellation(message)) {
+  // One pure decision for the whole turn. The refusal/confirmation gates below
+  // still examine every raw inbound message before any Pi coordinator can
+  // launch, and they do not depend on routing verbs.
+  const workspace = v2ScopedWorkspace();
+  const route = v2RouteDecision({ message, workspace, coordinatorObjectiveMaxChars, confirmationObjectiveMaxChars });
+  if (route.kind === 'cancel') {
     await v2ClearPendingAction(threadId);
     const reply = 'Okay, I won’t proceed with that action.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
@@ -2609,10 +2590,11 @@ async function handleImessageV2(threadId, message) {
         await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-workspace-refused' });
         return { ok: true, reply, handoff: false, confirmationId: record.id };
       }
-      return startImessageCoordinator(threadId, record.objective, {
+      const plan = {
         objective: record.objective, capability: 'coordinator', workspace, confirmedObjective: record.objective,
         actionClass: record.actionClass || 'confirmed-high-impact', allowWrite: false,
-      });
+      };
+      return startImessageCoordinator(threadId, record.objective, plan, diverNotesIntent({ message: record.objective, plan }).access);
     }
     if (confirmation.kind === 'deny') {
       const reply = 'Okay, I won’t proceed with that action.';
@@ -2621,54 +2603,74 @@ async function handleImessageV2(threadId, message) {
       return { ok: true, reply, handoff: false };
     }
   }
-  if (v2ConfirmationCommand(message)) {
+  if (route.kind === 'confirmation-command') {
     const reply = 'I can’t find a pending action for that confirmation.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-missing' });
     return { ok: true, reply, handoff: false };
   }
-
-  // This gate intentionally examines every raw current message before any Pi
-  // coordinator or worker can launch. It does not depend on routing verbs.
-  const risk = v2RiskClassification(message);
-  if (risk.kind === 'never-delegate') {
+  if (route.kind === 'never-delegate') {
     const reply = 'I can’t delegate that kind of action from iMessage.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-refused' });
     return { ok: true, reply, handoff: false };
   }
-  if (risk.kind === 'confirm') {
-    if (!objectiveFitsCoordinatorPolicy(risk.objective) || risk.objective.length > confirmationObjectiveMaxChars) {
-      const reply = `Please send a shorter request. I cannot safely store this exact action for confirmation; the limit is ${confirmationObjectiveMaxChars} characters.`;
-      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-too-long' });
-      return { ok: true, reply, handoff: false };
-    }
+  if (route.kind === 'confirm-too-long') {
+    const reply = `Please send a shorter request. I cannot safely store this exact action for confirmation; the limit is ${confirmationObjectiveMaxChars} characters.`;
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm-too-long' });
+    return { ok: true, reply, handoff: false };
+  }
+  if (route.kind === 'confirm') {
     const pendingAction = await createPendingConfirmation({
-      threadId, summary: risk.objective, riskReason: 'High-impact iMessage action',
-      objective: risk.objective, actionClass: risk.actionClass,
+      threadId, summary: route.objective, riskReason: 'High-impact iMessage action',
+      objective: route.objective, actionClass: route.actionClass,
     });
-    const reply = v2ConfirmReply(risk, pendingAction.id);
+    const reply = v2ConfirmReply(route, pendingAction.id);
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-confirm' });
     return { ok: true, reply, handoff: false, confirmationId: pendingAction.id };
   }
-  if (v2LooksLikeAction(message) && !v2ActionPlan(message, v2ScopedWorkspace() || { root: '', cwd: '' })) {
+  if (route.kind === 'local-reply') {
+    if (pending) {
+      const reply = `I still need confirmation for the pending action. Reply confirm ${pending.id} or deny ${pending.id}.`;
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-pending-reminder' });
+      return { ok: true, reply, handoff: false };
+    }
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', route.reply, { unread: false, source: 'imessage-v2-local-reply' });
+    return { ok: true, reply: route.reply, handoff: false };
+  }
+  if (route.kind === 'clarify') {
+    const diverNotes = diverNotesPreflight({ message, plan: route.plan });
+    if (diverNotes.reply) {
+      const source = diverNotes.unsupported ? 'imessage-v2-diver-notes-unsupported' : 'imessage-v2-diver-notes-clarify';
+      await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+      await appendThreadMessage(threadId, 'assistant', diverNotes.reply, { unread: false, source });
+      return { ok: true, reply: diverNotes.reply, handoff: false };
+    }
     const reply = 'What exactly should I act on?';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-clarify' });
     return { ok: true, reply, handoff: false };
   }
-  const workspace = v2ScopedWorkspace();
-  if (!workspace) {
+  if (route.kind === 'workspace-refused') {
     const reply = 'I need an existing approved workspace before I can start that work.';
     await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
     await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: 'imessage-v2-workspace-refused' });
     return { ok: true, reply, handoff: false };
   }
-  const plan = v2ActionPlan(message, workspace) || { objective: risk.objective, capability: 'coordinator', workspace, allowWrite: false, advisorSelections: [] };
+  const plan = { ...route.plan, workspace, cwd: route.plan.cwd || workspace.cwd, workspaceRoot: route.plan.workspaceRoot || workspace.root };
+  const diverNotes = diverNotesPreflight({ message, plan });
+  if (diverNotes.reply) {
+    const source = diverNotes.unsupported ? 'imessage-v2-diver-notes-unsupported' : 'imessage-v2-diver-notes-clarify';
+    await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
+    await appendThreadMessage(threadId, 'assistant', diverNotes.reply, { unread: false, source });
+    return { ok: true, reply: diverNotes.reply, handoff: false };
+  }
   await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage-v2-user' });
-  return startImessageCoordinator(threadId, message, plan);
+  return startImessageCoordinator(threadId, message, plan, diverNotes.access);
 }
 
 async function handle(req, res) {
@@ -2679,6 +2681,14 @@ async function handle(req, res) {
     if (req.method === 'GET' && url.pathname === '/sw.js') return sendText(res, 200, serviceWorkerJs, 'text/javascript; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/manifest.json') return sendText(res, 200, manifest, 'application/manifest+json; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { ok: true, ts: now(), thread: defaultThread, push: Boolean((await readPushSubscriptions()).length) });
+    if (req.method === 'GET' && url.pathname === '/api/worker-state') {
+      const workers = Array.from(activeWorkers.values());
+      return sendJson(res, 200, {
+        ok: true,
+        activeCoordinatorCount: workers.filter((worker) => worker?.coordinator && workerIsActive(worker)).length,
+        activeWorkerCount: workers.filter((worker) => workerIsActive(worker)).length,
+      });
+    }
     if (req.method === 'GET' && url.pathname === '/api/push/public-key') {
       const config = await vapidConfig();
       return sendJson(res, 200, { publicKey: config.publicKey });

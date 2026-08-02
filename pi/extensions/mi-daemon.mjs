@@ -10,6 +10,13 @@ import { pathToFileURL } from "node:url";
 import { reviewedMiExtensionPaths } from "./mi-reviewed-paths.mjs";
 
 const HOME = homedir();
+const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
+// The installed daemon is outside this source tree. Load this shared parser
+// from Mi when available while keeping source-tree tests self-contained.
+const workerCompletionModule = existsSync(join(MI_ROOT, "scripts", "mi-worker-completion.mjs"))
+  ? pathToFileURL(join(MI_ROOT, "scripts", "mi-worker-completion.mjs")).href
+  : new URL("../../scripts/mi-worker-completion.mjs", import.meta.url).href;
+const { parseWorkerCompletion } = await import(workerCompletionModule);
 const RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, ".pi", "agent", "mi");
 const SOCKET_PATH = process.env.MI_SOCKET_PATH || join(RUNTIME_DIR, "main.sock");
 const SESSION_DIR = process.env.MI_SESSION_DIR || join(HOME, ".pi", "agent", "sessions", "mi-main");
@@ -32,8 +39,7 @@ const MI_DAEMON_LOCK_HEARTBEAT_MS = Number(process.env.MI_DAEMON_LOCK_HEARTBEAT_
 const MI_DAEMON_IDLE_EXIT_MS = Number(process.env.MI_DAEMON_IDLE_EXIT_MS || 60000);
 const MI_TASK_DISCOVERY_DELAY_MS = Number(process.env.MI_TASK_DISCOVERY_DELAY_MS || 1500);
 const MI_STOPPED_SESSION_GRACE_MS = Number(process.env.MI_STOPPED_SESSION_GRACE_MS || 180000);
-const MI_ROOT = process.env.MI_ROOT || join(HOME, "assistant");
-const MI_WORKFLOWS_DIR = resolve(process.env.MI_WORKFLOWS_DIR || join(HOME, "workflows"));
+const MI_WORKFLOWS_DIR = realpathSync(process.env.MI_WORKFLOWS_DIR || join(HOME, "workflows"));
 const MI_PI_BRIDGE_DIR = join(RUNTIME_DIR, "pi-bridges");
 const THREADS_DIR = join(MI_ROOT, "state", "threads");
 const THREAD_INDEX_PATH = join(THREADS_DIR, "index.json");
@@ -65,8 +71,12 @@ function reducedPiEnv(extra = {}) {
 }
 
 function cwdInsideWorkflows(cwd = HOME) {
-  const absolute = resolve(cwd);
-  return absolute === MI_WORKFLOWS_DIR || absolute.startsWith(`${MI_WORKFLOWS_DIR}/`);
+  try {
+    const absolute = realpathSync(cwd);
+    return absolute === MI_WORKFLOWS_DIR || absolute.startsWith(`${MI_WORKFLOWS_DIR}/`);
+  } catch {
+    return false;
+  }
 }
 
 function trustedAdvisorSkillRoot() {
@@ -85,7 +95,7 @@ function advisorName(request = {}, task = undefined) {
 function workerCapabilityProfile(request = {}, cwd = HOME, task = undefined) {
   const requested = request.capabilityProfile || request.capability_profile || task?.capabilityProfile;
   if (requested === "worker-write-scoped") {
-    if (!cwdInsideWorkflows(cwd)) throw new Error("worker-write-scoped is only allowed under ~/workflows");
+    if (!cwdInsideWorkflows(cwd)) throw new Error("worker-write-scoped is only allowed inside the configured Mi workspace");
     return "worker-write-scoped";
   }
   if (requested === "advisor-read") {
@@ -107,7 +117,7 @@ function writeWorkerCapabilityGrantsFile(cwd = HOME, profile = "worker-read") {
     id: `${profile}-workspace-${Date.now().toString(36)}`,
     resource: `file://${workspaceRoot}`,
     rights: profile === "worker-write-scoped" ? ["read", "write"] : ["read"],
-    constraints: { recursive: true, profile, scope: profile === "worker-write-scoped" ? "workflows-only" : undefined },
+    constraints: { recursive: true, profile, scope: profile === "worker-write-scoped" ? "workspace-only" : undefined },
     principal: { id: "mi-worker", type: "worker", displayName: "Mi worker" },
     createdAt,
     expiresAt: new Date(Date.parse(createdAt) + MI_CAPABILITY_GRANT_TTL_MS).toISOString(),
@@ -2133,6 +2143,18 @@ async function handle(socket, request) {
   }
   if (request.type === "health") {
     socket.end(JSON.stringify({ ok: true, pi: !!piProc && !piProc.killed }) + "\n");
+    return;
+  }
+  if (request.type === "worker_state") {
+    // Counts only: callers can verify restart safety without reading task,
+    // prompt, session, or message data.
+    socket.end(JSON.stringify({
+      ok: true,
+      activeWorkerCount: activeWorkers.size,
+      startingWorkerCount: startingWorkerKeys.size,
+      activePrompt: Boolean(activePrompt),
+      queuedPromptCount: promptQueue.length,
+    }) + "\n");
     return;
   }
   if (request.type === "pi_session_event") {

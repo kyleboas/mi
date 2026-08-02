@@ -14,6 +14,8 @@ const MEMORY_MD = join(MEMORY_DIR, 'MEMORY.md');
 const HISTORY = join(MEMORY_DIR, 'history.jsonl');
 const CURSOR = join(MEMORY_DIR, '.dream_cursor');
 const PROMPT = join(MEMORY_DIR, 'dream-prompt.md');
+const LEGACY_IMPORTED = join(MEMORY_DIR, '.legacy-imported');
+const LEGACY_MEMORY = process.env.MI_LEGACY_MEMORY_PATH || join(homedir(), 'mi', 'memory.md');
 const EVENTS = join(MI_ROOT, 'state', 'events.jsonl');
 const DEFAULT_PROMPT = 'Distill durable facts for Mi. Return strict JSON: {"entries":[{"ts":"ISO","source":"...","summary":"...","refs":[]}],"memory":"full replacement MEMORY.md"}. Keep only reusable facts, decisions, feedback, and project context. Do not include secrets.';
 
@@ -27,6 +29,25 @@ async function ensureMemory() {
   if (!existsSync(PROMPT)) await writePrivate(PROMPT, DEFAULT_PROMPT + '\n');
   if (!existsSync(CURSOR)) await writePrivate(CURSOR, JSON.stringify({ threads: {}, eventsOffset: 0 }, null, 2));
   if (!existsSync(HISTORY)) await writePrivate(HISTORY, '');
+  await importLegacyMemory();
+}
+export async function importLegacyMemory() {
+  if (existsSync(LEGACY_IMPORTED)) return false;
+  // A test/isolated MI_ROOT must not reach back into the real home directory.
+  // Tests can still exercise migration with MI_LEGACY_MEMORY_PATH explicitly.
+  if (process.env.MI_ROOT && process.env.MI_ROOT !== join(homedir(), 'assistant') && !process.env.MI_LEGACY_MEMORY_PATH) {
+    await writePrivate(LEGACY_IMPORTED, JSON.stringify({ importedAt: new Date().toISOString(), skipped: 'isolated-root' }, null, 2));
+    return false;
+  }
+  let legacy = '';
+  try { legacy = String(redactSecrets(await readFile(LEGACY_MEMORY, 'utf8'))).trim(); } catch {}
+  if (legacy) {
+    const current = await readFile(MEMORY_MD, 'utf8').catch(() => '# Mi memory\n');
+    if (!current.includes('## Imported legacy Mi memory')) await writePrivate(MEMORY_MD, `${current.trim()}\n\n## Imported legacy Mi memory\n\n${legacy}\n`);
+    await appendPrivate(HISTORY, JSON.stringify({ ts: new Date().toISOString(), source: LEGACY_MEMORY, summary: 'Imported legacy Mi memory into the canonical memory surface.', refs: [LEGACY_MEMORY] }) + '\n');
+  }
+  await writePrivate(LEGACY_IMPORTED, JSON.stringify({ importedAt: new Date().toISOString(), source: LEGACY_MEMORY, hadContent: Boolean(legacy) }, null, 2));
+  return Boolean(legacy);
 }
 async function writePrivate(path: string, data: string) { await writeFile(path, String(redactSecrets(data)), { mode: 0o600 }); await chmod(path, 0o600).catch(() => undefined); }
 async function appendPrivate(path: string, data: string) { await appendFile(path, String(redactSecrets(data)), { mode: 0o600 }); await chmod(path, 0o600).catch(() => undefined); }
@@ -38,7 +59,21 @@ export async function readMemory(maxChars = Number(process.env.MI_MEMORY_MAX_CHA
   const text = String(redactSecrets(await readFile(MEMORY_MD, 'utf8')));
   return text.length > maxChars ? text.slice(0, maxChars) + '\n\n[Mi memory truncated]' : text;
 }
-export async function memorySystemBlock() { const memory = await readMemory(); return memory.trim() ? `\n\nDurable Mi memory:\n${memory}` : ''; }
+export async function appendMemoryNote(note: string, source = 'manual') {
+  await ensureMemory();
+  const clean = String(redactSecrets(note)).replace(/\s+/g, ' ').trim();
+  if (!clean) throw new Error('memory note required');
+  if (source.startsWith('imessage')) {
+    const existing = await readFile(MEMORY_MD, 'utf8').catch(() => '');
+    if (!existing.includes('## Captured via iMessage')) await appendPrivate(MEMORY_MD, '\n## Captured via iMessage\n');
+  }
+  await appendPrivate(MEMORY_MD, `\n- ${new Date().toISOString()}: ${clean}\n`);
+  await appendPrivate(HISTORY, JSON.stringify({ ts: new Date().toISOString(), source, summary: clean, refs: [] }) + '\n');
+}
+export async function memorySystemBlock() {
+  const memory = await readMemory();
+  return memory.trim() ? `\n\nDurable Mi memory:\n${memory}` : '';
+}
 export async function readMemoryHistory(limit = 20) { await ensureMemory(); const text = await readFile(HISTORY, 'utf8').catch(() => ''); return text.trim().split('\n').filter(Boolean).slice(-limit).map((line) => JSON.parse(line)); }
 
 async function git(args: string[]) { return new Promise<boolean>((resolve) => { const child = spawn('git', args, { cwd: MEMORY_DIR, shell: false, stdio: 'ignore' }); child.on('error', () => resolve(false)); child.on('close', (code) => resolve(code === 0)); }); }
@@ -49,8 +84,11 @@ async function collectInput(cursor: Cursor, maxChars: number) {
   for (const thread of await listThreads()) {
     if (thread.kind === 'temporary') continue;
     const messages = await readThreadMessages(thread.id);
-    const start = next.threads![thread.id] || 0;
-    for (const message of messages.slice(start)) input += `[thread:${thread.id}] ${message.role}: ${message.text}\n`;
+    const storedStart = next.threads![thread.id] || 0;
+    // Compaction can shrink a JSONL thread. Reset instead of retaining an
+    // impossible offset, which would otherwise skip every future message.
+    const start = storedStart > messages.length ? 0 : storedStart;
+    for (const message of messages.slice(start)) input += `[thread:${thread.id}:${message.id}] ${message.role}: ${message.text}\n`;
     next.threads![thread.id] = messages.length;
     if (input.length >= maxChars) break;
   }

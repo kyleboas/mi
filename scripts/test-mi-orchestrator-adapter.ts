@@ -1,15 +1,15 @@
 #!/usr/bin/env tsx
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { miCoordinatorPrompt } from './mi-imessage-coordinator.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'mi-orchestrator-adapter-'));
-const workspaceRoot = path.join(root, 'workflows');
-const workspace = path.join(workspaceRoot, 'project');
+const workspaceRoot = path.join(root, 'diver-notes-document-notes');
+const workspace = workspaceRoot;
 const outside = path.join(root, 'outside');
 const socketPath = path.join(root, 'mi.sock');
 const policyPath = path.join(root, 'policy.json');
@@ -28,6 +28,9 @@ await mkdir(path.dirname(advisorReference), { recursive: true });
 await writeFile(path.join(advisorRoot, 'SKILL.md'), '# Advisor fixture\n');
 await writeFile(advisorReference, '# Source standards fixture\n');
 await writeFile(grantsPath, JSON.stringify({ grants: [{
+  id: 'diver-notes-scoped-write', resource: `file://${workspace}`, rights: ['read', 'write'],
+  constraints: { recursive: true, profile: 'worker-write-scoped', scope: 'workspace-only' }, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+}, {
   id: 'advisor-skill-fixture', resource: `file://${advisorRoot}`, rights: ['read'],
   constraints: { recursive: true, profile: 'advisor-read' }, expiresAt: new Date(Date.now() + 60_000).toISOString(),
 }] }));
@@ -113,6 +116,24 @@ try {
   assert.equal(blockedOtherPi?.block, true, 'unrelated .pi resources remain blocked');
   const blockedAdvisorWrite = await guard({ toolName: 'write', toolCallId: 'advisor-write', input: { path: advisorReference } }, { cwd: workspace });
   assert.equal(blockedAdvisorWrite?.block, true, 'advisor grants never permit writes');
+  const allowedDiverRead = await guard({ toolName: 'read', toolCallId: 'diver-read', input: { path: 'document.md' } }, { cwd: workspace });
+  const allowedDiverWrite = await guard({ toolName: 'write', toolCallId: 'diver-write', input: { path: 'document.md' } }, { cwd: workspace });
+  assert.equal(allowedDiverRead, undefined, 'the canonical Diver Notes workspace is readable');
+  assert.equal(allowedDiverWrite, undefined, 'the canonical Diver Notes workspace permits scoped writes');
+  for (const [label, target] of [
+    ['git', '.git/config'], ['node modules', 'node_modules/pkg/index.js'], ['config', 'config/app.json'],
+    ['state', 'state/data.json'], ['secrets', 'secrets/key'], ['credentials', 'credentials/id'],
+  ]) {
+    const denied = await guard({ toolName: 'read', toolCallId: `protected-${label}`, input: { path: target } }, { cwd: workspace });
+    assert.equal(denied?.block, true, `${label} remains protected inside Diver Notes`);
+  }
+  const deniedParent = await guard({ toolName: 'read', toolCallId: 'parent', input: { path: path.join(root, 'README.md') } }, { cwd: workspace });
+  const deniedSibling = await guard({ toolName: 'write', toolCallId: 'sibling', input: { path: path.join(outside, 'note.md') } }, { cwd: workspace });
+  assert.equal(deniedParent?.block, true, 'workspace parents remain outside the grant');
+  assert.equal(deniedSibling?.block, true, 'workspace siblings remain outside the grant');
+  await symlink(outside, path.join(workspace, 'escape'));
+  const deniedEscape = await guard({ toolName: 'write', toolCallId: 'escape', input: { path: 'escape/note.md' } }, { cwd: workspace });
+  assert.equal(deniedEscape?.block, true, 'symlink escapes remain outside the canonical workspace');
   assert.equal(requests.length, 0, 'blocked global and unknown tools never reach the daemon');
 
   assert.equal(registeredTool?.name, 'mi_orchestrator_delegate', 'the adapter keeps a distinct reviewed tool name');

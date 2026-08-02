@@ -40,7 +40,10 @@ assert.match(daemonSource, /--no-context-files", "--no-extensions", "--no-skills
 assert.match(daemonSource, /"--extension", MI_CAPABILITY_GUARD/, 'Mi daemon worker RPC loads the Mi capability guard explicitly');
 assert.match(daemonSource, /env: reducedPiEnv\(\{ \.\.\.env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile,/, 'Mi daemon worker RPC uses reduced env plus capability metadata');
 assert.match(daemonSource, /"read,grep,find,ls"/, 'Mi daemon worker RPC defaults to read/search tools without bash');
-assert.match(daemonSource, /worker-write-scoped is only allowed under ~\/workflows/, 'Mi daemon only allows scoped writable workers under workflows');
+assert.match(daemonSource, /worker-write-scoped is only allowed inside the configured Mi workspace/, 'Mi daemon only allows scoped writable workers under its configured workspace');
+assert.match(daemonSource, /const MI_WORKFLOWS_DIR = realpathSync\(/, 'Mi daemon canonicalizes its one configured workspace root');
+assert.match(daemonSource, /const absolute = realpathSync\(cwd\)/, 'Mi daemon rejects symlinked scoped-write cwd escapes');
+assert.match(daemonSource, /request\.type === "worker_state"[\s\S]*activeWorkerCount/, 'Mi daemon exposes only content-free worker counts for restart safety');
 assert.match(daemonSource, /requested === "worker-write-scoped"[\s\S]*return "worker-read"/, 'Mi daemon falls back to read-only worker capability unless a scoped write profile is explicitly allowed');
 assert.match(daemonSource, /capabilityProfile\S*[\s\S]*worker-write-scoped[\s\S]*MI_CAPABILITY_PROFILE/, 'Mi daemon can preserve an explicit scoped worker capability profile');
 assert.doesNotMatch(daemonSource, /env: \{ \.\.\.process\.env, \.\.\.env \}/, 'Mi daemon worker RPC must not pass full process.env');
@@ -54,6 +57,9 @@ assert.match(daemonSource, /profile === "advisor-read"[\s\S]*--skill", advisorRo
 assert.match(daemonSource, /trustedAdvisorSkillRoot\(\)[\s\S]*rights: \["read"\]/, 'advisor skill grants are resolved and read-only');
 assert.match(guardSource, /isTrustedAdvisorReadGrant[\s\S]*profile === 'advisor-read'/, 'guard makes the narrow trusted advisor read exception explicitly');
 assert.match(guardSource, /PROTECTED_PATH_NAMES[\s\S]*credentials[\s\S]*config/, 'Capability guard must exclude credential, configuration, and state paths');
+assert.match(webChatSource, /MI_IMESSAGE_WORKSPACE_CWD/, 'iMessage workspace cwd uses the durable workspace-specific setting');
+assert.doesNotMatch(webChatSource, /MI_IMESSAGE_WORK_CWD/, 'iMessage workspace cwd does not accept the legacy alternate setting');
+assert.match(webChatSource, /url\.pathname === '\/api\/worker-state'[\s\S]*activeCoordinatorCount/, 'web chat exposes only content-free coordinator counts for restart safety');
 assert.match(guardSource, /return \{ block: true, reason: decision\.reason \}/, 'Capability guard must block denied tool calls');
 assert.match(guardSource, /appendFileSync\(auditPath/, 'Capability guard must audit allow/deny decisions');
 

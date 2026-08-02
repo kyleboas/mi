@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
-export const TURN_STAGES = new Set(['inbound', 'decision', 'ack', 'task-start', 'task-terminal', 'result-formatted', 'send', 'cleanup', 'terminal']);
+export const TURN_STAGES = new Set(['inbound', 'decision', 'ack', 'task-start', 'task-terminal', 'result-formatted', 'send', 'cleanup', 'terminal', 'coordinator-child-spawn', 'coordinator-agent-start', 'coordinator-first-assistant-delta', 'coordinator-rpc-complete', 'coordinator-final']);
 const OUTCOMES = new Set(['ok', 'error', 'skipped', 'fallback', 'blocked']);
+const MODEL_PROFILES = new Set(['mi-concierge', 'legacy', 'none', 'coordinator', 'deterministic-final', 'formatter-fallback']);
 export function turnHash(value) { return createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16); }
 export function sanitizeTurnEvent(value = {}) {
   const stage = TURN_STAGES.has(value.stage) ? value.stage : 'terminal';
@@ -11,7 +12,7 @@ export function sanitizeTurnEvent(value = {}) {
   const event = { schema: 'mi.turn.v1', stage, outcome, ts: new Date().toISOString() };
   if (Number.isInteger(value.durationMs) && value.durationMs >= 0 && value.durationMs <= 86_400_000) event.durationMs = value.durationMs;
   if (['v1', 'v2', 'web', 'photon'].includes(value.route)) event.route = value.route;
-  if (['mi-concierge', 'legacy', 'none'].includes(value.modelProfile)) event.modelProfile = value.modelProfile;
+  if (MODEL_PROFILES.has(value.modelProfile)) event.modelProfile = value.modelProfile;
   if (value.turn) event.turn = turnHash(value.turn);
   return event;
 }

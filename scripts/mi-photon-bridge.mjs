@@ -11,8 +11,9 @@ const allowedUsers = splitList(process.env.PHOTON_ALLOWED_USERS || '');
 const allowAll = /^(1|true|yes|on)$/i.test(process.env.PHOTON_ALLOW_ALL_USERS || '');
 const miBaseUrl = (process.env.MI_WEB_URL || 'http://127.0.0.1:8787').replace(/\/$/, '');
 const miThread = process.env.MI_PHOTON_THREAD || 'main';
-const pollMs = Number(process.env.MI_PHOTON_POLL_MS || 1500);
+const pollMs = Number(process.env.MI_PHOTON_POLL_MS || 250);
 const maxWaitMs = Number(process.env.MI_PHOTON_MAX_WAIT_MS || 30 * 60 * 1000);
+const photonTypingDelayMs = boundedEnvironmentInteger('MI_PHOTON_TYPING_DELAY_MS', 100, 0, 5000);
 const bootTestSend = /^(1|true|yes|on)$/i.test(process.env.PHOTON_BOOT_TEST_SEND || '');
 const maxReplyChars = Number(process.env.MI_PHOTON_MAX_REPLY_CHARS || 1200);
 const notifyHost = process.env.MI_PHOTON_NOTIFY_HOST || '127.0.0.1';
@@ -65,6 +66,8 @@ function createTestSpace(space = {}) {
       await appendTestSend({ kind: 'message', spaceId: this.id, phone: this.phone, text: String(content?.text || content || '') });
     },
     async startTyping() {
+      const delayMs = Number(space.typingStartDelayMs || 0);
+      if (Number.isFinite(delayMs) && delayMs > 0) await sleep(delayMs);
       await appendTestSend({ kind: 'typing-start', spaceId: this.id, phone: this.phone });
     },
     async stopTyping() {
@@ -124,6 +127,18 @@ const MAX_SEEN = 5000;
 
 function splitList(value) {
   return String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function boundedEnvironmentInteger(name, fallback, minimum, maximum) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const value = String(raw).trim();
+  const parsed = /^[+-]?\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    console.warn(`Invalid ${name}; using safe default ${fallback}ms.`);
+    return fallback;
+  }
+  return parsed;
 }
 
 function senderFor(space, message) {
@@ -279,7 +294,8 @@ async function send(space, reply) {
   return false;
 }
 
-function startTypingBestEffort(space, delayMs = 700) {
+function startTypingBestEffort(space, delayMs = photonTypingDelayMs) {
+  console.log(`photon typing scheduled delay=${delayMs}ms`);
   let done = false;
   let started = false;
   let startPromise = null;

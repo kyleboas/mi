@@ -36,8 +36,8 @@ try {
   const privateRoot = path.join(temp, 'private-mi');
   const privateExtensions = path.join(privateRoot, 'pi', 'extensions');
   await mkdir(privateExtensions, { recursive: true });
-  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await writeFile(path.join(privateExtensions, file), 'export {};\n');
-  const reviewed = reviewedMiExtensionPaths({ root: privateRoot, requireDaemon: true, requireGuard: true, requireAdapter: true });
+  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-diver-notes.ts']) await writeFile(path.join(privateExtensions, file), 'export {};\n');
+  const reviewed = reviewedMiExtensionPaths({ root: privateRoot, requireDaemon: true, requireGuard: true, requireAdapter: true, requireDiverNotes: true });
   assert.equal(reviewed.daemonPath, path.join(privateExtensions, 'mi-daemon.mjs'));
   const outsideDaemon = path.join(temp, 'outside.mjs');
   await writeFile(outsideDaemon, 'export {};\n');
@@ -86,10 +86,11 @@ try {
 
   const guard = path.join(repo, 'pi/extensions/mi-capability-guard.ts');
   const adapter = path.join(repo, 'pi/extensions/mi-orchestrator-adapter.ts');
-  const coordinator = miCoordinatorLaunch({ piCommand: 'pi', cwd: repo, runtimeDir: temp, model: 'test', capabilityGuardPath: guard, capabilityAdapterPath: adapter });
+  const diverNotes = path.join(repo, 'pi/extensions/mi-diver-notes.ts');
+  const coordinator = miCoordinatorLaunch({ piCommand: 'pi', cwd: repo, runtimeDir: temp, model: 'test', capabilityGuardPath: guard, capabilityAdapterPath: adapter, diverNotesPath: diverNotes });
   assert.ok(coordinator.args.includes('--no-extensions'), 'the coordinator disables ambient extensions');
-  assert.deepEqual(coordinator.args.filter((entry) => entry === '--extension'), ['--extension', '--extension'], 'the coordinator adds exactly two reviewed extensions');
-  assert.deepEqual(coordinator.args.slice(-4), ['--extension', guard, '--extension', adapter], 'the coordinator loads only the reviewed guard and adapter');
+  assert.deepEqual(coordinator.args.filter((entry) => entry === '--extension'), ['--extension', '--extension', '--extension'], 'the coordinator adds exactly three reviewed extensions');
+  assert.deepEqual(coordinator.args.slice(-6), ['--extension', guard, '--extension', adapter, '--extension', diverNotes], 'the coordinator loads only the reviewed private extensions');
 
   const packageJson = JSON.parse(await readFile(path.join(repo, 'package.json'), 'utf8'));
   const packageText = JSON.stringify(packageJson);

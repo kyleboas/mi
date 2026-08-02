@@ -35,6 +35,8 @@ type AuditRecord = {
 type ToolRequest = { right: Right; resource: string; path?: string };
 
 const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate']);
+const DIVER_NOTES_READ_OPERATIONS = new Set(['tasks.list', 'notes.list', 'projects.list', 'project-tasks.list']);
+const DIVER_NOTES_WRITE_OPERATIONS = new Set(['tasks.add', 'tasks.complete', 'tasks.reopen', 'notes.add', 'projects.ensure', 'project-tasks.add', 'project-tasks.complete', 'project-tasks.reopen', 'project-subtasks.add', 'project-subtasks.complete', 'project-subtasks.reopen']);
 const BLOCKED_ORCHESTRATOR_TOOLS = new Set(['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover']);
 const PROTECTED_PATH_NAMES = new Set(['.git', '.pi', '.config', '.ssh', 'node_modules', 'state', 'secrets', 'credentials', 'config']);
 
@@ -140,6 +142,13 @@ function requestForTool(toolName: string, input: any, cwd: string): ToolRequest 
   if (toolName === 'write') return { right: 'write', resource: fileResource(input?.path, cwd) };
   if (toolName === 'edit') return { right: 'write', resource: fileResource(input?.path, cwd) };
   if (toolName === 'bash') return { right: 'execute', resource: 'tool://bash' };
+  if (toolName === 'mi_diver_notes') {
+    const operation = input?.operation;
+    if (typeof operation !== 'string') return undefined;
+    if (DIVER_NOTES_READ_OPERATIONS.has(operation)) return { right: 'read', resource: 'diver-notes://vault' };
+    if (DIVER_NOTES_WRITE_OPERATIONS.has(operation)) return { right: 'write', resource: 'diver-notes://vault' };
+    return undefined;
+  }
   return undefined;
 }
 
