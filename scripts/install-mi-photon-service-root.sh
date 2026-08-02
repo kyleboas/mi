@@ -12,12 +12,15 @@ USER_NAME="${MI_SERVICE_USER:-kyle}"
 SECRET_ENV="${MI_PHOTON_SECRET_ENV:-$SYSTEM_ROOT/etc/agent-secrets/projects/assistant/photon.secret}"
 UNIT_PATH="$SYSTEM_ROOT/etc/systemd/system/mi-photon-bridge.service"
 NODE_BIN="${MI_NODE_BIN:-/home/kyle/.nvm/versions/node/v24.15.0/bin/node}"
+NODE_DIR="${NODE_BIN%/*}"
+PI_BIN="${MI_PI_BIN:-$NODE_DIR/pi}"
+SERVICE_PATH="$NODE_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
 SERVICE_HOME="${MI_SERVICE_HOME:-/home/$USER_NAME}"
 MI_WORKFLOWS_DIR_VALUE="${MI_WORKFLOWS_DIR:-$SERVICE_HOME/workflows}"
 MI_RUNTIME_DIR_VALUE="${MI_RUNTIME_DIR:-$APP_DIR/state/imessage/runtime}"
 safe_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ && "$1" != *//* && "$1" != */../* && "$1" != */./* ]]; }
 [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo 'Unsafe Photon service user' >&2; exit 1; }
-for checked_path in "$APP_DIR" "$SECRET_ENV" "$UNIT_PATH" "$NODE_BIN" "$SERVICE_HOME" "$MI_WORKFLOWS_DIR_VALUE" "$MI_RUNTIME_DIR_VALUE"; do
+for checked_path in "$APP_DIR" "$SECRET_ENV" "$UNIT_PATH" "$NODE_BIN" "$PI_BIN" "$SERVICE_HOME" "$MI_WORKFLOWS_DIR_VALUE" "$MI_RUNTIME_DIR_VALUE"; do
   safe_path "$checked_path" || { echo "Unsafe Photon path: $checked_path" >&2; exit 1; }
 done
 
@@ -45,6 +48,8 @@ User=$USER_NAME
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$SECRET_ENV
 Environment=MI_ROOT=$APP_DIR
+Environment=PI_CMD=$PI_BIN
+Environment=PATH=$SERVICE_PATH
 Environment=MI_RUNTIME_DIR=$MI_RUNTIME_DIR_VALUE
 Environment=MI_IMESSAGE_WORKSPACE_ROOT=$MI_WORKFLOWS_DIR_VALUE
 Environment=MI_IMESSAGE_WORKSPACE_CWD=$MI_WORKFLOWS_DIR_VALUE
