@@ -7,6 +7,17 @@ const DEFAULT_STDERR_CAP = 16 * 1024;
 const DEFAULT_ASSISTANT_CAP = 12 * 1024;
 const DEFAULT_RECORD_CAP = 64 * 1024;
 const DEFAULT_KILL_GRACE_MS = 1500;
+const FAILURE_DETAIL_CAP = 2048;
+
+export const COORDINATOR_FAILURE_CLASSES = Object.freeze([
+  'prompt-rejected',
+  'provider-unavailable',
+  'provider-auth-failed',
+  'model-unavailable',
+  'session-invalid',
+  'rpc-protocol-error',
+  'unknown',
+]);
 
 function boundedNumber(value, fallback, minimum, maximum) {
   const number = Number(value);
@@ -20,6 +31,64 @@ function textParts(content) {
     .filter((part) => part?.type === 'text' && typeof part.text === 'string')
     .map((part) => part.text)
     .join('\n');
+}
+
+function boundedFailureText(value) {
+  return typeof value === 'string' ? value.slice(0, FAILURE_DETAIL_CAP) : '';
+}
+
+function failureFieldText(value) {
+  if (typeof value === 'string') return boundedFailureText(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (!value || typeof value !== 'object') return '';
+  return [value.code, value.name, value.message]
+    .filter((field) => typeof field === 'string' || (typeof field === 'number' && Number.isFinite(field)))
+    .map((field) => failureFieldText(field))
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, FAILURE_DETAIL_CAP);
+}
+
+function responseFailureText(response) {
+  if (!response || typeof response !== 'object') return '';
+  return [response.error, response.message, response.code, response.reason]
+    .map((field) => failureFieldText(field))
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, FAILURE_DETAIL_CAP);
+}
+
+export function safeCoordinatorFailureClass(value) {
+  return COORDINATOR_FAILURE_CLASSES.includes(value) ? value : 'unknown';
+}
+
+/** Convert bounded RPC detail into one of the fixed diagnostic classes. */
+export function classifyCoordinatorFailure({ response, stderr = '' } = {}) {
+  const detail = boundedFailureText(`${responseFailureText(response)} ${boundedFailureText(stderr)}`).trim().toLowerCase();
+  if (/authentication|authorization|unauthori[sz]ed|forbidden|invalid (?:api )?key|missing (?:api )?key|no (?:api )?key|credential|token expired|login required|\b401\b|\b403\b/.test(detail)) {
+    return 'provider-auth-failed';
+  }
+  if (/(?:model|deployment).{0,40}(?:not found|unavailable|unknown|unsupported|invalid|does not exist)|no such model|model id/.test(detail)) {
+    return 'model-unavailable';
+  }
+  if (/(?:session|conversation).{0,50}(?:invalid|corrupt|malformed|not found|missing|cannot|unable|failed)|(?:invalid|corrupt|malformed).{0,50}(?:session|conversation)/.test(detail)) {
+    return 'session-invalid';
+  }
+  if (/(?:provider|upstream|service|gateway).{0,40}(?:unavailable|unreachable|offline|down|timeout|timed out|overloaded|rate limit|too many requests)|econn(?:refused|reset)|enotfound|etimedout|fetch failed|network error|socket hang up/.test(detail)) {
+    return 'provider-unavailable';
+  }
+  if (/prompt.{0,40}(?:rejected|refused|not accepted|cannot be accepted)|message.{0,40}(?:rejected|refused|not accepted)|(?:agent is )?streaming|already processing (?:a )?(?:prompt|message)/.test(detail)) {
+    return 'prompt-rejected';
+  }
+  if (/\b(?:rpc|protocol|parse error|json parse|malformed|invalid response|unexpected response|unknown command)\b/.test(detail)) {
+    return 'rpc-protocol-error';
+  }
+  if (!detail && response?.type === 'response' && response.success === false) return 'prompt-rejected';
+  return 'unknown';
+}
+
+function failureClassForReason(reason) {
+  return reason === 'stdout-limit' || reason === 'malformed-output' ? 'rpc-protocol-error' : 'unknown';
 }
 
 /** Only finalized assistant text may become an iMessage completion. */
@@ -74,6 +143,9 @@ export function runMiCoordinatorRpc({
     let stderr = '';
     let finalText = '';
     let promptWritten = false;
+    let rejectionResponse;
+    let failureClass = 'unknown';
+    let finishedResult;
     let timeout;
     let reapTimer;
     let forceKillTimer;
@@ -103,11 +175,22 @@ export function runMiCoordinatorRpc({
       forceKillTimer.unref?.();
     };
 
+    const refreshFailureClass = () => {
+      const classified = classifyCoordinatorFailure({ response: rejectionResponse, stderr });
+      if (classified !== 'unknown') {
+        failureClass = classified;
+        if (finishedResult) finishedResult.failureClass = classified;
+      }
+    };
+
     const finish = (result, { closeGracefully = false } = {}) => {
       if (finished) return;
       finished = true;
       if (timeout) clearTimeout(timeout);
       timeout = undefined;
+      refreshFailureClass();
+      const reason = result.reason || (result.ok ? 'settled' : 'failed');
+      if (!result.ok && failureClass === 'unknown') failureClass = failureClassForReason(reason);
       endInput();
       if (closeGracefully) {
         reapTimer = setTimeout(reap, killGraceMs);
@@ -115,25 +198,28 @@ export function runMiCoordinatorRpc({
       } else {
         reap();
       }
-      resolve({
+      finishedResult = {
         ok: result.ok === true,
-        reason: result.reason || (result.ok ? 'settled' : 'failed'),
+        reason,
         text: finalText || '',
-        stderr,
+        failureClass: result.ok ? undefined : safeCoordinatorFailureClass(failureClass),
         child,
-      });
+      };
+      resolve(finishedResult);
     };
 
     const fail = (reason) => finish({ ok: false, reason });
 
     const receiveEvent = (event) => {
-      try { onEvent?.(event); } catch {}
-      const assistant = coordinatorAssistantText(event, assistantCap);
-      if (assistant) finalText = assistant;
       if (event?.type === 'response' && event.id === requestId && event.success === false) {
+        rejectionResponse = event;
+        refreshFailureClass();
         fail('prompt-rejected');
         return;
       }
+      try { onEvent?.(event); } catch {}
+      const assistant = coordinatorAssistantText(event, assistantCap);
+      if (assistant) finalText = assistant;
       // RPC agent events do not carry command IDs. This process owns exactly
       // one outstanding prompt, so its next settlement boundary belongs to
       // that request. A settlement with no assistant text is a clear failure,
@@ -189,6 +275,7 @@ export function runMiCoordinatorRpc({
         const available = Math.max(0, boundedNumber(stderrCap, DEFAULT_STDERR_CAP, 0, 128 * 1024) - stderr.length);
         stderr += chunk.toString('utf8').slice(0, available);
       }
+      refreshFailureClass();
     });
     child.stdin?.on('error', () => fail('stdin-error'));
     child.on('error', () => fail('spawn-error'));

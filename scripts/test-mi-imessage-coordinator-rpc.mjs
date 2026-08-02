@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
+import { classifyCoordinatorFailure, COORDINATOR_FAILURE_CLASSES, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'mi-coordinator-rpc-'));
 const record = path.join(root, 'record.jsonl');
@@ -47,19 +47,34 @@ process.stdin.on('data', () => process.stdout.write('x'.repeat(4096)));
 process.stdin.on('data', () => process.stdout.write('x'.repeat(4096)));
 `, { mode: 0o755 });
   await writeFile(rejected, String.raw`#!/usr/bin/env node
-process.stdin.on('data', (chunk) => { const request = JSON.parse(chunk.toString()); process.stdout.write(JSON.stringify({ type: 'response', id: request.id, success: false, error: 'no' }) + '\n'); });
+process.stdin.on('data', (chunk) => { const request = JSON.parse(chunk.toString()); process.stderr.write('provider authentication failed: PRIVATE_PROMPT /home/kyle/private/session.jsonl test-token-not-secret\\n'); process.stdout.write(JSON.stringify({ type: 'response', id: request.id, success: false, error: 'unclassified detail' }) + '\n'); });
 `, { mode: 0o755 });
   await writeFile(noAssistant, String.raw`#!/usr/bin/env node
 process.stdin.on('data', () => process.stdout.write(JSON.stringify({ type: 'agent_settled' }) + '\n'));
 `, { mode: 0o755 });
   await Promise.all([good, stalled, exited, stdoutLimit, malformed, rejected, noAssistant].map((file) => chmod(file, 0o755)));
 
+  assert.deepEqual(COORDINATOR_FAILURE_CLASSES, [
+    'prompt-rejected', 'provider-unavailable', 'provider-auth-failed', 'model-unavailable',
+    'session-invalid', 'rpc-protocol-error', 'unknown',
+  ], 'diagnostics expose only the reviewed static classes');
+  const recognized = [
+    [{ response: { type: 'response', success: false, error: 'prompt was rejected' } }, 'prompt-rejected'],
+    [{ stderr: 'upstream provider is unavailable' }, 'provider-unavailable'],
+    [{ response: { error: 'provider authentication failed' } }, 'provider-auth-failed'],
+    [{ stderr: 'model was not found' }, 'model-unavailable'],
+    [{ response: { error: 'session file is corrupt' } }, 'session-invalid'],
+    [{ stderr: 'RPC protocol parse error' }, 'rpc-protocol-error'],
+  ];
+  for (const [input, expected] of recognized) assert.equal(classifyCoordinatorFailure(input), expected, `${expected} is recognized safely`);
+  assert.equal(classifyCoordinatorFailure({ response: { error: 'PRIVATE_PROMPT /home/kyle/private/session.jsonl test-token-not-secret' } }), 'unknown', 'unclassified detail falls back to unknown');
+
   const result = await runMiCoordinatorRpc({
     launch: launch(good), requestId: 'turn-1', prompt: 'safe request', stderrCap: 64, timeoutMs: 3000,
   });
   assert.equal(result.ok, true, 'assistant turn settles while RPC stdin remains open');
   assert.equal(result.text, 'Only this assistant result is safe.', 'user message_end content never becomes the completion');
-  assert.ok(result.stderr.length <= 64, 'stderr is drained but kept bounded');
+  assert.equal(result.stderr, undefined, 'raw stderr is not returned in the RPC result');
   await new Promise((resolve) => setTimeout(resolve, 40));
   const events = (await readFile(record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(events.find((event) => event.phase === 'prompt').stdinEnded, false, 'stdin was not ended before agent_settled');
@@ -79,6 +94,9 @@ process.stdin.on('data', () => process.stdout.write(JSON.stringify({ type: 'agen
   assert.equal(badRecord.reason, 'malformed-output', 'oversized unterminated output record is rejected');
   const promptRejected = await runMiCoordinatorRpc({ launch: launch(rejected), requestId: 'turn-6', prompt: 'reject', timeoutMs: 3000 });
   assert.equal(promptRejected.reason, 'prompt-rejected', 'explicit RPC prompt rejection fails immediately');
+  assert.equal(promptRejected.failureClass, 'provider-auth-failed', 'RPC rejection diagnostics classify bounded stderr');
+  assert.equal(promptRejected.stderr, undefined, 'RPC rejection results do not expose raw stderr');
+  assert.doesNotMatch(JSON.stringify(promptRejected), /PRIVATE_PROMPT|session\.jsonl|test-token-not-secret|unclassified detail/, 'raw rejection detail cannot reach the result');
   const settledWithoutAssistant = await runMiCoordinatorRpc({ launch: launch(noAssistant), requestId: 'turn-7', prompt: 'empty', timeoutMs: 3000 });
   assert.equal(settledWithoutAssistant.reason, 'settled-without-assistant', 'settlement without a final assistant response fails closed');
 

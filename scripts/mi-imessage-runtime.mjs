@@ -7,7 +7,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
-import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc } from './mi-imessage-coordinator.mjs';
+import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc, safeCoordinatorFailureClass } from './mi-imessage-coordinator.mjs';
 import { diverNotesPreflight } from './mi-diver-notes-intent.mjs';
 import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 import { redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
@@ -827,7 +827,7 @@ export class ImessageRuntime {
       return { reply, taskIds: ids };
     }
     if (!result.ok) {
-      console.error(`Mi iMessage coordinator failed: ${result.reason}`);
+      console.error(`Mi iMessage coordinator failed: ${safeCoordinatorFailureClass(result.failureClass)}`);
       const reply = result.reason === 'timeout' ? IMESSAGE_REPLIES.timeout
         : ['exited-SIGTERM', 'exited-SIGINT', 'exited-SIGKILL'].includes(result.reason) ? IMESSAGE_REPLIES.interruption
           : result.reason === 'spawn-error' ? IMESSAGE_REPLIES.startFailure : IMESSAGE_REPLIES.startFailure;

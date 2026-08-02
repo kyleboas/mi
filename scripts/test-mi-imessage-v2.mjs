@@ -24,7 +24,7 @@ try {
   process.env.MI_ROOT = miRoot;
   process.env.MI_IMESSAGE_WORKSPACE_ROOT = workspace;
   process.env.MI_IMESSAGE_WORKSPACE_CWD = workspace;
-  const { conversationIdFor, createImessageRuntime: createRuntime, deliveryIdFor, requestDigestFor } = await import('./mi-imessage-runtime.mjs');
+  const { conversationIdFor, createImessageRuntime: createRuntime, deliveryIdFor, IMESSAGE_REPLIES, requestDigestFor } = await import('./mi-imessage-runtime.mjs');
   const { readPendingConfirmation } = await import('../dist/src/pending-confirmations.js');
   assert.match(conversationIdFor({ id: 'SPACE A' }, { sender: { id: '+1' } }), /^imessage-[a-f0-9]{32}$/);
   assert.notEqual(conversationIdFor({ id: 'SPACE A' }, { sender: { id: '+1' } }), conversationIdFor({ id: 'SPACE B' }, { sender: { id: '+1' } }), 'space identity separates conversations');
@@ -154,6 +154,26 @@ try {
   const corrupt = await runtime.handleEvent({ ...event('corrupt', 'corrupt-turn', 'inspect'), sendReply: send });
   assert.equal(sent.at(-1), 'I could not reopen this conversation safely. Please try again.');
   assert.equal(prompts, beforeCorrupt, 'corrupted session does not start Pi');
+
+  const diagnosticRawDetail = 'PRIVATE_PROMPT /home/kyle/private/session.jsonl task-secret test-token-not-secret';
+  const diagnosticLogs = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => diagnosticLogs.push(args.map(String).join(' '));
+  let diagnostic;
+  try {
+    const diagnosticRuntime = await createRuntime({
+      stateRoot: join(root, 'diagnostics'),
+      spawnRpc: async () => ({ ok: false, reason: 'prompt-rejected', failureClass: 'provider-auth-failed', stderr: diagnosticRawDetail }),
+    });
+    diagnostic = await diagnosticRuntime.handleEvent({ ...event('diagnostics', 'failed-turn', 'inspect the failure'), sendReply: send });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(diagnostic.status, 'sent');
+  assert.equal(sent.at(-1), IMESSAGE_REPLIES.startFailure, 'diagnostics keep the generic user-facing reply');
+  assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_PROMPT|session\.jsonl|task-secret|test-token-not-secret/, 'raw rejection detail cannot reach runtime results');
+  assert.deepEqual(diagnosticLogs, ['Mi iMessage coordinator failed: provider-auth-failed'], 'runtime logs only the allowlisted failure class');
+  assert.doesNotMatch(diagnosticLogs.join('\n'), /PRIVATE_PROMPT|session\.jsonl|task-secret|test-token-not-secret/, 'raw rejection detail cannot reach runtime logs');
 
   const order = [];
   let concurrent = 0;
