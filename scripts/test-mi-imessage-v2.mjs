@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -67,15 +68,19 @@ try {
     taskIds: [],
   }), { mode: 0o600 });
   const resumed = await restartedRuntime.handleEvent({ ...pendingEvent, sendReply: send });
-  assert.equal(resumed.status, 'sent', 'a received delivery resumes after restart');
+  assert.equal(resumed.status, 'interrupted', 'a received delivery does not replay after restart');
+  assert.equal(prompts, 3, 'an interrupted received delivery starts no Pi prompt');
+  const interruptedPending = JSON.parse(await readFile(join(pendingDirectory, `${pendingDelivery}.json`), 'utf8'));
+  assert.equal('rawMessage' in interruptedPending, false, 'interrupted received state erases the raw message');
+  assert.equal(interruptedPending.interruptionReason, 'recovered-incomplete-delivery', 'interrupted received state keeps a fixed internal reason');
 
   const conflict = await runtime.handleEvent({ ...event('thread-a', 'one', 'changed payload'), sendReply: send });
   assert.equal(conflict.reason, 'payload-conflict');
-  assert.equal(prompts, 4, 'payload conflict starts no new Pi prompt');
+  assert.equal(prompts, 3, 'payload conflict starts no new Pi prompt');
 
   const missing = await runtime.handleEvent({ space: { id: 'thread-a' }, message: { timestamp: '2026-01-01T00:00:00Z', content: { type: 'text', text: 'missing id' } }, sendReply: send });
   assert.equal(missing.reason, 'missing-identity');
-  assert.equal(prompts, 4);
+  assert.equal(prompts, 3);
 
   const delegatedCalls = [];
   const delegatedRuntime = await createRuntime({
@@ -163,13 +168,82 @@ try {
   const staleEvent = event('stale', 'stale', 'stale request');
   const staleId = deliveryIdFor(staleConversation, staleEvent.message);
   const staleDigest = requestDigestFor(staleConversation, staleEvent.message, 'stale request', '2026-01-01T00:00:00.000Z');
-  await writeFile(join(staleDirectory, `${staleId}.json`), JSON.stringify({ schemaVersion: 1, conversationId: staleConversation, deliveryId: staleId, requestDigest: staleDigest, status: 'running', receivedAt: '2026-01-01T00:00:00Z', runningAt: '2026-01-01T00:00:00Z', rawMessage: 'stale request', taskIds: [] }), { mode: 0o600 });
+  const staleFile = join(staleDirectory, `${staleId}.json`);
+  await writeFile(staleFile, JSON.stringify({ schemaVersion: 1, conversationId: staleConversation, deliveryId: staleId, requestDigest: staleDigest, status: 'running', receivedAt: '2026-01-01T00:00:00Z', runningAt: '2026-01-01T00:00:00Z', rawMessage: 'stale request', taskIds: [] }), { mode: 0o600 });
+  await mkdir(`${staleFile}.lock`, { mode: 0o700 });
+  await writeFile(join(`${staleFile}.lock`, 'owner'), JSON.stringify({ pid: 4_000_000, createdAt: '2026-01-01T00:00:00.000Z', nonce: 'stale-lock' }), { mode: 0o600 });
   const restartedWithStale = await createRuntime({ stateRoot, spawnRpc });
   const recovered = JSON.parse(await readFile(join(staleDirectory, `${staleId}.json`), 'utf8'));
   assert.equal(recovered.status, 'interrupted', 'startup converts stale running work to interrupted');
+  assert.equal('rawMessage' in recovered, false, 'startup recovery erases the stale running raw message');
+  assert.equal(recovered.interruptionReason, 'recovered-incomplete-delivery', 'startup recovery keeps a fixed internal reason');
   const interrupted = await restartedWithStale.handleEvent({ ...staleEvent, sendReply: send });
   assert.equal(interrupted.status, 'interrupted', 'interrupted work does not rerun automatically');
   assert.equal(sent.at(-1), 'That request was interrupted before it finished. Please try again.');
+
+  const orderingStateRoot = join(root, 'ordering-recovery');
+  const orderingRecoveryRuntime = await createRuntime({ stateRoot: orderingStateRoot, spawnRpc });
+  const orderingOldEvent = event('ordering-recovery', 'old', 'old request', '2026-01-01T00:00:00Z');
+  const orderingConversation = conversationIdFor(orderingOldEvent.space, orderingOldEvent.message);
+  const orderingDirectory = join(orderingStateRoot, 'imessage', 'conversations', orderingConversation);
+  const orderingDeliveries = join(orderingDirectory, 'deliveries');
+  const orderingOldId = deliveryIdFor(orderingConversation, orderingOldEvent.message);
+  await mkdir(orderingDeliveries, { recursive: true, mode: 0o700 });
+  await writeFile(join(orderingDeliveries, `${orderingOldId}.json`), JSON.stringify({
+    schemaVersion: 1,
+    deliveryId: orderingOldId,
+    conversationId: orderingConversation,
+    requestDigest: requestDigestFor(orderingConversation, orderingOldEvent.message, 'old request', '2026-01-01T00:00:00.000Z'),
+    status: 'received',
+    receivedAt: '2026-01-01T00:00:00.000Z',
+    rawMessage: 'old request',
+    taskIds: [],
+  }), { mode: 0o600 });
+  const orderingNew = await orderingRecoveryRuntime.handleEvent({ ...event('ordering-recovery', 'new', 'new request', '2026-01-01T00:00:01Z'), sendReply: send });
+  assert.equal(orderingNew.status, 'sent', 'newer work proceeds after stale earlier state is resolved');
+  const orderingRecovered = JSON.parse(await readFile(join(orderingDeliveries, `${orderingOldId}.json`), 'utf8'));
+  assert.equal(orderingRecovered.status, 'interrupted', 'newer work resolves an earlier received delivery first');
+  assert.equal('rawMessage' in orderingRecovered, false, 'ordering recovery erases the earlier raw message');
+
+  const multiProcessRoot = join(root, 'multi-process');
+  const multiProcessWorkspace = join(root, 'multi-process-workspace');
+  const launches = join(root, 'multi-process-launches');
+  await mkdir(multiProcessWorkspace, { recursive: true, mode: 0o700 });
+  const runner = join(root, 'duplicate-runtime.mjs');
+  await writeFile(runner, `
+    import { appendFile } from 'node:fs/promises';
+    import { createImessageRuntime } from ${JSON.stringify(new URL('./mi-imessage-runtime.mjs', import.meta.url).href)};
+    const event = { space: { id: 'multi-process' }, message: { id: 'same-delivery', timestamp: '2026-01-01T00:00:00Z', direction: 'inbound', sender: { id: '+1' }, content: { type: 'text', text: 'one launch only' } } };
+    const runtime = await createImessageRuntime({
+      stateRoot: process.env.TEST_STATE_ROOT,
+      spawnRpc: async ({ onEvent }) => {
+        await appendFile(process.env.TEST_LAUNCHES, 'launch\\n');
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        onEvent?.({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'one reply' }] } });
+        return { ok: true, text: 'one reply', reason: 'settled' };
+      },
+    });
+    const result = await runtime.handleEvent({ ...event, sendReply: async () => true });
+    if (!['sent', 'completed'].includes(result.status)) throw new Error(JSON.stringify(result));
+  `);
+  const childEnvironment = {
+    ...process.env,
+    HOME: root,
+    MI_ROOT: miRoot,
+    MI_IMESSAGE_WORKSPACE_ROOT: multiProcessWorkspace,
+    MI_IMESSAGE_WORKSPACE_CWD: multiProcessWorkspace,
+    TEST_STATE_ROOT: multiProcessRoot,
+    TEST_LAUNCHES: launches,
+  };
+  const runChild = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [runner], { cwd: repoRoot, env: childEnvironment, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('exit', (status) => status === 0 ? resolve() : reject(new Error(`duplicate runtime exited ${status}: ${stderr}`)));
+  });
+  await Promise.all([runChild(), runChild()]);
+  assert.equal((await readFile(launches, 'utf8')).trim().split('\\n').filter(Boolean).length, 1, 'independent runtimes launch Pi once for a duplicate delivery');
   console.log('Mi iMessage runtime safety and recovery checks passed.');
 } finally {
   await rm(root, { recursive: true, force: true });

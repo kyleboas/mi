@@ -21,11 +21,12 @@ const maxCompletionChars = boundedInteger(process.env.MI_IMESSAGE_COMPLETION_MAX
 const coordinatorTimeoutMs = boundedInteger(process.env.MI_IMESSAGE_COORDINATOR_TIMEOUT_MS, 90_000, 1000, 10 * 60_000);
 const taskPollMs = boundedInteger(process.env.MI_IMESSAGE_TASK_POLL_MS, 250, 25, 5000);
 const maxConversations = boundedInteger(process.env.MI_IMESSAGE_CONCURRENCY, 4, 1, 16);
+const deliveryLockStaleMs = boundedInteger(process.env.MI_IMESSAGE_DELIVERY_LOCK_STALE_MS, 60_000, 1000, 10 * 60_000);
+const staleDeliveryReason = 'recovered-incomplete-delivery';
 const confirmationObjectiveMaxChars = 240;
 const coordinatorObjectiveMaxChars = boundedInteger(process.env.MI_COORDINATOR_OBJECTIVE_MAX_CHARS, 4000, 240, 16 * 1024);
 const deliverySchemaVersion = 1;
 const terminalTaskStatuses = new Set(['complete', 'completed', 'done', 'error', 'stopped', 'inactive']);
-const incompleteStatuses = new Set(['received', 'running', 'interrupted']);
 
 export const IMESSAGE_REPLIES = Object.freeze({
   retryIdentity: 'Please retry that message. I need its upstream ID and timestamp before I can process it.',
@@ -184,17 +185,13 @@ async function readJson(file) {
   }
 }
 
-function deliveryIncomplete(status) {
-  return incompleteStatuses.has(status);
-}
-
 function deliveryFile(directory, deliveryId) {
   return path.join(directory, 'deliveries', `${deliveryId}.json`);
 }
 
 function boundedDelivery(record) {
   const next = { ...record };
-  if (deliveryIncomplete(next.status)) next.rawMessage = String(next.rawMessage || '').slice(0, maxMessageChars);
+  if (next.status === 'received' || next.status === 'running') next.rawMessage = String(next.rawMessage || '').slice(0, maxMessageChars);
   else delete next.rawMessage;
   if (next.completionReply) next.completionReply = cleanReply(next.completionReply);
   next.taskIds = Array.isArray(next.taskIds) ? next.taskIds.filter((id) => safeId(id)).slice(0, 32) : [];
@@ -203,6 +200,73 @@ function boundedDelivery(record) {
 
 async function writeDelivery(file, record) {
   await atomicJsonWrite(file, boundedDelivery(record));
+}
+
+function deliveryLockFile(file) {
+  return `${file}.lock`;
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function deliveryLockIsStale(lockPath) {
+  const info = await lstat(lockPath).catch((error) => error?.code === 'ENOENT' ? undefined : null);
+  if (!info) return false;
+  const owner = await readJson(path.join(lockPath, 'owner'));
+  const pid = Number(owner?.pid);
+  if (Number.isSafeInteger(pid) && pid > 0) return !processIsAlive(pid);
+  const createdAt = Date.parse(String(owner?.createdAt || '')) || info.mtimeMs;
+  return Date.now() - createdAt > deliveryLockStaleMs;
+}
+
+async function acquireDeliveryLock(file) {
+  const lockPath = deliveryLockFile(file);
+  await ensurePrivateDirectory(path.dirname(file));
+  while (true) {
+    const nonce = randomBytes(16).toString('hex');
+    let created = false;
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      created = true;
+      await chmod(lockPath, 0o700);
+      const owner = await open(path.join(lockPath, 'owner'), 'wx', 0o600);
+      try {
+        await owner.writeFile(JSON.stringify({ pid: process.pid, createdAt: isoNow(), nonce }), 'utf8');
+        await owner.sync();
+      } finally {
+        await owner.close();
+      }
+      await chmod(path.join(lockPath, 'owner'), 0o600);
+      return async () => {
+        const current = await readJson(path.join(lockPath, 'owner'));
+        if (current?.nonce === nonce) await rm(lockPath, { recursive: true, force: true });
+      };
+    } catch (error) {
+      if (created) await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+      if (error?.code !== 'EEXIST') throw error;
+      if (await deliveryLockIsStale(lockPath)) {
+        await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
+async function withDeliveryLock(file, work) {
+  const release = await acquireDeliveryLock(file);
+  try {
+    return await work();
+  } finally {
+    await release().catch(() => undefined);
+  }
 }
 
 async function listDeliveryFiles(directory) {
@@ -233,6 +297,20 @@ async function ensurePrivateFile(file) {
   await chmod(file, 0o600);
 }
 
+async function interruptIncompleteDelivery(file, reason = staleDeliveryReason) {
+  return withDeliveryLock(file, async () => {
+    const record = await readJson(file);
+    if (!record || !['received', 'running'].includes(record.status)) return false;
+    record.status = 'interrupted';
+    record.interruptedAt = isoNow();
+    record.interruptionReason = reason;
+    delete record.runningAt;
+    delete record.rawMessage;
+    await writeDelivery(file, record);
+    return true;
+  });
+}
+
 async function recoverStaleRunning(stateRoot) {
   const base = path.join(stateRoot, 'imessage', 'conversations');
   let conversations = [];
@@ -241,13 +319,7 @@ async function recoverStaleRunning(stateRoot) {
     if (!entry.isDirectory() || !/^imessage-[a-f0-9]{32}$/.test(entry.name)) continue;
     const directory = path.join(base, entry.name);
     for (const file of await listDeliveryFiles(directory)) {
-      const record = await readJson(file);
-      if (!record || record.status !== 'running') continue;
-      record.status = 'interrupted';
-      record.interruptedAt = isoNow();
-      delete record.runningAt;
-      delete record.rawMessage;
-      await writeDelivery(file, record);
+      await interruptIncompleteDelivery(file).catch(() => undefined);
     }
   }
 }
@@ -495,13 +567,15 @@ export class ImessageRuntime {
       try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
       return { ok: false, reason: 'state-unavailable', deliveryId, conversationId };
     }
-    const deliveryInfo = await lstat(file).catch((error) => error?.code === 'ENOENT' ? undefined : null);
-    if (deliveryInfo === null || (deliveryInfo && !deliveryInfo.isFile())) {
+    return withDeliveryLock(file, async () => {
+      const deliveryInfo = await lstat(file).catch((error) => error?.code === 'ENOENT' ? undefined : null);
+      if (deliveryInfo === null || (deliveryInfo && !deliveryInfo.isFile())) {
       try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
       return { ok: false, reason: 'invalid-delivery-state', deliveryId, conversationId };
     }
-    let record = await readJson(file);
-    if (deliveryInfo && !record) {
+      let record = await readJson(file);
+      let createdHere = false;
+      if (deliveryInfo && !record) {
       try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
       return { ok: false, reason: 'invalid-delivery-state', deliveryId, conversationId };
     }
@@ -510,8 +584,24 @@ export class ImessageRuntime {
         try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
         return { ok: false, reason: 'payload-conflict', deliveryId, conversationId };
       }
-      if (record.status === 'sent' || record.status === 'running') return { ok: true, duplicate: true, status: record.status, deliveryId, conversationId };
+      if (record.status === 'sent') return { ok: true, duplicate: true, status: record.status, deliveryId, conversationId };
+      if (record.status === 'running') {
+        record.status = 'interrupted';
+        record.interruptedAt = isoNow();
+        record.interruptionReason = staleDeliveryReason;
+        delete record.runningAt;
+        delete record.rawMessage;
+        await writeDelivery(file, record);
+        const sent = Boolean(sendReply && await sendReply(IMESSAGE_REPLIES.interruption).catch(() => false));
+        if (sent) {
+          record.interruptionNotifiedAt = isoNow();
+          await writeDelivery(file, record).catch(() => undefined);
+        }
+        return { ok: sent, status: 'interrupted', deliveryId, conversationId };
+      }
       if (record.status === 'interrupted') {
+        delete record.rawMessage;
+        await writeDelivery(file, record).catch(() => undefined);
         if (!record.interruptionNotifiedAt) {
           let sent = false;
           try { sent = Boolean(sendReply && await sendReply(IMESSAGE_REPLIES.interruption)); } catch {}
@@ -531,23 +621,45 @@ export class ImessageRuntime {
         try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
         return { ok: false, reason: 'invalid-delivery-state', deliveryId, conversationId };
       }
-    } else {
-      record = {
-        schemaVersion: deliverySchemaVersion,
-        deliveryId,
-        conversationId,
-        requestDigest,
-        status: 'received',
-        receivedAt: isoNow(),
-        rawMessage: text,
-        taskIds: [],
-      };
-      try { await writeDelivery(file, record); } catch {
-        try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
-        return { ok: false, reason: 'state-unavailable', deliveryId, conversationId };
+      } else {
+        record = {
+          schemaVersion: deliverySchemaVersion,
+          deliveryId,
+          conversationId,
+          requestDigest,
+          status: 'received',
+          receivedAt: isoNow(),
+          rawMessage: text,
+          taskIds: [],
+        };
+        createdHere = true;
+        try { await writeDelivery(file, record); } catch {
+          try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+          return { ok: false, reason: 'state-unavailable', deliveryId, conversationId };
+        }
       }
-    }
-    await this.acquireConversationSlot();
+      if (!createdHere && record.status === 'received') {
+        record.status = 'interrupted';
+        record.interruptedAt = isoNow();
+        record.interruptionReason = staleDeliveryReason;
+        delete record.rawMessage;
+        await writeDelivery(file, record);
+        const sent = Boolean(sendReply && await sendReply(IMESSAGE_REPLIES.interruption).catch(() => false));
+        if (sent) {
+          record.interruptionNotifiedAt = isoNow();
+          await writeDelivery(file, record).catch(() => undefined);
+        }
+        return { ok: sent, status: 'interrupted', deliveryId, conversationId };
+      }
+      if (createdHere) {
+        try {
+          await this.resolveEarlierIncomplete(directory, record);
+        } catch {
+          try { if (sendReply) await sendReply(IMESSAGE_REPLIES.startFailure); } catch {}
+          return { ok: false, reason: 'state-unavailable', deliveryId, conversationId };
+        }
+      }
+      await this.acquireConversationSlot();
     try {
       if (!await this.replayUnsent(directory, sendReply, deliveryId)) return { ok: false, reason: 'send-failure', deliveryId, conversationId };
       const current = await readJson(file);
@@ -578,6 +690,22 @@ export class ImessageRuntime {
     } finally {
       this.releaseConversationSlot();
     }
+    });
+  }
+
+  async resolveEarlierIncomplete(directory, current) {
+    const earlier = [];
+    for (const file of await listDeliveryFiles(directory)) {
+      if (file.endsWith(`${current.deliveryId}.json`)) continue;
+      const record = await readJson(file);
+      if (!record || record.conversationId !== current.conversationId || !['received', 'running'].includes(record.status)) continue;
+      const receivedAt = Date.parse(String(record.receivedAt || ''));
+      const currentReceivedAt = Date.parse(String(current.receivedAt || ''));
+      if (!Number.isFinite(receivedAt) || !Number.isFinite(currentReceivedAt)) continue;
+      if (receivedAt < currentReceivedAt || (receivedAt === currentReceivedAt && record.deliveryId < current.deliveryId)) earlier.push({ file, receivedAt, deliveryId: record.deliveryId });
+    }
+    earlier.sort((a, b) => a.receivedAt - b.receivedAt || a.deliveryId.localeCompare(b.deliveryId));
+    for (const entry of earlier) await interruptIncompleteDelivery(entry.file);
   }
 
   async runTurn(record, directory) {

@@ -1896,9 +1896,11 @@ if (process.env.MI_WEB_CHAT_TEST_START_DAEMON === '1') {
   }
 } else {
   await ensureMainThread();
-  await loadActiveWorkers();
-  setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
-  void monitorBackgroundWorkers().catch(() => undefined);
+  if (webMaintenance) {
+    await loadActiveWorkers();
+    setInterval(() => monitorBackgroundWorkers().catch(() => undefined), workerMonitorIntervalMs);
+    void monitorBackgroundWorkers().catch(() => undefined);
+  }
   const server = http.createServer(handle);
   server.listen(port, host, () => {
     console.log(`Mi web chat listening on http://${host}:${port}`);
