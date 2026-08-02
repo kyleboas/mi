@@ -25,6 +25,7 @@ try {
   process.env.MI_IMESSAGE_WORKSPACE_ROOT = workspace;
   process.env.MI_IMESSAGE_WORKSPACE_CWD = workspace;
   const { conversationIdFor, createImessageRuntime: createRuntime, deliveryIdFor, requestDigestFor } = await import('./mi-imessage-runtime.mjs');
+  const { readPendingConfirmation } = await import('../dist/src/pending-confirmations.js');
   assert.match(conversationIdFor({ id: 'SPACE A' }, { sender: { id: '+1' } }), /^imessage-[a-f0-9]{32}$/);
   assert.notEqual(conversationIdFor({ id: 'SPACE A' }, { sender: { id: '+1' } }), conversationIdFor({ id: 'SPACE B' }, { sender: { id: '+1' } }), 'space identity separates conversations');
   assert.equal(conversationIdFor({}, { sender: { id: '+1 555' } }), conversationIdFor({}, { sender: { id: '+1  555' } }), 'sender fallback is normalized');
@@ -118,11 +119,32 @@ try {
   const wrongConversation = await runtime.handleEvent({ ...event('other-confirm', 'wrong-conversation', `confirm ${confirmationId}`), sendReply: send });
   assert.equal(wrongConversation.status, 'sent');
   assert.equal(sent.at(-1), 'I cannot find a pending action for that confirmation.');
+  const wrongDeny = await runtime.handleEvent({ ...event('thread-confirm', 'wrong-deny', 'deny 00000000000000000000000000000000'), sendReply: send });
+  assert.equal(wrongDeny.status, 'sent');
+  assert.equal(sent.at(-1), 'I cannot find a pending action for that confirmation.', 'wrong denial token does not clear a pending action');
   const approved = await runtime.handleEvent({ ...event('thread-confirm', 'approve', `confirm ${confirmationId}`), sendReply: send });
   assert.equal(approved.status, 'sent');
   const replay = await runtime.handleEvent({ ...event('thread-confirm', 'replay', `confirm ${confirmationId}`), sendReply: send });
   assert.equal(replay.status, 'sent');
   assert.equal(sent.at(-1), 'I cannot find a pending action for that confirmation.', 'confirmation replay does not repeat the action');
+
+  const denyPromptsBefore = prompts;
+  const denyRequest = await runtime.handleEvent({ ...event('thread-deny', 'deny-request', 'send Kyle a message'), sendReply: send });
+  assert.equal(denyRequest.status, 'sent');
+  const denialId = sent.at(-1).match(/deny ([a-f0-9]{32})/)?.[1];
+  assert.ok(denialId, 'confirmation has an exact denial token');
+  const wrongDenialConversation = await runtime.handleEvent({ ...event('other-deny', 'wrong-deny-conversation', `deny ${denialId}`), sendReply: send });
+  assert.equal(wrongDenialConversation.status, 'sent');
+  assert.equal(sent.at(-1), 'I cannot find a pending action for that confirmation.', 'wrong-conversation denial does not clear a pending action');
+  assert.ok(await readPendingConfirmation(conversationIdFor({ id: 'thread-deny' }, { sender: { id: '+1' } }), { statePath: join(stateRoot, 'pending-confirmations.json') }), 'wrong-conversation denial preserves pending state');
+  const denied = await runtime.handleEvent({ ...event('thread-deny', 'deny', `deny ${denialId}`), sendReply: send });
+  assert.equal(denied.status, 'sent');
+  assert.equal(sent.at(-1), 'Okay, I will not proceed with that action.');
+  assert.equal(prompts, denyPromptsBefore, 'valid denial does not start Pi');
+  assert.equal(await readPendingConfirmation(conversationIdFor({ id: 'thread-deny' }, { sender: { id: '+1' } }), { statePath: join(stateRoot, 'pending-confirmations.json') }), null, 'valid denial clears pending state');
+  const denialReplay = await runtime.handleEvent({ ...event('thread-deny', 'deny-replay', `deny ${denialId}`), sendReply: send });
+  assert.equal(denialReplay.status, 'sent');
+  assert.equal(sent.at(-1), 'I cannot find a pending action for that confirmation.', 'denial replay does not repeat cancellation');
 
   const corruptConversation = conversationIdFor({ id: 'corrupt' }, { sender: { id: '+1' } });
   const corruptDirectory = join(stateRoot, 'imessage', 'conversations', corruptConversation);

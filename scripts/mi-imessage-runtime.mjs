@@ -11,7 +11,7 @@ import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, ru
 import { diverNotesPreflight } from './mi-diver-notes-intent.mjs';
 import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 import { redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
-import { directAdvisorSelections, v2RouteDecision } from './mi-web-chat-v2-route.mjs';
+import { directAdvisorSelections, v2ConfirmationCommand, v2RouteDecision } from './mi-web-chat-v2-route.mjs';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 
 const root = process.env.MI_ROOT || path.join(os.homedir(), 'assistant');
@@ -712,30 +712,30 @@ export class ImessageRuntime {
     const message = record.rawMessage || '';
     const workspace = workspaceFromEnvironment();
     const confirmationOptions = { statePath: path.join(this.stateRoot, 'pending-confirmations.json') };
+    if (v2ConfirmationCommand(message)) {
+      const confirmation = await classifyConfirmationReply({ threadId: record.conversationId, reply: message }, confirmationOptions).catch(() => ({ kind: 'state_error' }));
+      if (confirmation.kind === 'deny') return { reply: IMESSAGE_REPLIES.confirmationCancelled, taskIds: [] };
+      if (confirmation.kind === 'confirm') {
+        const confirmed = confirmation.record;
+        if (!workspace) return { reply: IMESSAGE_REPLIES.workspace, taskIds: [] };
+        return this.runCoordinator({ ...record, rawMessage: confirmed.objective || confirmed.summary }, directory, {
+          objective: confirmed.objective || confirmed.summary,
+          confirmedObjective: confirmed.objective || confirmed.summary,
+          actionClass: confirmed.actionClass || 'confirmed-high-impact',
+          allowWrite: false,
+          advisorSelections: directAdvisorSelections(confirmed.objective || confirmed.summary),
+          workspace,
+        });
+      }
+      return { reply: confirmation.kind === 'state_error' ? IMESSAGE_REPLIES.startFailure : IMESSAGE_REPLIES.confirmationMissing, taskIds: [] };
+    }
     const route = v2RouteDecision({ message, workspace, coordinatorObjectiveMaxChars, confirmationObjectiveMaxChars });
     if (route.kind === 'cancel') {
       await clearPendingConfirmation(record.conversationId, confirmationOptions).catch(() => undefined);
       return { reply: IMESSAGE_REPLIES.confirmationCancelled, taskIds: [] };
     }
     const pending = await readPendingConfirmation(record.conversationId, confirmationOptions).catch(() => null);
-    if (pending) {
-      const confirmation = await classifyConfirmationReply({ threadId: record.conversationId, reply: message }, confirmationOptions).catch(() => ({ kind: 'unclear' }));
-      if (confirmation.kind === 'deny') return { reply: IMESSAGE_REPLIES.confirmationCancelled, taskIds: [] };
-      if (confirmation.kind === 'confirm') {
-        if (!workspace) return { reply: IMESSAGE_REPLIES.workspace, taskIds: [] };
-        return this.runCoordinator({ ...record, rawMessage: pending.objective || pending.summary }, directory, {
-          objective: pending.objective || pending.summary,
-          confirmedObjective: pending.objective || pending.summary,
-          actionClass: pending.actionClass || 'confirmed-high-impact',
-          allowWrite: false,
-          advisorSelections: directAdvisorSelections(pending.objective || pending.summary),
-          workspace,
-        });
-      }
-      if (confirmation.kind === 'not_found' || confirmation.kind === 'unclear') {
-        return { reply: `I still need confirmation for the pending action. Reply confirm ${pending.id} or deny ${pending.id}.`, taskIds: [] };
-      }
-    }
+    if (pending) return { reply: `I still need confirmation for the pending action. Reply confirm ${pending.id} or deny ${pending.id}.`, taskIds: [] };
     if (route.kind === 'confirmation-command') return { reply: IMESSAGE_REPLIES.confirmationMissing, taskIds: [] };
     if (route.kind === 'never-delegate') return { reply: IMESSAGE_REPLIES.prohibited, taskIds: [] };
     if (route.kind === 'confirm-too-long' || route.kind === 'objective-too-long') return { reply: IMESSAGE_REPLIES.objectiveTooLong, taskIds: [] };
