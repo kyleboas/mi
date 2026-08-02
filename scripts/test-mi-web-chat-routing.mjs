@@ -25,6 +25,8 @@ assert.doesNotMatch(coordinatorSource, /--session-dir|--no-session/, 'coordinato
 assert.equal(v2RouteDecision({ message: 'hello', workspace: { root: '/tmp/work', cwd: '/tmp/work' } }).kind, 'coordinator');
 assert.equal(v2RiskClassification('delete all data').kind, 'never-delegate');
 assert.equal(v2RiskClassification('send Kyle a message').kind, 'confirm');
+assert.equal(v2RouteDecision({ message: 'Reply exactly: iMessage check passed.', workspace: { root: '/tmp/work', cwd: '/tmp/work' } }).kind, 'coordinator');
+assert.equal(v2RouteDecision({ message: 'reply to Alice: iMessage check passed.', workspace: { root: '/tmp/work', cwd: '/tmp/work' } }).kind, 'confirm');
 assert.equal(v2RouteDecision({ message: 'cancel', workspace: { root: '/tmp/work', cwd: '/tmp/work' } }).kind, 'cancel');
 
 const root = await mkdtemp(join(tmpdir(), 'mi-web-maintenance-route-'));

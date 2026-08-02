@@ -40,8 +40,9 @@ export function v2RiskClassification(message) {
   if (prohibited) return { kind: 'never-delegate', objective };
   const needsConfirmation = /(?:\bdeploy\b|\bproduction\b|\brelease\b|\bpublish\b|\bannouncement\b|\bmerge\b|\brestart\b|\bsystemctl\b|\bservice\b|\binstall\b|\bemail\b|\bmail\b|\btweet\b|\bpost\b|\bsend\b|\bmessage\b|\b(?:tell|contact|notify|forward)\b|\btransfer\b|\bupload\b|\bshare\b)/i.test(text)
     || (/\b(?:book|reserve|order)\b/i.test(text) && !/\brecommend\s+(?:a\s+)?book\b/i.test(text));
-  const contactsSomeone = /\b(?:text|imessage|dm|whatsapp|ping)\s+(?!of\b|in\b|from\b|file\b|files\b|field\b|box\b|editor\b|content\b|contents\b|body\b|string\b)[a-z'’]+\b/i.test(text);
-  if (needsConfirmation || contactsSomeone) return { kind: 'confirm', objective, actionClass: 'confirmed-high-impact' };
+  const directContactRequest = /^(?:(?:please\s+)?|(?:(?:can|could|would)\s+you\s+(?:please\s+)?))(?:text|imessage|dm|whatsapp|ping)\s+(?!of\b|in\b|from\b|file\b|files\b|field\b|box\b|editor\b|content\b|contents\b|body\b|string\b)[a-z'’]+\b/i.test(text);
+  const externalReplyRequest = /\breply\s+(?:to\s+(?!this\b|that\b|it\b|the\s+(?:message|thread|conversation|reply)\b)(?:[a-z'’]+|@[a-z0-9_.-]+|\+?\d[\d\s().-]*)\b|(?:by|via|over|on|in)\s+(?:email|mail|text|imessage|dm|whatsapp|slack|discord|telegram|x|twitter)\b)/i.test(text);
+  if (needsConfirmation || directContactRequest || externalReplyRequest) return { kind: 'confirm', objective, actionClass: 'confirmed-high-impact' };
   return { kind: 'safe', objective };
 }
 

@@ -9,6 +9,8 @@ import { v2RiskClassification, v2RouteDecision } from './mi-web-chat-v2-route.mj
 assert.equal(v2RouteDecision({ message: 'hello', workspace: { root: '/tmp', cwd: '/tmp' } }).kind, 'coordinator', 'ordinary nonempty text uses the guarded coordinator');
 assert.equal(v2RiskClassification('delete the database').kind, 'never-delegate');
 assert.equal(v2RiskClassification('send Kyle a message').kind, 'confirm');
+assert.equal(v2RouteDecision({ message: 'Reply exactly: iMessage check passed.', workspace: { root: '/tmp', cwd: '/tmp' } }).kind, 'coordinator', 'same-conversation exact replies do not require confirmation');
+assert.equal(v2RouteDecision({ message: 'reply to Alice: iMessage check passed.', workspace: { root: '/tmp', cwd: '/tmp' } }).kind, 'confirm', 'external-recipient replies still require confirmation');
 
 const repoRoot = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const root = await mkdtemp(join(tmpdir(), 'mi-imessage-runtime-test-'));
