@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { notifyImessage, notifyPushover, safeNotificationText } from './notify.js';
@@ -51,10 +51,7 @@ const commandTimeoutMs = Number(process.env.MI_IMESSAGE_MONITOR_COMMAND_TIMEOUT_
 const notifyProbeTimeoutMs = Number(process.env.MI_IMESSAGE_MONITOR_NOTIFY_PROBE_TIMEOUT_MS || 3_000);
 const recentLogMinutes = Number(process.env.MI_IMESSAGE_MONITOR_LOG_MINUTES || 30);
 const bridgeService = process.env.MI_IMESSAGE_BRIDGE_SERVICE || 'mi-photon-bridge.service';
-const repairUserServices = (process.env.MI_IMESSAGE_REPAIR_USER_SERVICES || 'mi-web-chat.service,mi-daemon.service')
-  .split(',')
-  .map((item) => item.trim())
-  .filter(Boolean);
+const deliveryRoot = join(miRoot, 'state', 'imessage', 'conversations');
 const dangerousUrlPattern = /https?:\/\/\S+/gi;
 
 function enabled() {
@@ -143,7 +140,34 @@ export function analyzeThreadMessages(messages: ThreadMessage[], now = new Date(
 }
 
 export function serviceNeedsRestart(anomalies: ImessageAnomaly[]) {
-  return anomalies.some((item) => ['service-inactive', 'photon-log-error', 'notify-endpoint-down', 'imessage-stuck-reply'].includes(item.code));
+  return anomalies.some((item) => ['service-inactive', 'photon-log-error', 'notify-endpoint-down', 'imessage-stuck-reply', 'stale-delivery', 'completed-unsent'].includes(item.code));
+}
+
+export async function analyzeDurableDeliveries(now = new Date(), waitMs = monitorMaxWaitMs()): Promise<ImessageAnomaly[]> {
+  const anomalies: ImessageAnomaly[] = [];
+  let conversations = [];
+  try { conversations = await readdir(deliveryRoot, { withFileTypes: true }); } catch { return anomalies; }
+  for (const conversation of conversations) {
+    if (!conversation.isDirectory()) continue;
+    let files = [];
+    try { files = await readdir(join(deliveryRoot, conversation.name, 'deliveries'), { withFileTypes: true }); } catch { continue; }
+    for (const file of files) {
+      if (!file.isFile() || !/^[a-f0-9]{64}\.json$/.test(file.name)) continue;
+      try {
+        const record = JSON.parse(await readFile(join(deliveryRoot, conversation.name, 'deliveries', file.name), 'utf8'));
+        const timestamp = Date.parse(record.runningAt || record.receivedAt || record.updatedAt || '') || 0;
+        const age = now.getTime() - timestamp;
+        if (['received', 'running'].includes(record.status) && age >= waitMs) {
+          anomalies.push({ code: 'stale-delivery', severity: 'error', detail: `durable delivery ${record.status} has no terminal result after ${Math.round(age / 1000)}s`, service: bridgeService });
+        } else if (record.status === 'completed') {
+          anomalies.push({ code: 'completed-unsent', severity: 'error', detail: 'durable delivery has a completed reply that Photon did not confirm as sent', service: bridgeService });
+        }
+      } catch {
+        anomalies.push({ code: 'delivery-state-corrupt', severity: 'error', detail: 'durable delivery state could not be read', service: bridgeService });
+      }
+    }
+  }
+  return anomalies.slice(-20);
 }
 
 async function probeNotifyEndpoint(fetchImpl: typeof fetch, signal?: AbortSignal): Promise<ImessageAnomaly[]> {
@@ -178,6 +202,7 @@ async function inspect(deps: Required<Pick<MonitorDeps, 'runCommand' | 'fetch' |
 
   const messages = await deps.readMessages('main', 80).catch(() => [] as ThreadMessage[]);
   anomalies.push(...analyzeThreadMessages(messages, now, monitorMaxWaitMs()));
+  anomalies.push(...await analyzeDurableDeliveries(now, monitorMaxWaitMs()));
   return anomalies;
 }
 
@@ -194,7 +219,6 @@ async function repair(anomalies: ImessageAnomaly[], deps: Required<Pick<MonitorD
   const repairs: ImessageMonitorResult['repairs'] = [];
   if (!serviceNeedsRestart(anomalies)) return repairs;
   repairs.push(await restartService(deps, bridgeService, false));
-  for (const service of repairUserServices) repairs.push(await restartService(deps, service, true));
   return repairs;
 }
 

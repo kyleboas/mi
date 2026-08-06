@@ -231,7 +231,7 @@ try {
       ...process.env,
       MI_AGENT_RENDER_TEST: '1',
       MI_AGENT_RENDER_TEST_TASKS: fullTasksPath,
-      MI_AGENT_RENDER_TEST_EVENTS: 'ctrlL,pageDown,pageUp,text:reply text',
+      MI_AGENT_RENDER_TEST_EVENTS: 'ctrlL,up,down,text:reply text',
       MI_AGENT_RENDER_TEST_ROWS: '16',
       MI_AGENT_RENDER_TEST_COLS: '80',
     },
@@ -250,11 +250,11 @@ try {
   const firstOutputLine = fullLines.findIndex((line) => line.includes('next task output'));
   assert.ok(firstOutputLine > lastInputLine + 1 && fullLines.slice(lastInputLine + 1, firstOutputLine).some((line) => line.trim() === ''), 'blank line separates last input from full output viewport');
   assert.ok(visible(fullFrame).at(-1)?.trim(), 'model/footer remains last so the visible screen lands at bottom');
-  assert.equal(fullSnapshot.frames[2].selectedTask, 'render-full-output-next', 'PageDown at the end keeps the selected task in full output mode');
-  assert.ok(visible(fullSnapshot.frames[2]).join('\n').includes('next task output'), 'PageDown keeps the selected task output visible');
-  assert.equal(fullSnapshot.frames[3].selectedTask, 'render-full-output', 'PageUp switches to the previous task output');
+  assert.equal(fullSnapshot.frames[2].selectedTask, 'render-full-output-next', 'Up at the top keeps the selected task in full output mode');
+  assert.ok(visible(fullSnapshot.frames[2]).join('\n').includes('next task output'), 'the selected task output stays visible');
+  assert.equal(fullSnapshot.frames[3].selectedTask, 'render-full-output', 'Down switches to the next task output');
   const previousFullOutput = visible(fullSnapshot.frames[3]).join('\n');
-  assert.ok(previousFullOutput.includes('full output line 30'), 'PageUp shows the previous task full output');
+  assert.ok(previousFullOutput.includes('full output line 30'), 'switching task shows that task full output');
   assert.ok(visible(fullSnapshot.frames[3]).filter((line) => line.includes('full output line')).every((line) => !line.startsWith(' ')), 'final output lines have no leading indentation');
   const withInput = visible(fullSnapshot.frames[4]).join('\n');
   assert.ok(withInput.includes('reply text'), 'input remains visible and usable in full output mode');

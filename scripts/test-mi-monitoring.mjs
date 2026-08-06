@@ -7,10 +7,10 @@ import { normalizeHealthSidecar, writeHealthSidecar } from '../dist/src/monitori
 const docs = await readFile(new URL('../docs/monitoring.md', import.meta.url), 'utf8');
 const registry = await readFile(new URL('../assistants/monitors.md', import.meta.url), 'utf8');
 
-assert.match(docs, /Health sidecar contract[\s\S]*checked_at[\s\S]*status[\s\S]*reason/, 'monitoring docs define the health sidecar schema');
-assert.match(docs, /writeHealthSidecar\(\)[\s\S]*src\/monitoring\.ts/, 'monitoring docs describe the writer helper');
-assert.match(docs, /observe and persist state[\s\S]*worker-read[\s\S]*muted_pending_human/, 'monitoring docs describe the escalation ladder');
-assert.match(registry, /allowed_auto_actions/, 'monitor registry documents allowed auto-actions');
+assert.match(docs, /old configured health-monitor registry is retired/, 'monitoring docs retire the old health-monitor registry');
+assert.match(docs, /does not read `assistants\/monitors\.md`, health sidecars, or `state\/monitor-health\.json`/, 'monitoring docs say the tick ignores retired monitor inputs');
+assert.match(registry, /# Retired monitor registry/, 'retired monitor registry has a clear heading');
+assert.match(registry, /Mi no longer reads a configured monitor registry/, 'retired monitor registry cannot suggest active automatic actions');
 
 const normalized = normalizeHealthSidecar({ step: 'detect', status: 'ok', counts: { candidates: 2 } }, new Date('2026-07-02T00:00:00.000Z'));
 assert.deepEqual(normalized, {

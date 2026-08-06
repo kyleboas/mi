@@ -3,8 +3,9 @@
 set -eu
 
 health_command=${1:?health command is required}
+health_user=${2:?health-command user is required}
 for attempt in $(seq 1 30); do
-  if runuser -u kyle -- "$health_command" >/dev/null 2>&1; then
+  if runuser -u "$health_user" -- "$health_command" >/dev/null 2>&1; then
     exit 0
   fi
   sleep 1

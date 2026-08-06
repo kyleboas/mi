@@ -1,126 +1,91 @@
 # Mi
 
-Mi is a tiny local assistant harness for running small AI workers from plain files.
+Mi is a small local assistant harness. Assistants are Markdown instructions plus triggers, tools, permissions, and workers.
 
-Product definition:
+## Main parts
 
-```text
-assistant = instructions + trigger + tools + permissions
-```
+1. **Assistant Builder** creates or edits reviewable files under `assistants/`.
+2. **Assistant Runner** reads an assistant file and runs it when asked.
+3. **Mi chat** keeps the main local conversation.
+4. **Mi agents** shows background Pi work and known Pi sessions.
+5. **Mi tick** runs explicit reminders, memory upkeep, capability-file cleanup, and iMessage repair checks.
 
-Mi is not a DevOps platform or generic repair bot. Its proactive mode is delegation-based:
+Runtime assistants do not silently rewrite their own rules.
 
-- pi starts when you ask or when a standing delegation permits a bounded worker.
-- Mi can check local signals and tell you what it noticed.
-- Mi may act first only for reversible, scoped actions listed in `assistants/delegations.md`; everything else stays ask-first.
+## Safety
 
-## Product layers
+- Read access is the default for scoped workers.
+- A write worker is limited to its approved workspace.
+- Deploying, publishing, merging, deleting data, changing secrets, spending money, and sending outside messages need a clear approval path.
+- The iMessage runtime loads only the reviewed Mi capability guard, adapter, and Divernote extension. It disables normal extension, skill, theme, prompt-template, and context-file discovery.
+- Divernote access needs both Photon verification and a named `PHOTON_ALLOWED_USERS` sender. It is denied for every other sender, and remains constrained by the per-turn capability grant and audit log.
+- Direct advisor work loads only the reviewed advisor skill and gives it read access.
+- Mi has no public control webhook by default.
 
-Mi is split into two layers:
+## Commands
 
-1. **Assistant Builder** — creates, edits, and explains `assistants/*.md` files from user requests.
-2. **Assistant Runner** — reads those files and executes short-lived runs when a trigger fires.
-
-Builder changes are reviewable file changes. Runtime assistants should suggest instruction changes, not silently rewrite themselves.
-
-## Safety model
-
-- Assistants are read-only by default.
-- The three runtime modes are read-only, delegated, and approval-required.
-- Delegated actions must match `assistants/delegations.md`, stay within budget, verify their outcome, and report after acting.
-- Risky tools or permissions outside delegation require approvals.
-- Runtime assistants cannot silently rewrite their own `assistants/*.md` files.
-- Builder edits are reviewable file changes.
-- `pi.repair` is code-changing and must stay behind a delegation or approval gate.
-
-## Core primitives
-
-Mi core intentionally exposes only five primitives:
-
-1. **Assistant** — a Markdown file that defines purpose, triggers, tools, permissions, and rules.
-2. **Trigger** — something that starts an assistant run: timer, webhook, manual command, or service event.
-3. **Tool** — a boring function exposed to assistants, such as reading status or opening a PR.
-4. **Worker** — a short-lived AI process that does one job. pi is the coding/execution worker backend: Mi decides when and why work starts; pi handles repo inspection, repair, branches, tests, and PR preparation.
-5. **Run** — a durable record of what happened: timestamp, trigger, assistant, tool calls, worker results, approvals, status, and final report.
-
-Service-specific behavior belongs in installable tool packages, not the core.
-
-## Assistant files
-
-Assistants live in `assistants/*.md` and use Markdown with frontmatter. See `assistant-format.md` for the full v0 format:
-
-```md
----
-name: production
-triggers:
-  - every: 10m
-tools:
-  - github
-  - railway
-  - cloudflare
-  - pi
-permissions:
-  github:
-    actions: read
-    contents: write
-    pull_requests: write
-  production:
-    deploy: false
-    mutate_dns: false
-    edit_secrets: false
-    merge_code: false
----
-# Production Assistant
-Watch production health.
-When something breaks, collect the smallest useful context, start one worker if appropriate, and report back.
-Never merge, deploy, edit secrets, or change DNS.
-```
-
-## User-facing commands
-
-Keep the public Mi surface small:
+The main commands are:
 
 ```bash
-mi          # open Mi chat
-mi agents   # open the live background-agent view
-mi check    # check local Mi state and report observations
+mi                 # open Mi
+mi agents          # open the background-agent view
+mi tick            # run scheduled Mi upkeep once
+mi approvals       # list pending approvals
+mi task list        # list background tasks
 ```
 
-From this repo before install, use `npm run mi --`, `npm run mi -- agents`, and `npm run mi -- check`.
+`mi check <assistant>` validates one assistant Markdown file. It is not a proactive check-in command.
 
-Other lower-level/debug commands may exist in the CLI, but docs and user flows should point to `mi` for chat and `mi agents` for background work.
+Explicit reminder examples:
 
-## mi agents live view
+```bash
+mi cron add daily-note --every 1d --message "Review today's note"
+mi cron add one-time --at 2030-01-02T15:00:00Z --message "Appointment"
+mi cron list
+mi cron check
+mi cron remove daily-note
+```
 
-`mi agents` is the live terminal view for background workers and discovered pi sessions. It uses pi-tui's differential renderer in the alternate screen so stale scrollback rows cannot look like duplicate tasks, resets stale mouse tracking so tmux wheel behavior recovers after exit, dedupes rows by task/session identity, parses pi session UUIDs from session filenames, and persists visible tasks until the user clears them.
+Prompt crons can use `--prompt` and `--thread`. Command crons are still parsed for old data but are deprecated.
 
-Key behavior:
+The removed proactive check-in, monitor registry runner, daily brief, and automatic project-question and project-summary loops are not part of `mi tick`.
 
-- Normal typed text replies to the selected task. New tasks are explicit via `/new <prompt>`.
-- `/goal ...` is treated as task prompt text, not as a local mi agents slash command.
-- `/resume` opens a picker for recent/default pi sessions; selected sessions are persisted into the Mi task list.
-- `/model` opens a pi-style model picker for new tasks and replies; Shift+Tab cycles thinking level.
-- `^F` opens full-output mode for the selected task. Arrow keys and PageUp/PageDown scroll the output; `^F` exits it.
-- `^M` toggles multi-select clear mode. Enter/Space toggles a row; Esc clears selected rows.
-- `/mi <question>` asks Mi main about the selected task context and stays in that side-chat until Ctrl-C.
+## Mi agents
 
-Daemon behavior:
+`mi agents` shows `needs input`, `working`, and `completed` sections. Important commands are:
 
-- Discovered/open pi sessions are merged with stored tasks and remain visible until cleared.
-- Stale busy session state does not overwrite a terminal stored task result when no live Mi worker exists.
-- Dismissed task/session keys are persisted.
-- Known noisy project-specific pi sessions can be excluded through code/configuration when needed.
+- `/new <prompt>` starts a task.
+- Normal text replies to the selected task.
+- `/resume` adds a known Pi session to the view.
+- `/open` opens the selected session in Pi.
+- `/model` chooses a model for new work.
+- `^F` shows full output. Arrow keys switch tasks, while PageUp/PageDown scroll a cached terminal-sized output view so replies stay responsive for large sessions.
+- `^M` selects tasks to clear.
+- `/mi <question>` asks Mi about the selected task without steering it.
 
-Visual ordering contract:
+Mi reads Pi sessions from `~/.pi/agent/sessions`. It stores its daemon runtime under `~/.pi/agent/mi` and its task view under `~/mi/state` by default.
 
-- Sections always render in this order: `needs input`, `working`, `completed`.
-- Rows inside each section render newest to oldest.
-- Needs-input recency uses the needs-input transition time; working recency uses continue/update/activity/start time; completed recency uses finish time.
-- Selection follows the same logical task across refresh/reorder when that task still exists.
-- Tasks should not disappear unless the user clears/dismisses them or they are hidden by the completed-section cap.
-- The completed section shows the newest three rows unless the current selection is inside completed, in which case the completed section expands.
-- Default visual/e2e tests use fake daemon/pi state only; real pi or LLM smoke tests must be opt-in.
+## Tick and notifications
 
-## Public-control safety
+`mi tick` runs due reminder crons, removes expired capability grants, runs memory consolidation when due, and calls the iMessage repair monitor. Its lock is `state/tick.lock` under `MI_ROOT`.
 
-Mi does not expose a public webhook/control UI by default. Persistent Flue orchestration binds to loopback. Notification integrations are outbound-only and must not carry secrets, public control links, or dangerous action links.
+The stack timer runs every minute. The iMessage monitor has its own interval and defaults to 15 minutes. The monitor may restart only the Photon bridge. The system bridge restart needs the narrow sudoers rule from `scripts/install-mi-imessage-repair-sudoers-root.sh`.
+
+The Photon bridge offers a loopback-only notification endpoint. Tick can use it when `MI_PROACTIVE_IMESSAGE_NOTIFY=true`. Pushover remains opt-in.
+
+## Local state
+
+Default locations are split by purpose:
+
+- `~/assistant/state` or `$MI_ROOT/state`: threads, events, approvals, memory, tick lock, web data, and iMessage monitor records.
+- `~/mi/state`: reminder crons, cron logs, task rows, and dismissed task rows.
+- `~/.pi/agent/mi`: daemon socket, daemon log, short-lived capability grants, and coordinator policy files.
+- `$MI_ROOT/state/imessage/conversations`: private per-conversation Pi sessions and delivery records.
+- `~/.pi/agent/sessions`: general Pi sessions.
+- `~/mi/memory.md` and `~/mi/preferences.md`: the small user-facing memory and preference files used by chat.
+
+These paths contain private data. Do not copy them when making a clean second instance.
+
+## Installation
+
+The complete stack installer adds the production gateway registry, brokered gateway helper, Mi daemon, tick timer, Photon bridge, and generated home entrypoints. It does not install Web chat in the normal stack. Install Web chat separately with `MI_WEB_MAINTENANCE=1` for explicit maintenance. See [the stack guide](mi-stack.md). For a clean second VPS and a different phone number, use [the second VPS guide](second-vps-setup.md).

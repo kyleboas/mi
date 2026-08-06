@@ -28,8 +28,6 @@ try {
     MI_WEB_MAX_UPLOAD_BYTES: '8',
     MI_WEB_UPLOAD_DIR: join(fixture.miRoot, 'state', 'web-uploads'),
     MI_WEB_WORKER_THRESHOLD_SECONDS: '1',
-    MI_IMESSAGE_ASK_FIRST: '0',
-    MI_IMESSAGE_V2: '0', // This fixture asserts the retained legacy regex route.
   });
   const base = web.baseUrl;
 
@@ -47,12 +45,12 @@ try {
 
   let json = (await httpJson(base, '/api/health')).json;
   assert.equal(json.ok, true);
-  assert.equal(json.thread, 'main');
+  assert.equal(json.maintenance, true);
 
   json = (await httpJson(base, '/api/threads')).json;
   assert.ok(json.threads.some((thread) => thread.id === 'main'));
 
-  json = (await httpJson(base, '/api/messages?thread=main')).json;
+  json = (await httpJson(base, '/api/thread-state?thread=main')).json;
   assert.deepEqual(json.jobs, []);
 
   let unauthorized = await httpJson(base, '/api/notify', { method: 'POST', body: { text: 'secretless note' } });
@@ -81,31 +79,15 @@ try {
   assert.match(badPhotoSend.json.error, /invalid photo path/);
 
   json = (await httpJson(base, '/api/send', { method: 'POST', body: { message: 'hi' } })).json;
-  assert.equal(json.queued, true);
+  assert.equal(json.queued, true, JSON.stringify(json));
   await waitFor(async () => {
-    const messages = (await httpJson(base, '/api/messages?thread=main')).json.messages;
+    const messages = (await httpJson(base, '/api/thread-state?thread=main')).json.messages
     return messages.some((message) => message.role === 'assistant' && message.text === 'Hello.');
   }, { message: 'web chat direct reply' });
 
   json = (await httpJson(base, '/api/send', { method: 'POST', body: { message: 'fix the broken tests in this repo and report back with details' } })).json;
   assert.equal(json.queued, true);
   await waitFor(() => daemon.requests.some((request) => request.type === 'run_worker' && /fix the broken tests/.test(request.lastInput || request.message || '')), { message: 'web chat worker handoff' });
-
-  json = (await httpJson(base, '/api/imessage', { method: 'POST', body: { message: 'hi from imessage' } })).json;
-  assert.equal(json.ok, true);
-  assert.equal(json.handoff, false);
-  assert.match(json.reply, /Hi|Hello|Hey|I'm here/i);
-
-  const daemonRequestsBeforeAskFirst = daemon.requests.length;
-  json = (await httpJson(base, '/api/imessage', { method: 'POST', body: { message: 'can you check cron status?' } })).json;
-  assert.equal(json.ok, true);
-  assert.equal(json.handoff, false);
-  assert.equal(daemon.requests.length, daemonRequestsBeforeAskFirst, 'iMessage ask-shaped request should not hand off to a worker');
-
-  json = (await httpJson(base, '/api/imessage', { method: 'POST', body: { message: 'check detect status' } })).json;
-  assert.equal(json.ok, true);
-  assert.equal(json.handoff, true);
-  await waitFor(() => daemon.requests.some((request) => request.type === 'run_worker' && /check detect status/.test(request.lastInput || request.message || '')), { message: 'iMessage worker handoff' });
 
   json = (await httpJson(base, '/api/push/public-key')).json;
   assert.equal(json.publicKey, keys.publicKey);

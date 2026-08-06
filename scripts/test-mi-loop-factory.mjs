@@ -7,7 +7,6 @@ import { join } from 'node:path';
 
 const source = await readFile(new URL('../src/loop-factory.ts', import.meta.url), 'utf8');
 const cli = await readFile(new URL('../src/cli.ts', import.meta.url), 'utf8');
-const tick = await readFile(new URL('../src/tick.ts', import.meta.url), 'utf8');
 const webChat = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
 const loopDiscovery = await readFile(new URL('../src/loop-discovery.ts', import.meta.url), 'utf8');
 
@@ -21,8 +20,7 @@ assert.match(source, /Reply: queue now, later, or never/, 'Loop Factory sends th
 assert.match(source, /\^\[rR\]\$[\s\S]*accept the recommended answer/, 'Loop Factory maps r/R to accepting the recommended answer');
 assert.match(source, /Never quote private transcripts|Privacy: never quote private transcripts/, 'Loop Factory prompts preserve transcript privacy');
 assert.match(cli, /mi loop-factory capture <text>/, 'CLI documents loop capture');
-assert.match(cli, /if \(command === 'loop-factory'\) return loopFactoryCommand\(args\);/, 'CLI exposes mi loop-factory');
-assert.match(tick, /runLoopFactoryTick\(\)/, 'mi tick runs Loop Factory');
+assert.match(cli, /if \(command === 'loop-factory'\) return loopFactoryCommand\(args\);/, 'CLI exposes manual Loop Factory actions used by chat transports');
 assert.match(webChat, /handleLoopDiscoverySelectionFromImessage[\s\S]*handleLoopFactoryReplyFromImessage[\s\S]*handleLoopFactoryCaptureFromImessage/, 'iMessage routes loop discovery before active Loop Factory reply before capture');
 assert.match(webChat, /url\.pathname === '\/api\/send'[\s\S]*messageLooksLikeLoopFactoryCapture\(message\)[\s\S]*runLoopFactoryCli\(\['capture', message\]\)/, 'web chat captures Loop Factory phrases before normal worker queueing');
 assert.match(loopDiscovery, /recordMinedLoopSelection/, 'Loop discovery records selected mined candidates into Loop Factory state');

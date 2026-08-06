@@ -7,7 +7,8 @@ Use targeted tests while developing and `npm test` for full certification. Tests
 - `scripts/test-mi-agent-view.mjs`: core CLI/agents view behavior.
 - `scripts/test-mi-agent-extension-parity.mjs`: command inventory/classification and native dispatch paths for worker-forward, background-task, headless-exec, blocked, and unknown slash commands.
 - `scripts/test-mi-agent-render-snapshot.mjs`: render snapshots and scripted TUI interactions.
-- `scripts/test-mi-agent-perf.mjs`: hermetic render wall-clock budgets compared with `scripts/perf-baseline.json`.
+- `scripts/test-mi-agent-perf.mjs`: hermetic render CPU medians compared with `scripts/perf-baseline.json`, plus firm wall-clock smoke ceilings for hangs and unavailable runtime.
+- `scripts/test-mi-agent-perf-method.mjs`: checks that scheduler wait does not look like slower Mi code, while a CPU regression and a wall-clock smoke failure still fail.
 - `scripts/test-mi-agent-dedupe.mjs`: task de-duplication and optimistic task reconciliation.
 - `scripts/test-mi-daemon-singleton.mjs`: daemon singleton/lock behavior.
 - `scripts/test-mi-daemon-pi-session-e2e.mjs`: Pi session discovery/resume daemon behavior.

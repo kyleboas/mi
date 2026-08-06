@@ -7,7 +7,6 @@ import { join } from 'node:path';
 
 const source = await readFile(new URL('../src/loop-discovery.ts', import.meta.url), 'utf8');
 const cli = await readFile(new URL('../src/cli.ts', import.meta.url), 'utf8');
-const tick = await readFile(new URL('../src/tick.ts', import.meta.url), 'utf8');
 const webChat = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
 const daemon = await readFile(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
 
@@ -20,8 +19,7 @@ assert.match(source, /formatLoopDiscoveryBrief[\s\S]*Reply with a number or name
 assert.match(source, /appendNotes[\s\S]*loop-discovery:start[\s\S]*Aggregate-only notes/, 'NOTES updates are managed and aggregate-only');
 assert.match(source, /capabilityProfile: 'worker-write-scoped'/, 'selection starts scoped writable grilling workers');
 assert.match(cli, /mi loop-discovery \[--force\] \[--dry-run\] \[--notify\] \[--select <value>\]/, 'CLI documents mi loop-discovery');
-assert.match(cli, /if \(command === 'loop-discovery'\) return loopDiscoveryCommand\(args\);/, 'CLI exposes mi loop-discovery');
-assert.match(tick, /loopDiscoveryDue\(\)[\s\S]*runLoopDiscovery\(\{ mode: 'scheduled', notify: true \}\)/, 'mi tick runs scheduled loop discovery through the isolated module');
+assert.match(cli, /if \(command === 'loop-discovery'\) return loopDiscoveryCommand\(args\);/, 'CLI exposes manual loop discovery used by chat transports');
 assert.match(webChat, /handleLoopDiscoverySelectionFromImessage[\s\S]*--select[\s\S]*loop-discovery-selection/, 'iMessage replies can select a loop-discovery candidate');
 assert.match(webChat, /messageLooksLikeLoopDiscoveryRun[\s\S]*runLoopDiscoveryCli\(\['--force'\]\)/, 'iMessage can manually run loop discovery');
 assert.match(daemon, /worker-write-scoped is only allowed under ~\/workflows/, 'daemon refuses write-scoped workers outside workflows');

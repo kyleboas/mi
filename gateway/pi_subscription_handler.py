@@ -19,7 +19,32 @@ from litellm.types.utils import GenericStreamingChunk, ModelResponse
 
 LOGGER = logging.getLogger("litellm.proxy.pi_subscription")
 
-PI_BINARY = "/home/kyle/.nvm/versions/node/v24.15.0/bin/pi"
+def _required_path(name: str, *, executable: bool = False, directory: bool = False) -> str:
+    """Read one installer-controlled absolute path and reject unsafe values."""
+    value = os.environ.get(name, "")
+    if (
+        not value
+        or "\n" in value
+        or "\r" in value
+        or "<" in value
+        or ">" in value
+        or not os.path.isabs(value)
+        or os.path.normpath(value) != value
+        or os.path.islink(value)
+    ):
+        raise RuntimeError(f"{name} is not a safe absolute path")
+    if directory and not os.path.isdir(value):
+        raise RuntimeError(f"{name} is not a directory")
+    if executable and (not os.path.isfile(value) or not os.access(value, os.X_OK)):
+        raise RuntimeError(f"{name} is not an executable file")
+    return value
+
+
+PI_BINARY = _required_path("MI_GATEWAY_PI_BINARY", executable=True)
+PI_COMMAND_DIR = _required_path("MI_GATEWAY_PI_COMMAND_DIR", directory=True)
+PI_HOME = _required_path("MI_GATEWAY_SERVICE_HOME", directory=True)
+PI_AGENT_DIR = _required_path("MI_GATEWAY_PI_AGENT_DIR", directory=True)
+PI_WORKDIR = _required_path("MI_GATEWAY_WORK_DIR", directory=True)
 PI_MODEL = "openai-codex/gpt-5.6-sol"
 # These durable public aliases are the only profiles in the production handler.
 # `coding-main` deliberately retains its historical implicit high effort behavior.
@@ -27,9 +52,6 @@ SUBSCRIPTION_PROFILES = {
     "coding-main": (PI_MODEL, None),
     "mi-concierge": (PI_MODEL, "medium"),
 }
-PI_HOME = "/home/kyle"
-PI_AGENT_DIR = "/home/kyle/.pi/agent"
-PI_WORKDIR = "/var/lib/llm-gateway"
 
 MAX_MESSAGES = 32
 MAX_INPUT_CHARS = 24_000
@@ -43,7 +65,7 @@ DEFAULT_CONCURRENCY = 2
 PI_ENV = {
     "HOME": PI_HOME,
     "LC_ALL": "C.UTF-8",
-    "PATH": "/home/kyle/.nvm/versions/node/v24.15.0/bin:/usr/bin:/bin",
+    "PATH": f"{PI_COMMAND_DIR}:/usr/bin:/bin",
     "PI_CODING_AGENT_DIR": PI_AGENT_DIR,
     "PI_OFFLINE": "1",
     "TERM": "dumb",

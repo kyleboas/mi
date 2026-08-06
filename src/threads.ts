@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -39,6 +39,38 @@ const miRoot = process.env.MI_ROOT || path.join(homedir(), 'assistant');
 const threadsDir = path.join(miRoot, 'state', 'threads');
 const indexPath = path.join(threadsDir, 'index.json');
 const defaultRecentLimit = 60;
+const indexLockPath = path.join(threadsDir, '.index.lock');
+let indexMutationQueue = Promise.resolve();
+function processAlive(pid: number) { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch { return false; } }
+async function acquireIndexLock() {
+  await mkdir(threadsDir, { recursive: true });
+  const deadline = Date.now() + Number(process.env.MI_THREAD_INDEX_LOCK_TIMEOUT_MS || 5000);
+  while (Date.now() < deadline) {
+    try { const handle = await open(indexLockPath, 'wx', 0o600); await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })); return handle; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const [raw, info] = await Promise.all([readFile(indexLockPath, 'utf8').catch(() => ''), stat(indexLockPath).catch(() => undefined)]);
+      let pid = 0, startedAt = 0; try { const parsed = JSON.parse(raw); pid = Number(parsed.pid || 0); startedAt = Date.parse(parsed.startedAt || ''); } catch {}
+      const age = Date.now() - (startedAt || info?.mtimeMs || Date.now());
+      if ((pid > 0 && !processAlive(pid)) || (pid <= 0 && age > Number(process.env.MI_THREAD_INDEX_LOCK_STALE_MS || 30_000))) {
+        const stale = `${indexLockPath}.stale.${process.pid}.${Date.now()}`;
+        try { await rename(indexLockPath, stale); await rm(stale, { force: true }); } catch {}
+        continue;
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    }
+  }
+  throw new Error(`timed out waiting for thread index lock: ${indexLockPath}`);
+}
+function withIndexMutation<T>(fn: () => Promise<T>): Promise<T> {
+  const execute = async () => {
+    const handle = await acquireIndexLock();
+    try { return await fn(); } finally { await handle.close().catch(() => undefined); await rm(indexLockPath, { force: true }).catch(() => undefined); }
+  };
+  const run = indexMutationQueue.then(execute, execute);
+  indexMutationQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
 
 function now() {
   return new Date().toISOString();
@@ -72,12 +104,14 @@ function archivePath(threadId: string) {
 
 export async function ensureThreads() {
   await mkdir(threadsDir, { recursive: true });
-  const threads = await readThreadIndex();
-  if (!threads.some((thread) => thread.id === 'main')) {
-    const ts = now();
-    threads.unshift({ id: 'main', title: 'main', kind: 'main', createdAt: ts, updatedAt: ts, unread: 0 });
-    await writeThreadIndex(threads);
-  }
+  await withIndexMutation(async () => {
+    const threads = await readThreadIndex();
+    if (!threads.some((thread) => thread.id === 'main')) {
+      const ts = now();
+      threads.unshift({ id: 'main', title: 'main', kind: 'main', createdAt: ts, updatedAt: ts, unread: 0 });
+      await writeThreadIndex(threads);
+    }
+  });
 }
 
 export async function readThreadIndex(): Promise<ThreadRecord[]> {
@@ -91,7 +125,9 @@ export async function readThreadIndex(): Promise<ThreadRecord[]> {
 
 async function writeThreadIndex(threads: ThreadRecord[]) {
   await mkdir(threadsDir, { recursive: true });
-  await writeFile(indexPath, JSON.stringify(threads, null, 2));
+  const temporary = `${indexPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  await writeFile(temporary, JSON.stringify(threads, null, 2), { mode: 0o600 });
+  await rename(temporary, indexPath);
 }
 
 export async function listThreads() {
@@ -106,16 +142,19 @@ export async function getThread(threadId = 'main') {
 
 export async function createTempThread(title: string) {
   await ensureThreads();
-  const threads = await readThreadIndex();
-  let base = `temp-${safeThreadId(title)}`;
-  let candidate = base;
-  let suffix = 2;
-  while (threads.some((thread) => thread.id === candidate)) candidate = `${base}-${suffix++}`;
-  const ts = now();
-  const record: ThreadRecord = { id: candidate, title, kind: 'temporary', createdAt: ts, updatedAt: ts, unread: 0 };
-  threads.push(record);
-  await writeThreadIndex(threads);
-  await appendThreadMessage(candidate, 'system', `Temporary conversation created: ${title}`, { unread: false, source: 'mi' });
+  const record = await withIndexMutation(async () => {
+    const threads = await readThreadIndex();
+    const base = `temp-${safeThreadId(title)}`;
+    let candidate = base;
+    let suffix = 2;
+    while (threads.some((thread) => thread.id === candidate)) candidate = `${base}-${suffix++}`;
+    const ts = now();
+    const created: ThreadRecord = { id: candidate, title, kind: 'temporary', createdAt: ts, updatedAt: ts, unread: 0 };
+    threads.push(created);
+    await writeThreadIndex(threads);
+    return created;
+  });
+  await appendThreadMessage(record.id, 'system', `Temporary conversation created: ${title}`, { unread: false, source: 'mi' });
   return record;
 }
 
@@ -126,27 +165,28 @@ export async function appendThreadMessage(
   options: { unread?: boolean; source?: string; taskId?: string; replyToId?: string } = {},
 ) {
   await ensureThreads();
-  const threads = await readThreadIndex();
-  const record = threads.find((thread) => thread.id === threadId);
-  if (!record) throw new Error(`thread not found: ${threadId}`);
+  return withIndexMutation(async () => {
+    const threads = await readThreadIndex();
+    const record = threads.find((thread) => thread.id === threadId);
+    if (!record) throw new Error(`thread not found: ${threadId}`);
 
-  const message: ThreadMessage = {
-    id: id(),
-    threadId,
-    role,
-    text,
-    ts: now(),
-    unread: options.unread ?? role === 'assistant',
-    source: options.source,
-    taskId: options.taskId,
-    replyToId: options.replyToId,
-  };
-  await appendFile(threadPath(threadId), `${JSON.stringify(message)}\n`);
-
-  record.updatedAt = message.ts;
-  if (message.unread && role === 'assistant') record.unread += 1;
-  await writeThreadIndex(threads);
-  return message;
+    const message: ThreadMessage = {
+      id: id(),
+      threadId,
+      role,
+      text,
+      ts: now(),
+      unread: options.unread ?? role === 'assistant',
+      source: options.source,
+      taskId: options.taskId,
+      replyToId: options.replyToId,
+    };
+    await appendFile(threadPath(threadId), `${JSON.stringify(message)}\n`);
+    record.updatedAt = message.ts;
+    if (message.unread && role === 'assistant') record.unread += 1;
+    await writeThreadIndex(threads);
+    return message;
+  });
 }
 
 export async function readThreadMessages(threadId = 'main', limit?: number) {
@@ -165,17 +205,19 @@ export async function readThreadMessages(threadId = 'main', limit?: number) {
 
 export async function markThreadRead(threadId = 'main') {
   await ensureThreads();
-  const threads = await readThreadIndex();
-  const record = threads.find((thread) => thread.id === threadId);
-  if (record) {
-    record.unread = 0;
-    await writeThreadIndex(threads);
-  }
-
-  const messages = await readThreadMessages(threadId);
-  if (messages.length === 0) return;
-  const updated = messages.map((message) => ({ ...message, unread: false }));
-  await writeFile(threadPath(threadId), updated.map((message) => JSON.stringify(message)).join('\n') + '\n');
+  await withIndexMutation(async () => {
+    const threads = await readThreadIndex();
+    const record = threads.find((thread) => thread.id === threadId);
+    if (record) {
+      record.unread = 0;
+      await writeThreadIndex(threads);
+    }
+    let messages: ThreadMessage[] = [];
+    try { messages = (await readFile(threadPath(threadId), 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as ThreadMessage); } catch {}
+    if (messages.length === 0) return;
+    const updated = messages.map((message) => ({ ...message, unread: false }));
+    await writeFile(threadPath(threadId), updated.map((message) => JSON.stringify(message)).join('\n') + '\n');
+  });
 }
 
 export async function threadContext(threadId = 'main', recentLimit = defaultRecentLimit) {
@@ -230,10 +272,12 @@ export async function compactThread(threadId = 'main', keep = Number(process.env
 export async function archiveThread(threadId: string) {
   if (threadId === 'main') throw new Error('main thread cannot be archived');
   await ensureThreads();
-  const threads = await readThreadIndex();
-  const record = threads.find((thread) => thread.id === threadId);
-  if (!record) throw new Error(`thread not found: ${threadId}`);
-  record.archived = true;
-  record.updatedAt = now();
-  await writeThreadIndex(threads);
+  await withIndexMutation(async () => {
+    const threads = await readThreadIndex();
+    const record = threads.find((thread) => thread.id === threadId);
+    if (!record) throw new Error(`thread not found: ${threadId}`);
+    record.archived = true;
+    record.updatedAt = now();
+    await writeThreadIndex(threads);
+  });
 }

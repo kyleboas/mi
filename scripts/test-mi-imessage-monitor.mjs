@@ -73,8 +73,7 @@ try {
       },
     });
     assert.equal(repaired.status, 'repaired', 'repairable anomalies are restarted and verified');
-    assert.ok(repairs.includes('mi-photon-bridge.service'), 'bridge service is restarted');
-    assert.ok(repairs.includes('mi-web-chat.service'), 'Mi web user service is restarted as part of safe repair');
+    assert.deepEqual(repairs, ['mi-photon-bridge.service'], 'only the Photon bridge service is restarted by default');
     assert.equal(successNotify, 1, 'successful repair sends exactly one iMessage confirmation');
 
     let appended = '';
@@ -97,6 +96,22 @@ try {
     assert.equal(unrepaired.status, 'unrepaired', 'unfixed failures are reported as unrepaired');
     assert.match(appended, /could not repair/i, 'unrepaired failures are written to Mi main');
     assert.equal(pushover, 1, 'unrepaired failures send Pushover fallback');
+
+    const durableRoot = process.env.MI_ROOT + '/state/imessage/conversations/imessage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/deliveries';
+    await (await import('node:fs/promises')).mkdir(durableRoot, { recursive: true });
+    await (await import('node:fs/promises')).writeFile(durableRoot + '/' + 'b'.repeat(64) + '.json', JSON.stringify({ status: 'completed', completedAt: new Date(now.getTime() - 240000).toISOString() }));
+    const staleReceivedPath = durableRoot + '/' + 'c'.repeat(64) + '.json';
+    const staleRunningPath = durableRoot + '/' + 'd'.repeat(64) + '.json';
+    await (await import('node:fs/promises')).writeFile(staleReceivedPath, JSON.stringify({ status: 'received', receivedAt: new Date(now.getTime() - 240000).toISOString(), rawMessage: 'stale received private body' }), { mode: 0o600 });
+    await (await import('node:fs/promises')).writeFile(staleRunningPath, JSON.stringify({ status: 'running', runningAt: new Date(now.getTime() - 240000).toISOString(), rawMessage: 'stale running private body' }), { mode: 0o600 });
+    const { createImessageRuntime } = await import(${JSON.stringify(new URL('./mi-imessage-runtime.mjs', import.meta.url).href)});
+    await createImessageRuntime({ stateRoot: process.env.MI_ROOT + '/state', spawnRpc: async () => ({ ok: true, text: 'unused' }) });
+    const recoveredReceived = JSON.parse(await (await import('node:fs/promises')).readFile(staleReceivedPath, 'utf8'));
+    const recoveredRunning = JSON.parse(await (await import('node:fs/promises')).readFile(staleRunningPath, 'utf8'));
+    assert.equal('rawMessage' in recoveredReceived, false, 'runtime recovery removes stale received raw bodies before monitor inspection');
+    assert.equal('rawMessage' in recoveredRunning, false, 'runtime recovery removes stale running raw bodies before monitor inspection');
+    const durable = await monitor.analyzeDurableDeliveries(now, 180000);
+    assert.equal(durable[0].code, 'completed-unsent', 'monitor inspects completed unsent durable replies');
   `);
   const tsx = new URL('../node_modules/.bin/tsx', import.meta.url).pathname;
   const result = spawnSync(process.execPath, [tsx, runner], { cwd: root, env: { ...process.env, HOME: root, MI_ROOT: join(root, 'assistant'), PUSHOVER_USER: '', PUSHOVER_TOKEN: '' }, encoding: 'utf8' });

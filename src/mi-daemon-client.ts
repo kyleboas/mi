@@ -4,11 +4,12 @@ import { existsSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { reviewedMiPaths } from './mi-runtime-paths.js';
 
 const HOME = homedir();
 const MI_RUNTIME_DIR = process.env.MI_RUNTIME_DIR || join(HOME, '.pi', 'agent', 'mi');
 const MI_SOCKET_PATH = process.env.MI_SOCKET_PATH || join(MI_RUNTIME_DIR, 'main.sock');
-const MI_DAEMON_PATH = process.env.MI_DAEMON_PATH || join(HOME, '.pi', 'agent', 'extensions', 'mi-daemon.mjs');
+// The daemon is a reviewed Mi source file, never a Pi auto-loaded extension.
 const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const MI_DAEMON_HOST = process.env.MI_DAEMON_HOST || join(HOME, 'bin', 'mi-daemon-host');
 
@@ -99,10 +100,13 @@ async function startMiDaemonWithSystemd() {
 }
 
 export async function startMiDaemon() {
+  // Do this before asking systemd or Node to spawn anything. A missing or
+  // substituted guard/adapter means the private Mi runtime is not safe.
+  const reviewed = reviewedMiPaths();
   await mkdir(dirname(MI_SOCKET_PATH), { recursive: true });
   if (existsSync(MI_DAEMON_HOST) && await runQuiet(MI_DAEMON_HOST, [], 30000) && await waitForMiDaemonHealth(5000)) return;
   if (await startMiDaemonWithSystemd()) return;
-  const child = spawn(process.execPath, [MI_DAEMON_PATH], {
+  const child = spawn(process.execPath, [reviewed.daemonPath], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, MI_SOCKET_PATH, MI_RUNTIME_DIR },

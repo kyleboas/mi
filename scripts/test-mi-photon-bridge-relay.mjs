@@ -1,174 +1,103 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-const repoRoot = new URL('..', import.meta.url).pathname;
-
-const bridgeSource = await readFile(join(repoRoot, 'scripts', 'mi-photon-bridge.mjs'), 'utf8');
-assert.match(bridgeSource, /await sendToUser\(target, message, 'notification'\)/, 'notify endpoint sends the message body without a title heading');
-
-async function readJsonl(path) {
-  if (!existsSync(path)) return [];
-  const text = await readFile(path, 'utf8');
-  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk.toString('utf8'); });
-    req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
-      catch (error) { reject(error); }
-    });
-    req.on('error', reject);
-  });
-}
-
-function startMiServer(workerReply) {
-  const { source, text } = workerReply;
-  const calls = [];
-  let resultAvailableAt = 0;
-  let messagesPolls = 0;
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url || '/', 'http://127.0.0.1');
-      if (req.method === 'POST' && url.pathname === '/api/imessage') {
-        const body = await readBody(req);
-        calls.push({ method: req.method, path: url.pathname, body, at: Date.now() });
-        resultAvailableAt = Date.now() + Number(workerReply.delayMs || 0);
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, reply: 'On it. I’ll follow up here.', handoff: true, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}) }));
-        return;
-      }
-      if (req.method === 'GET' && url.pathname === '/api/messages') {
-        messagesPolls += 1;
-        calls.push({ method: req.method, path: url.pathname, thread: url.searchParams.get('thread'), messagesPolls, at: Date.now() });
-        const messages = messagesPolls >= 2 && Date.now() >= resultAvailableAt
-          ? ([
-            ...(workerReply.raw ? [{ role: 'assistant', source: 'mi-worker-result', text: workerReply.raw, ts: new Date().toISOString() }] : []),
-            ...(workerReply.interleaved ? [{ role: 'assistant', source: 'mi-worker-result', text: workerReply.interleaved, taskId: 'other-task', ts: new Date().toISOString() }] : []),
-            { role: 'assistant', source, text, ...(workerReply.taskId ? { taskId: workerReply.taskId } : {}), ts: new Date().toISOString() },
-          ])
-          : [];
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ messages }));
-        return;
-      }
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'not found' }));
-    } catch (error) {
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: error?.message || String(error) }));
-    }
-  });
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      resolve({
-        server,
-        calls,
-        baseUrl: `http://127.0.0.1:${server.address().port}`,
-        get resultAvailableAt() { return resultAvailableAt; },
-        close: () => new Promise((done) => server.close(done)),
-      });
-    });
-  });
-}
-
-function runBridge(env) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['scripts/mi-photon-bridge.mjs'], {
-      cwd: repoRoot,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      reject(new Error(`mi-photon-bridge timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-    }, 10000);
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on('exit', (code, signal) => {
-      clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`mi-photon-bridge exited ${code || signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-    });
-  });
-}
-
-async function runRelayCase(root, name, workerReply) {
-  const dir = join(root, name);
-  await mkdir(dir, { recursive: true });
-  const eventsPath = join(dir, 'events.json');
-  const sendsPath = join(dir, 'sends.jsonl');
-  await writeFile(eventsPath, JSON.stringify([
-    {
-      space: { id: `${name}-space`, phone: '+15551234567' },
-      message: {
-        id: `${name}-message`,
-        direction: 'inbound',
-        sender: { id: '+15551234567' },
-        content: { type: 'text', text: 'check detect status' },
-      },
-    },
-  ], null, 2));
-
-  const mi = await startMiServer(workerReply);
-  try {
-    const result = await runBridge({
+const repoRoot = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const root = await mkdtemp(join(tmpdir(), 'mi-photon-runtime-'));
+const miRoot = join(root, 'assistant');
+const work = join(root, 'work');
+const bin = join(root, 'bin');
+const events = join(root, 'events.json');
+const sends = join(root, 'sends.jsonl');
+const prompts = join(root, 'prompts.jsonl');
+try {
+  await mkdir(join(miRoot, 'pi', 'extensions'), { recursive: true, mode: 0o700 });
+  await cp(join(repoRoot, 'pi', 'extensions'), join(miRoot, 'pi', 'extensions'), { recursive: true });
+  await mkdir(work, { recursive: true, mode: 0o700 });
+  await mkdir(bin, { recursive: true, mode: 0o700 });
+  const fakePi = join(bin, 'pi');
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { appendFile, mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+let buffer = '';
+let settled = false;
+process.stdin.on('data', async (chunk) => {
+  buffer += chunk.toString();
+  if (settled || !buffer.includes('\\n')) return;
+  settled = true;
+  const session = process.argv[process.argv.indexOf('--session') + 1];
+  await mkdir(dirname(session), { recursive: true });
+  await appendFile(session + '.prompts', JSON.stringify({ argv: process.argv.slice(2) }) + '\\n');
+  await writeFile(session, JSON.stringify({ type: 'session', prompt: JSON.parse(buffer).message }) + '\\n', { mode: 0o600 });
+  console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'The durable answer.' }] } }));
+  console.log(JSON.stringify({ type: 'agent_settled' }));
+});
+`, { mode: 0o755 });
+  const event = {
+    space: { id: 'space-one', phone: '+15551234567' },
+    message: { id: 'upstream-one', timestamp: '2026-01-01T00:00:00Z', direction: 'inbound', sender: { id: '+15551234567' }, content: { type: 'text', text: 'List my Divernote tasks' } },
+  };
+  const missingIdentity = {
+    space: { id: 'space-one', phone: '+15551234567' },
+    message: { timestamp: '2026-01-01T00:00:01Z', direction: 'inbound', sender: { id: '+15551234567' }, content: { type: 'text', text: 'retry me' } },
+  };
+  await writeFile(events, JSON.stringify([event, structuredClone(event), missingIdentity]));
+  await writeFile(sends, '');
+  const child = spawn(process.execPath, ['scripts/mi-photon-bridge.mjs'], {
+    cwd: repoRoot,
+    env: {
       ...process.env,
+      MI_ROOT: miRoot,
+      MI_IMESSAGE_WORKSPACE_ROOT: work,
+      MI_IMESSAGE_WORKSPACE_CWD: work,
+      MI_DAEMON_PATH: join(miRoot, 'pi', 'extensions', 'mi-daemon.mjs'),
+      PI_CMD: fakePi,
       PHOTON_PROJECT_ID: 'test-project',
       PHOTON_PROJECT_SECRET: 'test-secret',
       PHOTON_ALLOWED_USERS: '+15551234567',
       PHOTON_BOOT_TEST_SEND: '0',
-      MI_WEB_URL: mi.baseUrl,
-      MI_PHOTON_THREAD: 'main',
-      MI_PHOTON_POLL_MS: '25',
-      MI_PHOTON_MAX_WAIT_MS: '3000',
-      MI_PHOTON_MAX_REPLY_CHARS: '1200',
       MI_PHOTON_NOTIFY_PORT: '0',
       MI_PHOTON_TEST: '1',
-      MI_PHOTON_TEST_EVENTS: eventsPath,
-      MI_PHOTON_TEST_SENDS: sendsPath,
-    });
-    assert.match(result.stdout, /imessage handoff - polling for (?:task|legacy worker) result/, `${name}: bridge should poll after handoff`);
-
-    const sends = (await readJsonl(sendsPath)).filter((entry) => entry.kind === 'message');
-    assert.equal(sends.length, 2, `${name}: bridge should send ack plus worker follow-up`);
-    assert.equal(sends[0].text, 'On it. I’ll follow up here.');
-    assert.equal(sends[1].text, workerReply.text);
-    assert.equal(sends[0].phone, '+15551234567');
-    assert.equal(sends[1].phone, '+15551234567');
-    if (workerReply.delayMs) {
-      assert.ok(Date.parse(sends[0].ts) < mi.resultAvailableAt, `${name}: acknowledgement must send before the delayed result exists`);
-      const firstPoll = mi.calls.find((call) => call.method === 'GET' && call.path === '/api/messages');
-      assert.ok(firstPoll && Date.parse(sends[0].ts) <= firstPoll.at, `${name}: acknowledgement must precede result polling`);
-    }
-
-    assert.ok(mi.calls.some((call) => call.method === 'POST' && call.path === '/api/imessage' && call.body.message === 'check detect status' && call.body.thread === 'main'), `${name}: bridge should forward inbound iMessage to Mi web`);
-    assert.ok(mi.calls.filter((call) => call.method === 'GET' && call.path === '/api/messages').length >= 2, `${name}: bridge should poll Mi messages until worker result appears`);
-  } finally {
-    await mi.close();
-  }
-}
-
-const root = await mkdtemp(join(tmpdir(), 'mi-photon-bridge-relay-'));
-try {
-  await runRelayCase(root, 'delayed-exact-task-id', { source: 'mi-worker-result', taskId: 'wanted-task', delayMs: 160, raw: 'Raw uncorrelated daemon diagnostic that must stay hidden.', interleaved: 'Wrong worker result.', text: 'Wanted worker finished and posted the final answer.' });
-  await runRelayCase(root, 'legacy-result', { source: 'mi-worker-result', text: 'Worker finished and posted the final answer.' });
-  await runRelayCase(root, 'legacy-error', { source: 'mi-worker-error', text: 'I hit an error finishing that: fake failure.' });
-  console.log('Mi Photon bridge relay checks passed.');
+      MI_PHOTON_TEST_EVENTS: events,
+      MI_PHOTON_TEST_SENDS: sends,
+      MI_IMESSAGE_COORDINATOR_TIMEOUT_MS: '5000',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  const status = await new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+  assert.equal(status, 0, `${stdout}\n${stderr}`);
+  const sent = (await readFile(sends, 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse).filter((entry) => entry.kind === 'message');
+  assert.equal(sent.length, 2, 'duplicate delivery starts no second Pi turn');
+  assert.ok(sent.some((entry) => entry.text === 'The durable answer.'), `runtime sends the completed Pi reply: ${JSON.stringify(sent)}\n${stdout}\n${stderr}`);
+  assert.ok(sent.some((entry) => entry.text === 'Please retry that message. I need its upstream ID and timestamp before I can process it.'), 'missing upstream identity gets the fixed retry request');
+  const conversationRoot = join(miRoot, 'state', 'imessage', 'conversations');
+  assert.ok(existsSync(conversationRoot), 'runtime state was created under state/imessage');
+  const conversations = await (await import('node:fs/promises')).readdir(conversationRoot);
+  const promptLines = (await readFile(join(conversationRoot, conversations[0], 'session.jsonl.prompts'), 'utf8')).trim().split('\n').filter(Boolean);
+  assert.equal(promptLines.length, 1, 'one upstream delivery creates exactly one Pi prompt');
+  const args = JSON.parse(promptLines[0]).argv;
+  assert.ok(args.includes('--session'), 'Pi receives a durable session path');
+  const coordinatorSession = JSON.parse(await readFile(join(conversationRoot, conversations[0], 'session.jsonl'), 'utf8'));
+  assert.match(coordinatorSession.prompt, /Divernote access for this request: read/, 'the verified configured Photon sender receives the scoped Divernote prompt');
+  assert.ok(!args.includes('--session-dir') && !args.includes('--no-session'), 'Pi receives no session fallback flags');
+  assert.equal(conversations.length, 1, 'space identity creates one conversation directory');
+  const deliveryRoot = join(conversationRoot, conversations[0], 'deliveries');
+  const deliveryFiles = await (await import('node:fs/promises')).readdir(deliveryRoot);
+  assert.equal(deliveryFiles.length, 1, 'delivery state is retained');
+  const record = JSON.parse(await readFile(join(deliveryRoot, deliveryFiles[0]), 'utf8'));
+  assert.equal(record.status, 'sent', 'delivery is marked sent after Photon send success');
+  assert.equal('rawMessage' in record, false, 'completed delivery state erases raw message text');
+  assert.equal((await stat(join(conversationRoot, conversations[0]))).mode & 0o777, 0o700, 'conversation directory is private');
+  assert.equal((await stat(join(deliveryRoot, deliveryFiles[0]))).mode & 0o777, 0o600, 'delivery record is private');
+  console.log('Mi Photon direct runtime checks passed.');
 } finally {
   await rm(root, { recursive: true, force: true });
 }
