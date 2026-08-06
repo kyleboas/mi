@@ -22,7 +22,13 @@ esac
 prior_ref="$(git symbolic-ref --quiet --short HEAD || true)"
 prior_commit="$(git rev-parse --verify HEAD)"
 [[ -n "$prior_ref" ]] || prior_ref="detached HEAD"
+rollback_branch="mi-deploy-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
 echo "Previous checkout: $prior_ref at $prior_commit"
+
+# Keep a uniquely named local branch for the prior reviewed commit. This never
+# moves or overwrites a user branch and remains available after this script.
+git branch "$rollback_branch" "$prior_commit"
+echo "Rollback branch: $rollback_branch"
 
 # Fetch exactly the reviewed upstream branch. Do not fetch tags or arbitrary
 # refs, reset the checkout, clean files, or rewrite a local branch.
@@ -37,7 +43,8 @@ fi
 deployed_commit="$(git rev-parse --verify origin/main)"
 post_update=1
 rollback_hint() {
-  echo "Update did not complete. To return this checkout to the prior revision: git switch --detach $prior_commit" >&2
+  echo "Update did not complete. Recovery: git switch --detach $rollback_branch && npm ci && npm run build" >&2
+  echo "If services were restarted, restart them manually after recovery; deploy does not roll them back automatically." >&2
 }
 on_error() {
   local status=$?
@@ -50,6 +57,8 @@ trap on_error ERR
 
 echo "Updating dependencies for $deployed_commit"
 npm ci
+npm run build
+npm test
 
 # Mi runs from this reviewed tree. Never copy Mi files into Pi's global
 # auto-load directory.
@@ -57,9 +66,7 @@ for file in pi/extensions/mi-daemon.mjs pi/extensions/mi-capability-guard.ts pi/
   [[ -f "$file" ]] || { echo "Missing reviewed Mi file: $file" >&2; exit 1; }
 done
 
-npm test
-
-# Run canaries before restarting services. A failed canary changes no deployed
+# Run canaries after the build and full test suite, before restarting services. A failed canary changes no deployed
 # files; roll back by checking out the prior reviewed commit before activation.
 MI_AUTO_ACTIONS_ENABLED=false \
 MI_IMESSAGE_MONITOR_ENABLED=false \

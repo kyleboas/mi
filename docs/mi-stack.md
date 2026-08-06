@@ -40,9 +40,9 @@ cd /home/kyle/assistant
 ./scripts/deploy-mi.sh
 ```
 
-This manual command refuses tracked, staged, and untracked changes before it contacts GitHub. It accepts only the `origin` SSH or HTTPS URL for `kyleboas/mi`, fetches only `origin/main`, reports the prior ref and commit, and advances local `main` only with a fast-forward merge. It runs `npm ci`, the existing tests and canaries, then prints the deployed commit. It never resets, cleans, rewrites branches, or activates timers/outbound jobs.
+This manual command refuses tracked, staged, and untracked changes before it contacts GitHub. It accepts only the `origin` SSH or HTTPS URL for `kyleboas/mi`, fetches only `origin/main`, reports the prior ref and commit, preserves that commit in a uniquely named local `mi-deploy-rollback-<UTC timestamp>` branch, and advances local `main` only with a fast-forward merge. The exact validation sequence is `npm ci`, `npm run build`, `npm test`, the focused tick canary, then the compiled CLI tick canary. It never resets, cleans, rewrites user branches, or activates timers/outbound jobs.
 
-It restarts only Mi user units that were already active. If the system `mi-photon-bridge.service` is already active, it restarts and verifies it with interactive `sudo`, so the GitHub update may prompt for a sudo password. A failed post-update validation or restart prints the prior commit and a concise detached-checkout rollback command. There is no iMessage, Web, scheduler, or other remote-triggered update path.
+It restarts only Mi user units that were already active. If the system `mi-photon-bridge.service` is already active, it restarts and verifies it with interactive `sudo`, so the GitHub update may prompt for a sudo password. A failed post-update validation or restart prints a recovery command using the durable rollback branch: `git switch --detach <rollback-branch> && npm ci && npm run build`. If any service was already restarted, the operator must restart it manually after recovery; this command does not automatically roll services back. There is no iMessage, Web, scheduler, or other remote-triggered update path.
 
 ## Safe cleanup manifest
 
