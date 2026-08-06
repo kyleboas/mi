@@ -31,6 +31,19 @@ sudo /home/kyle/uninstall-mi-model-eval-gateway.sh
 
 Normal iMessage operation does not use Web chat or a legacy router. The focused runtime owns durable conversation sessions and delivery recovery.
 
+## Manual GitHub update and deploy
+
+Run this only as a local operator from the Mi checkout:
+
+```bash
+cd /home/kyle/assistant
+./scripts/deploy-mi.sh
+```
+
+This manual command refuses tracked, staged, and untracked changes before it contacts GitHub. It accepts only the `origin` SSH or HTTPS URL for `kyleboas/mi`, fetches only `origin/main`, reports the prior ref and commit, and advances local `main` only with a fast-forward merge. It runs `npm ci`, the existing tests and canaries, then prints the deployed commit. It never resets, cleans, rewrites branches, or activates timers/outbound jobs.
+
+It restarts only Mi user units that were already active. If the system `mi-photon-bridge.service` is already active, it restarts and verifies it with interactive `sudo`, so the GitHub update may prompt for a sudo password. A failed post-update validation or restart prints the prior commit and a concise detached-checkout rollback command. There is no iMessage, Web, scheduler, or other remote-triggered update path.
+
 ## Safe cleanup manifest
 
 Tracked manifest: `scripts/mi-obsolete-home-entrypoints.tsv`.
