@@ -119,12 +119,12 @@ try {
   assert.equal(allowedDivernoteWrite.status, 'sent');
   assert.equal(unverifiedDivernote.status, 'sent');
   assert.equal(otherDivernote.status, 'sent');
-  assert.match(divernoteLaunches[0].prompt, /Divernote access for this current objective is read/, 'a bridge-verified named sender receives a read grant');
+  assert.match(divernoteLaunches[0].prompt, /Divernote access for this request: read/, 'a bridge-verified named sender receives a read grant');
   assert.ok(divernoteLaunches[0].grants.grants.some((grant) => grant.resource === 'diver-notes://vault' && grant.rights.includes('read')), 'the allowed sender gets only the required Divernote read capability');
-  assert.match(divernoteLaunches[1].prompt, /Divernote access for this current objective is write/, 'a bridge-verified named sender receives a scoped Divernote write grant for an explicit write');
+  assert.match(divernoteLaunches[1].prompt, /Divernote access for this request: write/, 'a bridge-verified named sender receives a scoped Divernote write grant for an explicit write');
   assert.ok(divernoteLaunches[1].grants.grants.some((grant) => grant.resource === 'diver-notes://vault' && grant.rights.includes('read') && grant.rights.includes('write')), 'the allowed sender gets only the reviewed Divernote write capability');
   for (const launch of divernoteLaunches.slice(2)) {
-    assert.match(launch.prompt, /Divernote access for this current objective is none/, 'unverified and unmatched senders remain default-deny');
+    assert.match(launch.prompt, /Divernote access for this request: none/, 'unverified and unmatched senders remain default-deny');
     assert.ok(!launch.grants.grants.some((grant) => grant.resource === 'diver-notes://vault'), 'unverified and unmatched senders receive no Divernote capability even when transport allow-all is set');
   }
   if (previousAllowedSenders === undefined) delete process.env.PHOTON_ALLOWED_USERS;

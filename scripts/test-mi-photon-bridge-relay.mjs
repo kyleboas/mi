@@ -86,7 +86,7 @@ process.stdin.on('data', async (chunk) => {
   const args = JSON.parse(promptLines[0]).argv;
   assert.ok(args.includes('--session'), 'Pi receives a durable session path');
   const coordinatorSession = JSON.parse(await readFile(join(conversationRoot, conversations[0], 'session.jsonl'), 'utf8'));
-  assert.match(coordinatorSession.prompt, /Divernote access for this current objective is read/, 'the verified configured Photon sender receives the scoped Divernote prompt');
+  assert.match(coordinatorSession.prompt, /Divernote access for this request: read/, 'the verified configured Photon sender receives the scoped Divernote prompt');
   assert.ok(!args.includes('--session-dir') && !args.includes('--no-session'), 'Pi receives no session fallback flags');
   assert.equal(conversations.length, 1, 'space identity creates one conversation directory');
   const deliveryRoot = join(conversationRoot, conversations[0], 'deliveries');

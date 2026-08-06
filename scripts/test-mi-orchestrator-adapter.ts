@@ -97,10 +97,8 @@ try {
   assert.equal(requests.length, 0, 'ordinary coordinator setup never starts a worker by itself');
 
   const prompt = miCoordinatorPrompt({ message: 'Ask Seth how I should position this offer.' });
-  assert.match(prompt, /Keep ordinary chat and uninvoked advice local/, 'ordinary uninvoked advice remains local');
-  assert.match(prompt, /Ask Terra request select Terra/, 'Terra has an explicit restricted route');
-  assert.match(prompt, /Ask Luna select Luna/, 'Luna has an explicit restricted route');
-  assert.match(prompt, /Ask Seth selects Seth.*Ask Alex or Ask Hormozi selects Alex.*Ask the advisors selects Seth and Alex/s, 'advisor selector rules are explicit');
+  assert.match(prompt, /Answer ordinary conversation and advice directly; delegate only work that the policy permits/, 'ordinary conversation remains direct unless delegation is permitted');
+  assert.doesNotMatch(prompt, /Ask Terra request select Terra|Ask Luna select Luna|Ask Seth selects Seth|Ask Alex or Ask Hormozi selects Alex|Sol-High worker|mi_orchestrator_delegate/, 'routing instructions remain outside the coordinator prompt');
 
   const guard = (handlers.get('tool_call') || [])[0];
   assert.ok(guard, 'the real capability guard is registered');
