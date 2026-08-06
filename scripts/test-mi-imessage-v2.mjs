@@ -85,6 +85,53 @@ try {
   assert.equal(missing.reason, 'missing-identity');
   assert.equal(prompts, 3);
 
+  const previousAllowedSenders = process.env.PHOTON_ALLOWED_USERS;
+  const previousAllowAll = process.env.PHOTON_ALLOW_ALL_USERS;
+  process.env.PHOTON_ALLOWED_USERS = '+1';
+  process.env.PHOTON_ALLOW_ALL_USERS = 'true';
+  const divernoteLaunches = [];
+  const divernoteRuntime = await createRuntime({
+    stateRoot: join(root, 'divernote'),
+    spawnRpc: async ({ launch, prompt }) => {
+      divernoteLaunches.push({ prompt, grants: JSON.parse(await readFile(launch.env.MI_CAPABILITY_GRANTS_FILE, 'utf8')) });
+      return { ok: true, text: 'Divernote response', reason: 'settled' };
+    },
+  });
+  const allowedDivernote = await divernoteRuntime.handleEvent({
+    ...event('divernote-allowed', 'allowed', 'List my Divernote tasks'),
+    senderAuthorized: true,
+    sendReply: send,
+  });
+  const allowedDivernoteWrite = await divernoteRuntime.handleEvent({
+    ...event('divernote-write', 'write', 'Add a task to Divernote: call the dentist'),
+    senderAuthorized: true,
+    sendReply: send,
+  });
+  const unverifiedDivernote = await divernoteRuntime.handleEvent({
+    ...event('divernote-unverified', 'unverified', 'List my Divernote tasks'),
+    senderAuthorized: false,
+    sendReply: send,
+  });
+  const otherSenderEvent = event('divernote-other', 'other', 'List my Divernote tasks');
+  otherSenderEvent.message.sender.id = '+2';
+  const otherDivernote = await divernoteRuntime.handleEvent({ ...otherSenderEvent, senderAuthorized: true, sendReply: send });
+  assert.equal(allowedDivernote.status, 'sent');
+  assert.equal(allowedDivernoteWrite.status, 'sent');
+  assert.equal(unverifiedDivernote.status, 'sent');
+  assert.equal(otherDivernote.status, 'sent');
+  assert.match(divernoteLaunches[0].prompt, /Divernote access for this current objective is read/, 'a bridge-verified named sender receives a read grant');
+  assert.ok(divernoteLaunches[0].grants.grants.some((grant) => grant.resource === 'diver-notes://vault' && grant.rights.includes('read')), 'the allowed sender gets only the required Divernote read capability');
+  assert.match(divernoteLaunches[1].prompt, /Divernote access for this current objective is write/, 'a bridge-verified named sender receives a scoped Divernote write grant for an explicit write');
+  assert.ok(divernoteLaunches[1].grants.grants.some((grant) => grant.resource === 'diver-notes://vault' && grant.rights.includes('read') && grant.rights.includes('write')), 'the allowed sender gets only the reviewed Divernote write capability');
+  for (const launch of divernoteLaunches.slice(2)) {
+    assert.match(launch.prompt, /Divernote access for this current objective is none/, 'unverified and unmatched senders remain default-deny');
+    assert.ok(!launch.grants.grants.some((grant) => grant.resource === 'diver-notes://vault'), 'unverified and unmatched senders receive no Divernote capability even when transport allow-all is set');
+  }
+  if (previousAllowedSenders === undefined) delete process.env.PHOTON_ALLOWED_USERS;
+  else process.env.PHOTON_ALLOWED_USERS = previousAllowedSenders;
+  if (previousAllowAll === undefined) delete process.env.PHOTON_ALLOW_ALL_USERS;
+  else process.env.PHOTON_ALLOW_ALL_USERS = previousAllowAll;
+
   const delegatedCalls = [];
   const delegatedRuntime = await createRuntime({
     stateRoot: join(root, 'delegated'),

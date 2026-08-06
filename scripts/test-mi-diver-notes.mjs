@@ -48,19 +48,20 @@ let captured;
 const result = await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: (command, argv, options) => { captured = { command, argv, options }; return fakeChild(); } });
 assert.deepEqual(result, { ok: true, value: { ok: true } });
 assert.equal(captured.command, DIVER_NOTES_WRAPPER); assert.equal(captured.options.shell, false); assert.deepEqual(captured.options.stdio, ['ignore', 'pipe', 'pipe']); assert.deepEqual(captured.options.env, { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' });
-assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ stdout: 'not json' }) })).error, 'Diver Notes returned an invalid response.');
-assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ code: 1 }) })).error, 'Diver Notes request failed.');
-assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ emitError: true }) })).error, 'Diver Notes is unavailable.');
-assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ stdout: 'x'.repeat(200) }), outputCap: 20 })).error, 'Diver Notes returned too much data.');
+assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ stdout: 'not json' }) })).error, 'Divernote returned an invalid response.');
+assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ code: 1 }) })).error, 'Divernote request failed.');
+assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ emitError: true }) })).error, 'Divernote is unavailable.');
+assert.equal((await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, spawnProcess: () => fakeChild({ stdout: 'x'.repeat(200) }), outputCap: 20 })).error, 'Divernote returned too much data.');
 let timedChild;
 const timed = await runDiverNotes({ operation: 'tasks.list' }, { verify: () => {}, timeoutMs: 1, spawnProcess: () => (timedChild = fakeChild({ close: false })) });
-assert.equal(timed.error, 'Diver Notes request timed out.'); assert.deepEqual(timedChild.kills, ['SIGTERM']); assert.equal(timedChild.stdoutDestroyed, true, 'timeout cleans up captured output');
+assert.equal(timed.error, 'Divernote request timed out.'); assert.deepEqual(timedChild.kills, ['SIGTERM']); assert.equal(timedChild.stdoutDestroyed, true, 'timeout cleans up captured output');
 
 assert.deepEqual(diverNotesIntent({ message: 'List my tasks.', plan: { allowWrite: false } }), { access: 'read' });
-assert.deepEqual(diverNotesIntent({ message: 'Add a task to Diver Notes.', plan: { allowWrite: true } }), { access: 'write' });
-assert.deepEqual(diverNotesIntent({ message: 'Add a task to Diver Notes.', plan: { allowWrite: false } }), { access: 'read' });
+assert.deepEqual(diverNotesIntent({ message: 'Find my Divernote tasks.', plan: { allowWrite: false } }), { access: 'read' });
+assert.deepEqual(diverNotesIntent({ message: 'Add a task to Divernote.', plan: { allowWrite: true } }), { access: 'write' });
+assert.deepEqual(diverNotesIntent({ message: 'Add a task to Divernote.', plan: { allowWrite: false } }), { access: 'read' });
 assert.deepEqual(diverNotesIntent({ message: 'Update it.', plan: { allowWrite: true } }), { access: 'none', clarify: true });
-assert.deepEqual(diverNotesIntent({ message: 'Read my Diver Notes documents.', plan: { allowWrite: false } }), { access: 'none', clarify: true });
+assert.deepEqual(diverNotesIntent({ message: 'Read my Divernote documents.', plan: { allowWrite: false } }), { access: 'none', clarify: true });
 assert.deepEqual(diverNotesIntent({ message: 'List my tasks.', plan: { allowWrite: true }, gate: 'confirm' }), { access: 'none' });
 
 const temp = await mkdtemp(path.join(os.tmpdir(), 'mi-diver-guard-'));
@@ -76,4 +77,4 @@ try {
   assert.equal((await guard({ toolName: 'mi_diver_notes', input: { operation: 'project-documents.read' } }, { cwd: temp })).block, true, 'unknown operations remain denied');
 } finally { delete process.env.MI_CAPABILITY_GRANTS_FILE; await rm(temp, { recursive: true, force: true }); }
 
-console.log('Mi Diver Notes extension checks passed.');
+console.log('Mi Divernote extension checks passed.');

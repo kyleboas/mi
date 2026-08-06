@@ -26,7 +26,7 @@ The runner reads an assistant file and starts a short run from an explicit trigg
 
 The Photon bridge calls `scripts/mi-imessage-runtime.mjs` directly. The runtime stores one private JSONL Pi session per normalized conversation and starts Pi only for a turn. It resumes the exact session path with `--mode rpc --session` and exits after settlement. It does not copy thread history into the prompt.
 
-The runtime loads only the reviewed capability guard, adapter, and Diver Notes extension. A policy binds the request to one real workspace root and working directory. High-impact work needs exact confirmation. Delegated work uses the reviewed Mi daemon path, and the runtime waits for terminal evidence before it reports completion.
+The runtime loads only the reviewed capability guard, adapter, and Divernote extension. Divernote grants require a Photon-verified sender that exactly matches `PHOTON_ALLOWED_USERS`; every other sender is denied. Its supported read/list/search-within-results and reviewed write operations remain subject to the capability guard and audit log. A policy binds the request to one real workspace root and working directory. High-impact work needs exact confirmation. Delegated work uses the reviewed Mi daemon path, and the runtime waits for terminal evidence before it reports completion.
 
 ### Advisor workers
 

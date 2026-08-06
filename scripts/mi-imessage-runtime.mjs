@@ -9,6 +9,7 @@ import path from 'node:path';
 import { classifyConfirmationReply, clearPendingConfirmation, createPendingConfirmation, readPendingConfirmation } from '../dist/src/pending-confirmations.js';
 import { coordinatorDelegatedTasks, miCoordinatorLaunch, miCoordinatorPrompt, runMiCoordinatorRpc, safeCoordinatorFailureClass } from './mi-imessage-coordinator.mjs';
 import { diverNotesPreflight } from './mi-diver-notes-intent.mjs';
+import { authorizedForDivernote } from './mi-imessage-sender-access.mjs';
 import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
 import { redactV2Text, sanitizeImessageCompletion } from './mi-imessage-v2.mjs';
 import { directAdvisorSelections, v2ConfirmationCommand, v2RouteDecision } from './mi-web-chat-v2-route.mjs';
@@ -529,22 +530,22 @@ export class ImessageRuntime {
     return true;
   }
 
-  async handleEvent({ space, message, sendReply = this.sendReply }) {
+  async handleEvent({ space, message, senderAuthorized = false, sendReply = this.sendReply }) {
     const preliminaryConversationId = conversationIdFor(space, message);
-    if (!preliminaryConversationId) return this.handleEventInternal({ space, message, sendReply });
+    if (!preliminaryConversationId) return this.handleEventInternal({ space, message, senderAuthorized, sendReply });
     const preliminaryDeliveryId = deliveryIdFor(preliminaryConversationId, message);
     const lockFile = preliminaryDeliveryId
       ? deliveryFile(conversationDirectory(preliminaryConversationId, this.stateRoot), preliminaryDeliveryId)
       : '';
     const active = lockFile ? this.deliveryLocks.get(lockFile) : undefined;
     if (active) return active;
-    const work = this.enqueue(preliminaryConversationId, () => this.handleEventInternal({ space, message, sendReply }));
+    const work = this.enqueue(preliminaryConversationId, () => this.handleEventInternal({ space, message, senderAuthorized, sendReply }));
     if (!lockFile) return work;
     this.deliveryLocks.set(lockFile, work);
     try { return await work; } finally { if (this.deliveryLocks.get(lockFile) === work) this.deliveryLocks.delete(lockFile); }
   }
 
-  async handleEventInternal({ space, message, sendReply = this.sendReply }) {
+  async handleEventInternal({ space, message, senderAuthorized = false, sendReply = this.sendReply }) {
     const text = messageTextFor(message);
     if (!text) return { ok: true, ignored: true };
     const conversationId = conversationIdFor(space, message);
@@ -667,7 +668,7 @@ export class ImessageRuntime {
       current.status = 'running';
       current.runningAt = isoNow();
       await writeDelivery(file, current);
-      const result = await this.runTurn(current, directory);
+      const result = await this.runTurn(current, directory, { space, message, senderAuthorized });
       current.taskIds = coordinatorTaskIds(result.taskIds || []);
       if (result.status === 'sent') return { ...result, deliveryId, conversationId };
       current.status = 'completed';
@@ -708,7 +709,7 @@ export class ImessageRuntime {
     for (const entry of earlier) await interruptIncompleteDelivery(entry.file);
   }
 
-  async runTurn(record, directory) {
+  async runTurn(record, directory, sender = {}) {
     const message = record.rawMessage || '';
     const workspace = workspaceFromEnvironment();
     const confirmationOptions = { statePath: path.join(this.stateRoot, 'pending-confirmations.json') };
@@ -752,7 +753,12 @@ export class ImessageRuntime {
       return { reply: `Action class: ${route.actionClass}.\n\nExact objective: ${route.objective}\n\nThis could make a real change or contact another service. Reply "confirm ${pendingAction.id}" to approve or "deny ${pendingAction.id}" to cancel.`, taskIds: [] };
     }
     const plan = { ...(route.plan || {}), workspace, cwd: workspace.cwd, workspaceRoot: workspace.root };
-    const diverNotes = diverNotesPreflight({ message, plan });
+    // A normal coordinator turn is available after transport authorization, but
+    // the private vault needs both that verified bridge signal and a named
+    // sender in PHOTON_ALLOWED_USERS. PHOTON_ALLOW_ALL_USERS never grants it.
+    const diverNotes = authorizedForDivernote({ ...sender })
+      ? diverNotesPreflight({ message, plan })
+      : { access: 'none' };
     if (diverNotes.reply) return { reply: diverNotes.reply, taskIds: [] };
     return this.runCoordinator(record, directory, { ...plan, diverNotesAccess: diverNotes.access });
   }

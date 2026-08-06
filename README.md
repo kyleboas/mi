@@ -134,6 +134,8 @@ Each conversation stores one private Pi session at `state/imessage/conversations
 
 The runtime requires an upstream message ID and a stable timestamp. It rejects incomplete events with a fixed retry request before Pi starts. It replays completed but unsent replies before later turns. A successful Photon send followed by a failed durable state write can produce one duplicate after restart. The runtime never retries interrupted work automatically.
 
+Divernote is available only to a named sender in `PHOTON_ALLOWED_USERS` after the Photon bridge has verified that sender. Its per-turn grant defaults to deny for every other sender, including the transport's unsafe `PHOTON_ALLOW_ALL_USERS` development override. An allowed sender can list supported items, search within listed results, and make only the reviewed task, note, project, and project-subtask changes. The normal capability guard and its audit log still apply to every request.
+
 The normal stack has no Web chat dependency. Web chat remains a loopback maintenance tool and requires `MI_WEB_MAINTENANCE=1`. Do not expose it as a second user interface. No provider credential is placed in the repository or Pi configuration.
 
 Optional env:

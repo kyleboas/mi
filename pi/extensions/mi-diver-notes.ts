@@ -39,18 +39,18 @@ export const DIVER_NOTES_READ_OPERATIONS = new Set(Object.entries(operations).fi
 export const DIVER_NOTES_WRITE_OPERATIONS = new Set(Object.entries(operations).filter(([, value]) => value.write).map(([key]) => key));
 
 function safeValue(value: unknown, name: string) {
-  if (typeof value !== 'string' || !value || value.length > (name === 'id' || name === 'taskId' || name === 'subtaskId' ? ID_CAP : VALUE_CAP) || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('Diver Notes input is invalid.');
-  if (/^(?:https?:\/\/|file:|\/|~\/)|(?:^|\s)(?:--|[|&;`$<>])/.test(value) || value.includes('\\')) throw new Error('Diver Notes input is invalid.');
+  if (typeof value !== 'string' || !value || value.length > (name === 'id' || name === 'taskId' || name === 'subtaskId' ? ID_CAP : VALUE_CAP) || /[\u0000-\u001f\u007f]/.test(value)) throw new Error('Divernote input is invalid.');
+  if (/^(?:https?:\/\/|file:|\/|~\/)|(?:^|\s)(?:--|[|&;`$<>])/.test(value) || value.includes('\\')) throw new Error('Divernote input is invalid.');
   return value;
 }
 
 export function diverNotesArgv(input: Input): string[] {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Diver Notes input is invalid.');
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Divernote input is invalid.');
   const operation = input.operation;
-  if (typeof operation !== 'string' || !Object.hasOwn(operations, operation)) throw new Error('Diver Notes operation is not allowed.');
+  if (typeof operation !== 'string' || !Object.hasOwn(operations, operation)) throw new Error('Divernote operation is not allowed.');
   const spec = operations[operation];
   const permitted = new Set(['operation', ...Object.keys(spec.args)]);
-  if (Object.keys(input).some((key) => !permitted.has(key))) throw new Error('Diver Notes input is invalid.');
+  if (Object.keys(input).some((key) => !permitted.has(key))) throw new Error('Divernote input is invalid.');
   const [group, command] = operation.split('.');
   const argv = [group, command];
   for (const [property, option] of Object.entries(spec.args)) {
@@ -58,7 +58,7 @@ export function diverNotesArgv(input: Input): string[] {
     if (value === undefined) continue;
     argv.push(`--${option}`, safeValue(value, property));
   }
-  for (const required of spec.required || []) if (!(required in input)) throw new Error('Diver Notes input is incomplete.');
+  for (const required of spec.required || []) if (!(required in input)) throw new Error('Divernote input is incomplete.');
   return [...argv, '--json'];
 }
 
@@ -71,12 +71,12 @@ export function verifyDiverNotesWrapper(wrapper = DIVER_NOTES_WRAPPER, deps: { l
     const link = lstat(wrapper);
     const info = stat(wrapper);
     if (link.isSymbolicLink() || !info.isFile() || info.uid !== 0 || (info.mode & 0o022) !== 0 || (info.mode & 0o111) === 0) throw new Error();
-  } catch { throw new Error('Diver Notes is unavailable.'); }
+  } catch { throw new Error('Divernote is unavailable.'); }
 }
 
 export function runDiverNotes(input: Input, { spawnProcess = nodeSpawn, verify = verifyDiverNotesWrapper, timeoutMs = TIMEOUT_MS, outputCap = OUTPUT_CAP, stderrCap = STDERR_CAP } = {}): Promise<{ ok: boolean; value?: unknown; error?: string }> {
   let argv: string[];
-  try { argv = diverNotesArgv(input); verify(); } catch (error) { return Promise.resolve({ ok: false, error: error instanceof Error ? error.message : 'Diver Notes is unavailable.' }); }
+  try { argv = diverNotesArgv(input); verify(); } catch (error) { return Promise.resolve({ ok: false, error: error instanceof Error ? error.message : 'Divernote is unavailable.' }); }
   return new Promise((resolve) => {
     const maxOutput = Math.max(1, Math.min(Number(outputCap) || OUTPUT_CAP, OUTPUT_CAP));
     const maxStderr = Math.max(1, Math.min(Number(stderrCap) || STDERR_CAP, STDERR_CAP));
@@ -97,20 +97,20 @@ export function runDiverNotes(input: Input, { spawnProcess = nodeSpawn, verify =
       killTimer = setTimeout(() => { try { if (child?.exitCode === null) child.kill('SIGKILL'); } catch {} }, 500);
       killTimer.unref?.();
     };
-    try { child = spawnProcess(DIVER_NOTES_WRAPPER, argv, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } }); } catch { return finish({ ok: false, error: 'Diver Notes is unavailable.' }); }
-    timer = setTimeout(() => { stop(); finish({ ok: false, error: 'Diver Notes request timed out.' }); }, Math.max(1000, Math.min(Number(timeoutMs) || TIMEOUT_MS, 30_000)));
+    try { child = spawnProcess(DIVER_NOTES_WRAPPER, argv, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } }); } catch { return finish({ ok: false, error: 'Divernote is unavailable.' }); }
+    timer = setTimeout(() => { stop(); finish({ ok: false, error: 'Divernote request timed out.' }); }, Math.max(1000, Math.min(Number(timeoutMs) || TIMEOUT_MS, 30_000)));
     child.once('close', () => { if (killTimer) clearTimeout(killTimer); });
-    child.stdout?.on('data', (chunk: Buffer) => { outputBytes += chunk.length; if (outputBytes > maxOutput) { stop(); finish({ ok: false, error: 'Diver Notes returned too much data.' }); } else stdout += chunk.toString('utf8'); });
-    child.stderr?.on('data', (chunk: Buffer) => { stderrBytes += chunk.length; if (stderrBytes > maxStderr) { stop(); finish({ ok: false, error: 'Diver Notes request failed.' }); } });
-    child.on('error', () => finish({ ok: false, error: 'Diver Notes is unavailable.' }));
+    child.stdout?.on('data', (chunk: Buffer) => { outputBytes += chunk.length; if (outputBytes > maxOutput) { stop(); finish({ ok: false, error: 'Divernote returned too much data.' }); } else stdout += chunk.toString('utf8'); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderrBytes += chunk.length; if (stderrBytes > maxStderr) { stop(); finish({ ok: false, error: 'Divernote request failed.' }); } });
+    child.on('error', () => finish({ ok: false, error: 'Divernote is unavailable.' }));
     child.on('close', (code: number) => {
       if (done) return;
-      if (code !== 0) return finish({ ok: false, error: 'Diver Notes request failed.' });
+      if (code !== 0) return finish({ ok: false, error: 'Divernote request failed.' });
       try {
         if (Buffer.byteLength(stdout) > maxOutput) throw new Error();
         const value = JSON.parse(stdout);
         finish({ ok: true, value });
-      } catch { finish({ ok: false, error: 'Diver Notes returned an invalid response.' }); }
+      } catch { finish({ ok: false, error: 'Divernote returned an invalid response.' }); }
     });
   });
 }
@@ -120,12 +120,12 @@ export const diverNotesSchema = Type.Union(toolVariants);
 
 export default function miDiverNotes(pi: ExtensionAPI) {
   pi.registerTool({
-    name: 'mi_diver_notes', label: 'Diver Notes', description: 'Read or make the exact requested change in the owner’s private Diver Notes vault.', parameters: diverNotesSchema,
+    name: 'mi_diver_notes', label: 'Divernote', description: 'Read, search through listed results, or make the exact requested change in the owner’s private Divernote vault.', parameters: diverNotesSchema,
     async execute(_id, params) {
       const result = await runDiverNotes(params as Input);
       return result.ok
         ? { content: [{ type: 'text', text: JSON.stringify(result.value).slice(0, OUTPUT_CAP) }], details: { operation: params.operation } }
-        : { content: [{ type: 'text', text: result.error || 'Diver Notes request failed.' }], details: { operation: params.operation, failed: true } };
+        : { content: [{ type: 'text', text: result.error || 'Divernote request failed.' }], details: { operation: params.operation, failed: true } };
     },
   });
 }

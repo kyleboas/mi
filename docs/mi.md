@@ -17,7 +17,8 @@ Runtime assistants do not silently rewrite their own rules.
 - Read access is the default for scoped workers.
 - A write worker is limited to its approved workspace.
 - Deploying, publishing, merging, deleting data, changing secrets, spending money, and sending outside messages need a clear approval path.
-- The iMessage runtime loads only the reviewed Mi capability guard, adapter, and Diver Notes extension. It disables normal extension, skill, theme, prompt-template, and context-file discovery.
+- The iMessage runtime loads only the reviewed Mi capability guard, adapter, and Divernote extension. It disables normal extension, skill, theme, prompt-template, and context-file discovery.
+- Divernote access needs both Photon verification and a named `PHOTON_ALLOWED_USERS` sender. It is denied for every other sender, and remains constrained by the per-turn capability grant and audit log.
 - Direct advisor work loads only the reviewed advisor skill and gives it read access.
 - Mi has no public control webhook by default.
 

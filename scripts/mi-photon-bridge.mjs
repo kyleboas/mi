@@ -3,11 +3,12 @@ import http from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { emitTurnEvent } from './mi-turn-observability.mjs';
 import { createImessageRuntime } from './mi-imessage-runtime.mjs';
+import { configuredIMessageSenders, isConfiguredIMessageSender, senderForIMessage } from './mi-imessage-sender-access.mjs';
 
 const root = process.env.MI_ROOT || '/home/kyle/assistant';
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
-const allowedUsers = splitList(process.env.PHOTON_ALLOWED_USERS || '');
+const allowedUsers = configuredIMessageSenders();
 const allowAll = /^(1|true|yes|on)$/i.test(process.env.PHOTON_ALLOW_ALL_USERS || '');
 const photonTypingDelayMs = boundedEnvironmentInteger('MI_PHOTON_TYPING_DELAY_MS', 100, 0, 5000);
 const bootTestSend = /^(1|true|yes|on)$/i.test(process.env.PHOTON_BOOT_TEST_SEND || '');
@@ -130,18 +131,14 @@ app = await Spectrum({
 });
 runtime = await createImessageRuntime();
 
-function senderFor(space, message) {
-  return String(message?.sender?.id || space?.phone || message?.space?.phone || '').trim();
-}
-
 function mask(value) {
   const text = String(value || '');
   if (text.length <= 4) return text || '(unknown)';
   return `${text.slice(0, 3)}…${text.slice(-4)}`;
 }
 
-function authorized(sender) {
-  return allowAll || allowedUsers.includes(sender);
+function authorized(space, message) {
+  return allowAll || isConfiguredIMessageSender(space, message);
 }
 
 function cleanNotification(text) {
@@ -195,15 +192,21 @@ function startTypingBestEffort(space, delayMs = photonTypingDelayMs) {
 
 async function handle(space, message) {
   if (message?.direction && message.direction !== 'inbound') return;
-  const sender = senderFor(space, message);
+  const sender = senderForIMessage(space, message);
   console.log(`photon inbound sender=${mask(sender)} space=${mask(space?.id || message?.space?.id)}`);
-  if (!authorized(sender)) {
+  if (!authorized(space, message)) {
     console.log(`photon inbound blocked sender=${mask(sender)} allowed=${allowedUsers.map(mask).join(',') || '(none)'}`);
     return;
   }
   const stopTyping = startTypingBestEffort(space);
   try {
-    const result = await runtime.handleEvent({ space, message, sendReply: (reply) => sendWithRetries(space, reply) });
+    const result = await runtime.handleEvent({
+      space, message,
+      // The runtime independently checks this named configured sender before
+      // granting Divernote access; this only carries the bridge verification.
+      senderAuthorized: true,
+      sendReply: (reply) => sendWithRetries(space, reply),
+    });
     await emitTurnEvent(root, { stage: 'ack', outcome: result.ok ? 'ok' : 'skipped', route: 'photon', modelProfile: 'none', turn: result.deliveryId || result.conversationId || 'retry' }).catch(() => undefined);
   } catch (error) {
     console.error('mi photon handling failed:', error?.message || String(error));

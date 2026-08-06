@@ -14,7 +14,7 @@ function normalizedMessageText(message) {
 
 export function messageHasLocalWorkTarget(message) {
   const text = normalizedMessageText(message);
-  return /\b(?:mi|diver\s+notes|routing|app|ui|notification|reminder|calendar|cron|schedule|video|watchlist|logo|favicon|chat|pwa|site|service|typing|code|file|repo|branch|github|pull\s*request|\bpr\b|test|daemon|systemd|tailscale|candidate|project|research|worker)\b/.test(text)
+  return /\b(?:mi|diver\s*notes?|routing|app|ui|notification|reminder|calendar|cron|schedule|video|watchlist|logo|favicon|chat|pwa|site|service|typing|code|file|repo|branch|github|pull\s*request|\bpr\b|test|daemon|systemd|tailscale|candidate|project|research|worker)\b/.test(text)
     || /\b(?:code|repo|project)\/[a-z0-9_.-]+|~\/code\/[a-z0-9_.-]+|\/home\/\w+\/(?:code\/)?[a-z0-9_.-]+/.test(text);
 }
 

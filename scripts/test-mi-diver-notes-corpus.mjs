@@ -167,15 +167,16 @@ for (const [index, [message, expectedClass, expectedAccess, expectedHandoff, ope
   assert.equal(intent.access, expectedAccess, `case ${index + 1}: access for ${message}`);
   assert.equal(handoff, expectedHandoff, `case ${index + 1}: handoff for ${message}`);
   assert.equal(actualOperation, operation && sampleInput[operation] && (expectedAccess === 'write' || operation.endsWith('.list')) ? operation : null, `case ${index + 1}: operation for ${message}`);
-  assert.equal(preflight.reply || null, expectedReply, `case ${index + 1}: deterministic reply for ${message}`);
+  const expectedUserFacingReply = expectedReply?.replaceAll('Diver Notes', 'Divernote') || null;
+  assert.equal(preflight.reply || null, expectedUserFacingReply, `case ${index + 1}: deterministic reply for ${message}`);
 }
 
 // The prompt is also audited as a production handoff boundary: mocked fixture
 // prose is never presented as a generated assistant answer.
 assert.match(miCoordinatorPrompt({ message: 'List my Diver Notes tasks', diverNotesAccess: 'read' }), /current objective is read/);
-assert.match(miCoordinatorPrompt({ message: 'List my Diver Notes tasks', diverNotesAccess: 'read' }), /Diver Notes/);
+assert.match(miCoordinatorPrompt({ message: 'List my Divernote tasks', diverNotesAccess: 'read' }), /Divernote/);
 
 const counts = (field) => Object.fromEntries([...new Set(outcomes.map((row) => row[field]))].sort().map((key) => [key, outcomes.filter((row) => row[field] === key).length]));
 const operationCounts = Object.fromEntries([...new Set(outcomes.map((row) => row.operation || 'none'))].sort().map((key) => [key, outcomes.filter((row) => (row.operation || 'none') === key).length]));
 console.log(JSON.stringify({ cases: outcomes.length, route: counts('route'), access: counts('access'), operation: operationCounts, mocked: outcomes.filter((row) => row.mocked === 'mocked-success').length }, null, 2));
-console.log('Mi Diver Notes 100-case audit passed; failures: 0 (all fixture replies are MOCKED).');
+console.log('Mi Divernote 100-case audit passed; failures: 0 (all fixture replies are MOCKED).');
