@@ -30,17 +30,23 @@ echo "Previous checkout: $prior_ref at $prior_commit"
 git branch "$rollback_branch" "$prior_commit"
 echo "Rollback branch: $rollback_branch"
 
-# Fetch exactly the reviewed upstream branch. Do not fetch tags or arbitrary
-# refs, reset the checkout, clean files, or rewrite a local branch.
+# Fetch exactly the reviewed upstream branch. The dedicated deployment branch
+# is the only local branch this command creates or advances; local main and
+# the operator's prior branch are never switched or modified.
 git fetch --no-tags origin main:refs/remotes/origin/main
-if git show-ref --verify --quiet refs/heads/main; then
-  git switch main
+deployment_branch="deploy/mi"
+if git show-ref --verify --quiet "refs/heads/$deployment_branch"; then
+  if ! git merge-base --is-ancestor "$deployment_branch" origin/main; then
+    echo "Refusing to update: $deployment_branch is not a fast-forward ancestor of origin/main. Resolve it manually; deploy will not rewrite it." >&2
+    exit 1
+  fi
+  git switch "$deployment_branch"
   git merge --ff-only origin/main
 else
-  git switch --detach origin/main
+  git switch -c "$deployment_branch" --track origin/main
 fi
 
-deployed_commit="$(git rev-parse --verify origin/main)"
+deployed_commit="$(git rev-parse --verify "$deployment_branch")"
 post_update=1
 rollback_hint() {
   echo "Update did not complete. Recovery: git switch --detach $rollback_branch && npm ci && npm run build" >&2
