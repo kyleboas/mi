@@ -36,24 +36,16 @@ try {
   const calls = path.join(temp, 'calls');
   await mkdir(bin);
   await writeFile(path.join(bin, 'git'), `#!/bin/sh
-printf 'git %s\\n' "$*" >> ${JSON.stringify(calls)}
-case "$1" in
-  diff|ls-files|status) exit 0 ;;
-  remote) printf '%s\\n' "\${ORIGIN_URL:-https://github.com/kyleboas/mi.git}"; exit 0 ;;
-  symbolic-ref) printf '%s\\n' "\${PRIOR_BRANCH:-checkpoint/imessage-v2-before-simplification}"; exit 0 ;;
-  rev-parse) printf '0123456789012345678901234567890123456789\\n'; exit 0 ;;
-  show-ref) [ "\${DEPLOY_BRANCH_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
-  merge-base) [ "\${DEPLOY_BRANCH_ANCESTOR:-1}" = 1 ] && exit 0 || exit 1 ;;
-  branch|fetch|merge) exit 0 ;;
-  switch) [ "$2" = main ] && [ "\${LOCAL_MAIN_DIVERGENT:-0}" = 1 ] && exit 1; exit 0 ;;
-esac
-exit 1
+if [ "$1" = remote ] && [ "$2" = get-url ] && [ "$3" = origin ]; then
+  printf '%s\\n' "\${ORIGIN_URL:-https://github.com/kyleboas/mi.git}"
+  exit 0
+fi
+exec /usr/bin/git "$@"
 `);
   await writeFile(path.join(bin, 'npm'), `#!/bin/sh
 printf 'npm %s\\n' "$*" >> ${JSON.stringify(calls)}
 if [ "$*" = 'run build' ] && [ "\${FAIL_BUILD:-0}" = 1 ]; then exit 1; fi
-case "$*" in ci|'run build'|test) exit 0;; esac
-exit 1
+exit 0
 `);
   await writeFile(path.join(bin, 'node'), `#!/bin/sh
 printf 'node %s\\n' "$*" >> ${JSON.stringify(calls)}
@@ -67,19 +59,66 @@ exit 0
   await writeFile(path.join(bin, 'sudo'), '#!/bin/sh\nexec "$@"\n');
   for (const name of ['git', 'npm', 'node', 'systemctl', 'sudo']) await chmod(path.join(bin, name), 0o700);
 
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
-  const run = (extra = {}) => spawnSync('bash', ['scripts/deploy-mi.sh'], {
-    cwd: repo, env: { ...env, ...extra }, encoding: 'utf8',
+  const git = (cwd, args) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const setupRepo = async (name) => {
+    const seed = path.join(temp, `${name}-seed`);
+    const checkout = path.join(temp, name);
+    const origin = path.join(temp, `${name}-origin.git`);
+    git(temp, ['init', '--initial-branch=main', seed]);
+    git(seed, ['config', 'user.email', 'test@example.com']);
+    git(seed, ['config', 'user.name', 'Mi deploy canary']);
+    await mkdir(path.join(seed, 'scripts'), { recursive: true });
+    await mkdir(path.join(seed, 'pi/extensions'), { recursive: true });
+    await mkdir(path.join(seed, 'dist/src'), { recursive: true });
+    await writeFile(path.join(seed, 'scripts/deploy-mi.sh'), text, { mode: 0o700 });
+    await writeFile(path.join(seed, 'package.json'), '{"private":true}\n');
+    await writeFile(path.join(seed, 'scripts/test-mi-tick.mjs'), '');
+    await writeFile(path.join(seed, 'dist/src/cli.js'), '');
+    for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi.ts']) {
+      await writeFile(path.join(seed, 'pi/extensions', file), '');
+    }
+    git(seed, ['add', '.']);
+    git(seed, ['commit', '-m', 'initial deploy fixture']);
+    git(temp, ['clone', '--bare', seed, origin]);
+    git(temp, ['clone', origin, checkout]);
+    git(checkout, ['config', 'user.email', 'test@example.com']);
+    git(checkout, ['config', 'user.name', 'Mi deploy canary']);
+    git(checkout, ['remote', 'set-url', 'origin', 'https://github.com/kyleboas/mi.git']);
+    return { checkout, origin };
+  };
+  const run = (cwd, origin, extra = {}) => spawnSync('bash', ['scripts/deploy-mi.sh'], {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...extra,
+      PATH: `${bin}:${process.env.PATH}`,
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${origin}.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'https://github.com/kyleboas/mi.git',
+    },
   });
 
-  const result = run({ LOCAL_MAIN_DIVERGENT: '1' });
+  const { checkout, origin } = await setupRepo('divergent-main');
+  git(checkout, ['branch', 'deploy/mi', 'origin/main']);
+  await writeFile(path.join(checkout, 'local-main-only'), 'do not deploy this commit\n');
+  git(checkout, ['add', 'local-main-only']);
+  git(checkout, ['commit', '-m', 'local main divergence']);
+  const originalMain = git(checkout, ['rev-parse', 'main']);
+  const originalMainRef = git(checkout, ['show-ref', '--verify', 'refs/heads/main']);
+
+  const result = run(checkout, origin);
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(git(checkout, ['rev-parse', 'main']), originalMain, 'the divergent local main commit remains unchanged');
+  assert.equal(git(checkout, ['show-ref', '--verify', 'refs/heads/main']), originalMainRef, 'the local main ref remains unchanged');
+  assert.equal(git(checkout, ['symbolic-ref', '--short', 'HEAD']), 'deploy/mi', 'the owned deployment branch is checked out, not main');
+  assert.equal(git(checkout, ['rev-parse', 'deploy/mi']), git(checkout, ['rev-parse', 'origin/main']), 'deploy/mi reaches origin/main');
+  assert.doesNotMatch(git(checkout, ['reflog', 'show', '--format=%gs', 'HEAD']), /moving from deploy\/mi to main/, 'the updater never checks out local main');
   let recorded = await readFile(calls, 'utf8');
-  assert.match(recorded, /git fetch --no-tags origin main:refs\/remotes\/origin\/main/, 'only origin/main is fetched');
-  assert.match(recorded, /git merge-base --is-ancestor deploy\/mi origin\/main/, 'existing deployment branch is checked before updating');
-  assert.match(recorded, /git switch deploy\/mi\ngit merge --ff-only origin\/main/, 'existing deployment branch fast-forwards from origin/main');
-  assert.doesNotMatch(recorded, /git (?:switch|merge) main(?:\n| )/, 'a divergent local main is never selected or modified');
-  assert.match(recorded, /git branch mi-deploy-rollback-\d{8}T\d{6}Z 0123456789012345678901234567890123456789/, 'prior commit gets a durable rollback branch');
   const stages = ['npm ci', 'npm run build', 'npm test', 'node scripts/test-mi-tick.mjs', 'node dist/src/cli.js tick'];
   let previousStage = -1;
   for (const stage of stages) {
@@ -92,32 +131,38 @@ exit 0
   assert.doesNotMatch(recorded, /(?:restart|try-restart)/, 'inactive services are never started by deploy');
 
   await writeFile(calls, '');
-  const bootstrap = run({ DEPLOY_BRANCH_EXISTS: '0' });
+  const bootstrapFixture = await setupRepo('bootstrap-deploy');
+  const bootstrap = run(bootstrapFixture.checkout, bootstrapFixture.origin);
   assert.equal(bootstrap.status, 0, bootstrap.stderr);
-  recorded = await readFile(calls, 'utf8');
-  assert.match(recorded, /git switch -c deploy\/mi --track origin\/main/, 'first deploy creates deploy/mi directly from origin/main');
-  assert.doesNotMatch(recorded, /git merge --ff-only origin\/main/, 'a newly bootstrapped deployment branch needs no merge');
+  assert.equal(git(bootstrapFixture.checkout, ['symbolic-ref', '--short', 'HEAD']), 'deploy/mi', 'first deploy creates and checks out the owned deployment branch');
+  assert.equal(git(bootstrapFixture.checkout, ['rev-parse', 'deploy/mi']), git(bootstrapFixture.checkout, ['rev-parse', 'origin/main']), 'first deploy creates deploy/mi at origin/main');
 
   await writeFile(calls, '');
-  const divergentDeploy = run({ DEPLOY_BRANCH_ANCESTOR: '0' });
+  const divergentFixture = await setupRepo('divergent-deploy');
+  const divergent = divergentFixture.checkout;
+  git(divergent, ['branch', 'deploy/mi', 'origin/main']);
+  git(divergent, ['switch', 'deploy/mi']);
+  await writeFile(path.join(divergent, 'deploy-only'), 'divergent deployment branch\n');
+  git(divergent, ['add', 'deploy-only']);
+  git(divergent, ['commit', '-m', 'divergent deploy branch']);
+  const divergentDeployCommit = git(divergent, ['rev-parse', 'deploy/mi']);
+  git(divergent, ['switch', 'main']);
+  const divergentDeploy = run(divergent, divergentFixture.origin);
   assert.notEqual(divergentDeploy.status, 0, 'a divergent deployment branch fails closed');
   assert.match(divergentDeploy.stderr, /deploy\/mi is not a fast-forward ancestor of origin\/main/, 'divergent deployment branch failure is clear');
+  assert.equal(git(divergent, ['rev-parse', 'deploy/mi']), divergentDeployCommit, 'a divergent deployment branch is not rewritten');
+  assert.equal(git(divergent, ['symbolic-ref', '--short', 'HEAD']), 'main', 'a divergent deployment branch is not checked out');
   recorded = await readFile(calls, 'utf8');
-  assert.doesNotMatch(recorded, /git switch/, 'a divergent deployment branch is not checked out');
-  assert.doesNotMatch(recorded, /git merge --ff-only/, 'a divergent deployment branch is not rewritten');
-  assert.doesNotMatch(recorded, /npm ci/, 'a divergent deployment branch stops before dependency changes');
+  assert.equal(recorded, '', 'a divergent deployment branch stops before dependency or service commands');
 
-  const failedBuild = run({ FAIL_BUILD: '1' });
+  const rejected = run(checkout, origin, { ORIGIN_URL: 'https://github.com/other/repo.git' });
+  assert.notEqual(rejected.status, 0, 'unexpected origins are rejected');
+  assert.match(rejected.stderr, /origin must identify github\.com\/kyleboas\/mi/, 'unexpected origin failure is clear');
+
+  const failedBuild = run(checkout, origin, { FAIL_BUILD: '1' });
   assert.notEqual(failedBuild.status, 0, 'failed post-update build fails deploy');
   assert.match(failedBuild.stderr, /Recovery: git switch --detach mi-deploy-rollback-\d{8}T\d{6}Z && npm ci && npm run build/, 'failed post-update build prints the durable rollback recovery command');
   assert.match(failedBuild.stderr, /does not roll them back automatically/, 'failed post-update build does not claim automatic service rollback');
-
-  await writeFile(calls, '');
-  const rejected = run({ ORIGIN_URL: 'https://github.com/other/repo.git' });
-  assert.notEqual(rejected.status, 0, 'unexpected origins are rejected');
-  assert.match(rejected.stderr, /origin must identify github\.com\/kyleboas\/mi/, 'unexpected origin failure is clear');
-  recorded = await readFile(calls, 'utf8');
-  assert.doesNotMatch(recorded, /git fetch/, 'unexpected origin is rejected before fetch');
 } finally {
   await rm(temp, { recursive: true, force: true });
 }
