@@ -12,6 +12,7 @@ import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
 import { logEvent } from '../dist/src/state.js';
+import { AI_DISCLOSURE, createTwilioVoiceBackend, validateTwilioSignature } from '../dist/src/twilio-voice.js';
 import { workerCompletionInstruction } from './mi-worker-completion.mjs';
 
 import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
@@ -81,6 +82,8 @@ const loopDiscoveryStatePath = process.env.MI_LOOP_DISCOVERY_STATE_PATH || path.
 const loopFactoryStatePath = process.env.MI_LOOP_FACTORY_STATE_PATH || path.join(home, '.pi', 'agent', 'state', 'loop-factory.json');
 const loopFactoryNotesPath = process.env.MI_LOOP_FACTORY_NOTES_PATH || path.join(home, 'NOTES.md');
 const loopFactoryWorkflowsDir = process.env.MI_LOOP_FACTORY_WORKFLOWS_DIR || path.join(home, 'workflows');
+const twilioVoiceEnabled = /^(1|true|yes|on)$/i.test(process.env.MI_TWILIO_ENABLED || '');
+const twilioVoice = createTwilioVoiceBackend();
 
 let sendQueue = Promise.resolve();
 const activeJobs = new Map();
@@ -217,7 +220,7 @@ async function readMessages(threadId = defaultThread, limit = 150) {
   }
 }
 
-async function readJsonBody(req, maxBytes = 64 * 1024) {
+async function readRequestText(req, maxBytes = 64 * 1024) {
   const chunks = [];
   let total = 0;
   for await (const chunk of req) {
@@ -225,8 +228,18 @@ async function readJsonBody(req, maxBytes = 64 * 1024) {
     if (total > maxBytes) throw new Error('request too large');
     chunks.push(chunk);
   }
-  const raw = Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readJsonBody(req, maxBytes = 64 * 1024) {
+  const raw = await readRequestText(req, maxBytes);
   return raw ? JSON.parse(raw) : {};
+}
+
+async function readTwilioForm(req) {
+  const raw = await readRequestText(req, 64 * 1024);
+  const params = Object.fromEntries(new URLSearchParams(raw).entries());
+  return params;
 }
 
 function extensionForMime(mimeType) {
@@ -280,6 +293,33 @@ function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') 
     'Cache-Control': 'no-store',
   });
   res.end(body);
+}
+
+function sendTwiml(res, status, body) {
+  return sendText(res, status, body, 'text/xml; charset=utf-8');
+}
+
+async function handleTwilioWebhook(req, res, url) {
+  if (!twilioVoiceEnabled) return sendJson(res, 404, { ok: false, error: 'Twilio voice is disabled' });
+  if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST required' });
+  const params = await readTwilioForm(req);
+  const pathname = url.pathname;
+  const signature = String(req.headers['x-twilio-signature'] || '');
+  const callbackUrl = twilioVoice.webhookUrl(pathname);
+  if (!callbackUrl || !validateTwilioSignature(callbackUrl, params, signature, twilioVoice.config.authToken)) return sendJson(res, 403, { ok: false, error: 'invalid Twilio signature' });
+  if (pathname === '/api/twilio/status') {
+    const callSid = String(params.CallSid || '');
+    const callStatus = String(params.CallStatus || '');
+    if (!callSid || !callStatus) return sendJson(res, 400, { ok: false, error: 'CallSid and CallStatus required' });
+    try {
+      return sendJson(res, 200, { ok: true, call: await twilioVoice.updateStatus(callSid, callStatus) });
+    } catch (error) {
+      return sendJson(res, 404, { ok: false, error: redact(error instanceof Error ? error.message : String(error)) });
+    }
+  }
+  // Calls use inline, approved TwiML so an unredacted script is never stored
+  // for later retrieval by this endpoint. Keep this route signed and inert.
+  return sendTwiml(res, 410, '<Response><Say>This voice webhook is not enabled for inline TwiML calls.</Say></Response>');
 }
 
 async function sendFile(res, filePath, contentType) {
@@ -1805,6 +1845,15 @@ function formatZonedTime(timeZone, label) {
 async function handle(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   try {
+    if (req.method === 'POST' && url.pathname === '/api/twilio/status') return await handleTwilioWebhook(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/api/twilio/voice') return await handleTwilioWebhook(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/api/twilio/confirmation') {
+      if (!twilioVoiceEnabled || !webMaintenance) return sendJson(res, 404, { ok: false, error: 'Twilio voice is disabled' });
+      const body = await readJsonBody(req);
+      if (body.confirm !== true) return sendJson(res, 400, { ok: false, error: 'final confirmation is required' });
+      const confirmation = await twilioVoice.createConfirmation({ to: body.to, purpose: body.purpose, script: body.script, disclosure: body.disclosure || AI_DISCLOSURE, userId: body.userId });
+      return sendJson(res, 201, { ok: true, confirmation });
+    }
     if (!webMaintenance && url.pathname !== '/api/health') return sendJson(res, 404, { ok: false, error: 'web maintenance mode is disabled' });
     if (req.method === 'GET' && url.pathname === '/') return sendText(res, 200, html, 'text/html; charset=utf-8');
     if (req.method === 'GET' && (url.pathname === '/favicon.jpg' || url.pathname === '/apple-touch-icon.png')) return sendFile(res, faviconPath, 'image/jpeg');

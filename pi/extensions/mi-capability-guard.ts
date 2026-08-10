@@ -34,7 +34,7 @@ type AuditRecord = {
 
 type ToolRequest = { right: Right; resource: string; path?: string };
 
-const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate']);
+const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate', 'mi_twilio_voice']);
 const DIVER_NOTES_READ_OPERATIONS = new Set(['tasks.list', 'notes.list', 'projects.list', 'project-tasks.list']);
 const DIVER_NOTES_WRITE_OPERATIONS = new Set(['tasks.add', 'tasks.complete', 'tasks.reopen', 'notes.add', 'projects.ensure', 'project-tasks.add', 'project-tasks.complete', 'project-tasks.reopen', 'project-subtasks.add', 'project-subtasks.complete', 'project-subtasks.reopen']);
 const BLOCKED_ORCHESTRATOR_TOOLS = new Set(['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover']);
@@ -153,7 +153,10 @@ function requestForTool(toolName: string, input: any, cwd: string): ToolRequest 
 }
 
 function extensionDecision(toolName: string) {
-  if (ALLOWED_MI_EXTENSION_TOOLS.has(toolName) && process.env.MI_COORDINATOR_MODE === '1' && process.env.MI_COORDINATOR_POLICY_FILE) {
+  if (toolName === 'mi_twilio_voice' && process.env.MI_TWILIO_TOOL_ENABLED === '1') {
+    return { allowed: true, reason: 'reviewed Mi Twilio voice tool; final confirmation is enforced by the backend' };
+  }
+  if (toolName === 'mi_orchestrator_delegate' && ALLOWED_MI_EXTENSION_TOOLS.has(toolName) && process.env.MI_COORDINATOR_MODE === '1' && process.env.MI_COORDINATOR_POLICY_FILE) {
     return { allowed: true, reason: 'reviewed Mi coordinator adapter' };
   }
   if (BLOCKED_ORCHESTRATOR_TOOLS.has(toolName)) return { allowed: false, reason: 'global orchestrator controls are not available to Mi; use the reviewed Mi adapter' };
