@@ -20,6 +20,9 @@ export default function miTwilio(pi: ExtensionAPI) {
     description: 'Initiate one approved outbound Twilio call. Requires a final, unexpired, single-use confirmation bound to every call detail; never records or transcribes.',
     parameters: inputSchema,
     async execute(_toolCallId, params) {
+      if (process.env.MI_CAPABILITY_PROFILE !== 'mi-main-orchestrator' || process.env.MI_TWILIO_TOOL_ENABLED !== '1' || process.env.MI_TWILIO_ENABLED !== '1') {
+        return { content: [{ type: 'text', text: 'Twilio voice is not enabled for this capability profile.' }], details: { failed: true } };
+      }
       try {
         const result = await createTwilioVoiceBackend().initiate(params as any);
         return { content: [{ type: 'text', text: JSON.stringify(result) }], details: result };

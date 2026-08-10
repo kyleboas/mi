@@ -11,6 +11,7 @@ type FetchLike = (input: string, init?: { method?: string; headers?: Record<stri
 type Clock = () => Date;
 
 type VoiceConfig = {
+  enabled: boolean;
   accountSid: string;
   apiKeySid: string;
   apiKeySecret: string;
@@ -89,6 +90,9 @@ const DEFAULT_CONFIRMATION_TTL_MS = 5 * 60_000;
 const LOCK_STALE_MS = 30_000;
 const COUNTRY_CODES = ['358', '357', '351', '353', '350', '34', '33', '32', '31', '30', '27', '20', '7', '1', '44', '49', '39', '41', '43', '45', '46', '47', '48', '52', '53', '54', '55', '56', '57', '58', '60', '61', '62', '63', '64', '65', '66', '81', '82', '84', '86', '90', '91', '92', '93', '94', '95', '98', '212', '213', '216', '218', '220', '221', '222', '223', '224', '225', '226', '227', '228', '229', '230', '231', '232', '233', '234', '235', '236', '237', '238', '239', '240', '241', '242', '243', '244', '245', '246', '248', '249', '250', '251', '252', '253', '254', '255', '256', '257', '258', '260', '261', '262', '263', '264', '265', '266', '267', '268', '269', '290', '291', '297', '298', '299', '350', '351', '352', '353', '354', '355', '356', '357', '358', '359', '370', '371', '372', '373', '374', '375', '376', '377', '378', '380', '381', '382', '383', '385', '386', '387', '389', '420', '421', '423', '500', '501', '502', '503', '504', '505', '506', '507', '508', '509', '590', '591', '592', '593', '594', '595', '596', '597', '598', '599', '670', '672', '673', '674', '675', '676', '677', '678', '679', '680', '681', '682', '683', '685', '686', '687', '688', '689', '690', '691', '692', '700', '701', '702', '703', '704', '705', '706', '707', '708', '709', '710', '711', '712', '713', '714', '715', '716', '717', '718', '719', '720', '721', '722', '723', '724', '725', '726', '727', '728', '729', '730', '731', '732', '733', '734', '735', '736', '737', '738', '739', '740', '741', '742', '743', '744', '745', '746', '747', '748', '749', '750', '751', '752', '753', '754', '755', '756', '757', '758', '759', '760', '761', '762', '763', '764', '765', '766', '767', '768', '770', '771', '772', '773', '774', '775', '800', '808', '809', '850', '855', '856', '857', '858', '859', '870', '878', '880', '881', '882', '883', '886', '888', '960', '961', '962', '963', '964', '965', '966', '967', '968', '970', '971', '972', '973', '974', '975', '976', '977', '992', '993', '994', '995', '996', '998'];
 
+const DEFAULT_PROHIBITED_PREFIXES = ['+1900', '+1976', '+1979', '+979'];
+const EMERGENCY_CODES = ['000', '110', '111', '112', '118', '119', '911', '997', '998', '999'];
+
 function listEnv(env: NodeJS.ProcessEnv, key: string, fallback: string[]) {
   const value = String(env[key] || '').trim();
   return value ? value.split(',').map((item) => item.trim()).filter(Boolean) : fallback;
@@ -112,22 +116,51 @@ function phoneCountryCode(number: string) {
   return [...COUNTRY_CODES].sort((a, b) => b.length - a.length).find((code) => number.slice(1).startsWith(code)) || '';
 }
 
-export function isProhibitedServiceNumber(number: string, prohibitedPrefixes = ['+1900', '+1976', '+1979', '+979']) {
+function isPublicHostname(hostname: string) {
+  const host = hostname.toLowerCase().replace(/\.$/u, '');
+  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal') || host === '::1' || host === '[::1]' || host === '127.0.0.1') return false;
+  if (/^(?:0|10|127)\.(?:\d{1,3}\.){2}\d{1,3}$/u.test(host) || /^(?:fc|fd|fe8|fe9|fea|feb)[0-9a-f]*:/iu.test(host.replace(/^\[|\]$/gu, ''))) return false;
+  if (/^192\.168\.(?:\d{1,3}\.)?\d{1,3}$/u.test(host) || /^169\.254\.(?:\d{1,3}\.){2}\d{1,3}$/u.test(host) || /^172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3}$/u.test(host) || /^100\.(?:6[4-9]|[78]\d)\.(?:\d{1,3}\.)\d{1,3}$/u.test(host)) return false;
+  return true;
+}
+
+function validateWebhookBaseUrl(value: string, environment: string) {
+  if (!value) {
+    if (environment === 'production') throw new Error('production Twilio voice requires a public HTTPS webhook URL and auth token');
+    return;
+  }
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { throw new Error('Twilio webhook URL is malformed'); }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash || !parsed.hostname) throw new Error('Twilio webhook URL is unsafe');
+  if (environment === 'production') {
+    if (parsed.protocol !== 'https:' || !isPublicHostname(parsed.hostname)) throw new Error('production Twilio voice requires a public HTTPS webhook URL and auth token');
+  } else if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname.toLowerCase()))) {
+    throw new Error('development Twilio webhook URL must be HTTPS or loopback HTTP');
+  }
+}
+
+export function isProhibitedServiceNumber(number: string, prohibitedPrefixes = DEFAULT_PROHIBITED_PREFIXES) {
+  const compact = typeof number === 'string' ? `+${number.trim().replace(/^\+/u, '').replace(/[ ()-]/g, '')}` : '';
+  // Emergency short codes are not E.164 numbers, so check them before the
+  // normalizer rejects short destinations. Also reject country-code forms
+  // whose national number is an emergency/service code.
+  const digits = compact.slice(1);
+  if (EMERGENCY_CODES.includes(digits) || COUNTRY_CODES.some((code) => digits.startsWith(code) && EMERGENCY_CODES.includes(digits.slice(code.length)))) return true;
   const normalized = normalizeE164(number);
   if (prohibitedPrefixes.some((prefix) => /^\+\d+$/u.test(prefix) && normalized.startsWith(prefix))) return true;
-  if (normalized === '+911' || normalized === '+112' || normalized === '+999' || normalized === '+000') return true;
-  // Block common emergency/service suffixes in NANP destinations. This is
-  // intentionally conservative: a call tool should fail closed.
-  if (normalized.startsWith('+1') && ['911', '112', '999', '000', '988'].some((suffix) => normalized.endsWith(suffix))) return true;
+  // NANP emergency/service codes can be embedded in a valid local number;
+  // fail closed for the known suffixes rather than relying on a short code.
+  if (normalized.startsWith('+1') && ['000', '112', '911', '988', '999'].some((suffix) => normalized.slice(2).endsWith(suffix))) return true;
   return false;
 }
 
 function validateDestination(number: string, config: VoiceConfig) {
   const normalized = normalizeE164(number);
-  const premium = config.prohibitedPrefixes.some((prefix) => /^\+\d+$/u.test(prefix) && normalized.startsWith(prefix));
-  if (premium) {
+  if (isProhibitedServiceNumber(normalized, DEFAULT_PROHIBITED_PREFIXES)) throw new Error('destination is a prohibited service number');
+  const customPremium = config.prohibitedPrefixes.some((prefix) => !DEFAULT_PROHIBITED_PREFIXES.includes(prefix) && /^\+\d+$/u.test(prefix) && normalized.startsWith(prefix));
+  if (customPremium) {
     if (!config.allowPremium || !config.allowedPremiumPrefixes.some((prefix) => normalized.startsWith(prefix))) throw new Error('premium-rate destination is not configured');
-  } else if (isProhibitedServiceNumber(normalized, config.prohibitedPrefixes)) {
+  } else if (isProhibitedServiceNumber(normalized, config.prohibitedPrefixes.filter((prefix) => !DEFAULT_PROHIBITED_PREFIXES.includes(prefix)))) {
     throw new Error('destination is a prohibited service number');
   }
   const country = phoneCountryCode(normalized);
@@ -181,6 +214,7 @@ export function validateTwilioSignature(url: string, params: Record<string, stri
 
 export function loadTwilioVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConfig {
   return {
+    enabled: /^(1|true|yes|on)$/iu.test(String(env.MI_TWILIO_ENABLED || '')),
     accountSid: String(env.TWILIO_ACCOUNT_SID || '').trim(),
     apiKeySid: String(env.TWILIO_API_KEY_SID || '').trim(),
     apiKeySecret: String(env.TWILIO_API_KEY_SECRET || '').trim(),
@@ -189,7 +223,7 @@ export function loadTwilioVoiceConfig(env: NodeJS.ProcessEnv = process.env): Voi
     webhookBaseUrl: String(env.MI_TWILIO_WEBHOOK_BASE_URL || '').trim().replace(/\/$/u, ''),
     environment: String(env.MI_TWILIO_ENV || 'development').trim().toLowerCase(),
     allowedCountryCodes: listEnv(env, 'MI_TWILIO_ALLOWED_COUNTRY_CODES', ['1']),
-    prohibitedPrefixes: listEnv(env, 'MI_TWILIO_PROHIBITED_PREFIXES', ['+1900', '+1976', '+1979', '+979']),
+    prohibitedPrefixes: [...new Set([...DEFAULT_PROHIBITED_PREFIXES, ...listEnv(env, 'MI_TWILIO_PROHIBITED_PREFIXES', [])])],
     allowedPremiumPrefixes: listEnv(env, 'MI_TWILIO_ALLOWED_PREMIUM_PREFIXES', []),
     allowPremium: /^(1|true|yes|on)$/iu.test(String(env.MI_TWILIO_ALLOW_PREMIUM || '')),
     maxScriptChars: numberEnv(env, 'MI_TWILIO_MAX_SCRIPT_CHARS', DEFAULT_SCRIPT_CHARS, 80, 4000),
@@ -270,8 +304,10 @@ export class TwilioVoiceBackend {
   }
 
   private validateSetup() {
+    if (!this.config.enabled) throw new Error('Twilio voice is disabled');
     if (!this.config.accountSid || !this.config.apiKeySid || !this.config.apiKeySecret || !this.config.fromNumber) throw new Error('Twilio voice configuration is incomplete');
-    if (this.config.environment === 'production' && (!this.config.webhookBaseUrl || !this.config.webhookBaseUrl.startsWith('https://') || !this.config.authToken)) throw new Error('production Twilio voice requires a public HTTPS webhook URL and auth token');
+    validateWebhookBaseUrl(this.config.webhookBaseUrl, this.config.environment);
+    if (this.config.environment === 'production' && !this.config.authToken) throw new Error('production Twilio voice requires a public HTTPS webhook URL and auth token');
     const from = normalizeE164(this.config.fromNumber);
     if (isProhibitedServiceNumber(from)) throw new Error('configured from-number is prohibited');
   }
@@ -301,12 +337,24 @@ export class TwilioVoiceBackend {
     const hashes = detailHashes(details);
     let record: CallRecord | undefined;
     let reused = false;
+    let retryPending = false;
     const createdAt = this.clock();
     await withStore(this.file, async (store) => {
       const duplicate = store.calls.find((item) => item.idempotencyKey === idempotencyKey);
       if (duplicate) {
         if (!sameDetails(duplicate, hashes)) throw new Error('idempotency key is bound to different call details');
-        record = duplicate; reused = true; return;
+        record = duplicate;
+        // A crash can occur after Twilio accepted the idempotent request but
+        // before its response was persisted. Retry the same request/key so
+        // Twilio reconciles it to the original call instead of leaving the
+        // confirmation permanently consumed. Failed transport attempts are
+        // likewise retryable with the same exact details.
+        if (duplicate.callSid || !['pending', 'failed'].includes(duplicate.status)) { reused = true; return; }
+        duplicate.status = 'pending';
+        duplicate.outcome = undefined;
+        duplicate.updatedAt = createdAt.toISOString();
+        retryPending = true;
+        return;
       }
       const confirmation = store.confirmations.find((item) => item.id === input.confirmationId);
       if (!confirmation || Date.parse(confirmation.expiresAt) <= createdAt.getTime()) throw new Error('confirmation is missing or expired');
@@ -316,7 +364,7 @@ export class TwilioVoiceBackend {
       if (recent.filter((item) => item.userHash === hashes.userHash).length >= this.config.maxCallsPerUser) throw new Error('user call rate limit exceeded');
       if (recent.filter((item) => item.toHash === hashes.toHash).length >= this.config.maxCallsPerNumber) throw new Error('destination call rate limit exceeded');
       if (recent.length >= this.config.maxCallsPerAccount) throw new Error('account call rate limit exceeded');
-      if (store.calls.some((item) => item.toHash === hashes.toHash && !['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(item.status))) throw new Error('a call to this destination is already active');
+      if (!retryPending && store.calls.some((item) => item.toHash === hashes.toHash && !['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(item.status))) throw new Error('a call to this destination is already active');
       record = { id: randomUUID().replaceAll('-', ''), idempotencyKey, confirmationId: input.confirmationId, ...hashes, createdAt: createdAt.toISOString(), updatedAt: createdAt.toISOString(), status: 'pending' };
       confirmation.consumedBy = record.id;
       store.calls.unshift(record);

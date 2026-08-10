@@ -29,7 +29,7 @@ export async function createHermeticMiEnv(prefix = 'mi-test-') {
   await mkdir(miRoot, { recursive: true, mode: 0o700 });
   const privateExtensions = join(miRoot, 'pi', 'extensions');
   await mkdir(privateExtensions, { recursive: true, mode: 0o700 });
-  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-reviewed-paths.mjs']) {
+  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-reviewed-paths.mjs', 'mi-twilio.ts']) {
     await copyFile(repoPath('pi', 'extensions', file), join(privateExtensions, file));
   }
   await mkdir(join(miRoot, 'scripts'), { recursive: true, mode: 0o700 });
@@ -196,9 +196,10 @@ export async function httpJson(baseUrl, path, { method = 'GET', body, token, hea
 
 export async function startWebChat(env, { port = 0 } = {}) {
   const actualPort = port || 19000 + Math.floor(Math.random() * 20000);
+  const baseUrl = `http://127.0.0.1:${actualPort}`;
   const child = spawn(process.execPath, ['scripts/mi-web-chat.mjs'], {
     cwd: repoRoot,
-    env: { MI_WEB_MAINTENANCE: '1', ...env, MI_WEB_HOST: '127.0.0.1', MI_WEB_PORT: String(actualPort), MI_WEB_HTTPS_PORT: '0' },
+    env: { MI_WEB_MAINTENANCE: '1', ...env, MI_WEB_ORIGIN: env.MI_WEB_ORIGIN || baseUrl, MI_WEB_HOST: '127.0.0.1', MI_WEB_PORT: String(actualPort), MI_WEB_HTTPS_PORT: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -206,7 +207,6 @@ export async function startWebChat(env, { port = 0 } = {}) {
   child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
   child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
   child.on('error', () => {});
-  const baseUrl = `http://127.0.0.1:${actualPort}`;
   await waitFor(async () => {
     try {
       const res = await fetch(`${baseUrl}/api/health`);

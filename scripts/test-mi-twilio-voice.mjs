@@ -21,6 +21,7 @@ const env = {
   TWILIO_API_KEY_SID: 'SKtest',
   TWILIO_API_KEY_SECRET: 'test-secret',
   TWILIO_AUTH_TOKEN: 'auth-token',
+  MI_TWILIO_ENABLED: '1',
   MI_TWILIO_FROM_NUMBER: '+15551234567',
   MI_TWILIO_WEBHOOK_BASE_URL: 'https://voice.example.test',
   MI_TWILIO_ENV: 'production',
@@ -48,8 +49,12 @@ assert.equal(normalizeE164('+1 (555) 123-4568'), '+15551234568');
 assert.throws(() => normalizeE164('15551234568'), /E\.164/);
 assert.equal(isProhibitedServiceNumber('+15551234911'), true);
 assert.equal(isProhibitedServiceNumber('+19005551234'), true);
+assert.equal(isProhibitedServiceNumber('+911'), true, 'domestic emergency short code is blocked before E.164 parsing');
+assert.equal(isProhibitedServiceNumber('+44999'), true, 'international emergency code is blocked');
+assert.equal(isProhibitedServiceNumber('+44112'), true, 'international emergency code is blocked');
 await assert.rejects(() => backend.createConfirmation({ to: '+15551234568', purpose: 'test', script: 'hello', disclosure: 'This is a caller.' }), /AI disclosure/);
 await assert.rejects(() => backend.createConfirmation({ to: '+447700900123', purpose: 'test', script: 'hello', disclosure: AI_DISCLOSURE }), /international/);
+await assert.rejects(() => backend.createConfirmation({ to: '+19005551234', purpose: 'premium', script: 'hello', disclosure: AI_DISCLOSURE }), /prohibited/);
 
 const confirmation = await backend.createConfirmation({ to: '+1 (555) 123-4568', purpose: 'Appointment reminder', script: 'Your appointment is tomorrow.', disclosure: AI_DISCLOSURE, userId: 'user-1' });
 assert.equal(confirmation.to, '+15551234568');
@@ -97,6 +102,28 @@ const storedAfterCall = await readFile(statePath, 'utf8');
 assert.equal(storedAfterCall.includes('+15551234568'), false);
 assert.equal(storedAfterCall.includes('Your appointment is tomorrow.'), false);
 assert.ok(events.some((event) => event.type === 'twilio.voice.initiated'));
+let retryCount = 0;
+const retryBackend = createTwilioVoiceBackend({
+  env,
+  statePath: join(root, 'retry.json'),
+  fetchImpl: async () => {
+    retryCount += 1;
+    if (retryCount === 1) throw new Error('response was lost');
+    return { ok: true, status: 201, async json() { return { sid: 'CA-reconciled' }; } };
+  },
+  paused: async () => false,
+  killed: async () => false,
+});
+const retryConfirmation = await retryBackend.createConfirmation({ to: '+15551234572', purpose: 'Recover', script: 'AI assistant recovery call.', disclosure: AI_DISCLOSURE });
+await assert.rejects(() => retryBackend.initiate({ confirmationId: retryConfirmation.confirmationId, idempotencyKey: 'recover-1', to: '+15551234572', purpose: 'Recover', script: 'AI assistant recovery call.', disclosure: AI_DISCLOSURE }), /response was lost/);
+const reconciled = await retryBackend.initiate({ confirmationId: retryConfirmation.confirmationId, idempotencyKey: 'recover-1', to: '+15551234572', purpose: 'Recover', script: 'AI assistant recovery call.', disclosure: AI_DISCLOSURE });
+assert.equal(reconciled.callSid, 'CA-reconciled', 'same idempotency key reconciles a pending/failed record after a lost response');
+
+const unsafeWebhook = createTwilioVoiceBackend({ env: { ...env, MI_TWILIO_WEBHOOK_BASE_URL: 'https://127.0.0.1/callback' }, statePath: join(root, 'unsafe-webhook.json') });
+await assert.rejects(() => unsafeWebhook.createConfirmation({ to: '+15551234568', purpose: 'x', script: 'AI assistant.', disclosure: AI_DISCLOSURE }), /public HTTPS/);
+const malformedWebhook = createTwilioVoiceBackend({ env: { ...env, MI_TWILIO_WEBHOOK_BASE_URL: 'not a url' }, statePath: join(root, 'malformed-webhook.json') });
+await assert.rejects(() => malformedWebhook.createConfirmation({ to: '+15551234568', purpose: 'x', script: 'AI assistant.', disclosure: AI_DISCLOSURE }), /malformed/);
+
 const paused = createTwilioVoiceBackend({ env, statePath: join(root, 'paused.json'), paused: async () => true, killed: async () => false });
 await assert.rejects(() => paused.initiate({ confirmationId: 'a'.repeat(32), idempotencyKey: 'paused', to: '+15551234568', purpose: 'x', script: 'x', disclosure: AI_DISCLOSURE }), /paused/);
 

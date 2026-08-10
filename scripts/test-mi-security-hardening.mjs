@@ -52,6 +52,10 @@ assert.match(capabilitySource, /'chat-read'[\s\S]*allowBash: false/, 'Capability
 assert.match(capabilitySource, /SAFE_ENV_ALLOWLIST/, 'Capability model must include env allowlisting');
 assert.match(guardSource, /toolName === 'bash'[\s\S]*right: 'execute'[\s\S]*resource: 'tool:\/\/bash'/, 'Capability guard must treat bash as an explicit execute capability');
 assert.match(guardSource, /ALLOWED_MI_EXTENSION_TOOLS[\s\S]*mi_orchestrator_delegate/, 'Capability guard must use an explicit reviewed extension-tool allowlist');
+assert.match(guardSource, /MI_CAPABILITY_PROFILE === 'mi-main-orchestrator'[\s\S]*MI_TWILIO_TOOL_ENABLED === '1'[\s\S]*MI_TWILIO_ENABLED === '1'/, 'Twilio tool requires the narrow orchestrator profile and both enablement gates');
+assert.match(daemonSource, /MI_TWILIO_EXTENSION[\s\S]*--extension/, 'daemon explicitly loads the reviewed Twilio extension');
+assert.match(webChatSource, /twilioConfirmationAuthorized\(req\)[\s\S]*x-mi-confirmation-csrf/, 'Twilio confirmation route authenticates and enforces CSRF');
+assert.match(webChatSource, /userId: auth\.userId/, 'Twilio confirmations bind ownership to authenticated identity');
 assert.match(guardSource, /unreviewed extension tool is denied/, 'Capability guard must deny unknown extension tools by default');
 assert.match(guardSource, /global orchestrator controls are not available to Mi/, 'Capability guard must deny unscoped global orchestrator controls');
 assert.match(daemonSource, /profile === "advisor-read"[\s\S]*--skill", advisorRoot/, 'advisor workers load only the reviewed skill explicitly after disabling discovery');

@@ -153,9 +153,10 @@ function requestForTool(toolName: string, input: any, cwd: string): ToolRequest 
 }
 
 function extensionDecision(toolName: string) {
-  if (toolName === 'mi_twilio_voice' && process.env.MI_TWILIO_TOOL_ENABLED === '1') {
-    return { allowed: true, reason: 'reviewed Mi Twilio voice tool; final confirmation is enforced by the backend' };
+  if (toolName === 'mi_twilio_voice' && process.env.MI_CAPABILITY_PROFILE === 'mi-main-orchestrator' && process.env.MI_TWILIO_TOOL_ENABLED === '1' && process.env.MI_TWILIO_ENABLED === '1') {
+    return { allowed: true, reason: 'reviewed Mi Twilio voice tool; orchestrator profile and backend enablement are both required' };
   }
+  if (toolName === 'mi_twilio_voice') return { allowed: false, reason: 'Twilio voice requires the reviewed Mi orchestrator profile, MI_TWILIO_TOOL_ENABLED=1, and MI_TWILIO_ENABLED=1' };
   if (toolName === 'mi_orchestrator_delegate' && ALLOWED_MI_EXTENSION_TOOLS.has(toolName) && process.env.MI_COORDINATOR_MODE === '1' && process.env.MI_COORDINATOR_POLICY_FILE) {
     return { allowed: true, reason: 'reviewed Mi coordinator adapter' };
   }

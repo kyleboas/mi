@@ -83,6 +83,11 @@ const loopFactoryStatePath = process.env.MI_LOOP_FACTORY_STATE_PATH || path.join
 const loopFactoryNotesPath = process.env.MI_LOOP_FACTORY_NOTES_PATH || path.join(home, 'NOTES.md');
 const loopFactoryWorkflowsDir = process.env.MI_LOOP_FACTORY_WORKFLOWS_DIR || path.join(home, 'workflows');
 const twilioVoiceEnabled = /^(1|true|yes|on)$/i.test(process.env.MI_TWILIO_ENABLED || '');
+const twilioConfirmationToken = String(process.env.MI_TWILIO_CONFIRMATION_TOKEN || webhookToken).trim();
+const twilioConfirmationUserId = String(process.env.MI_TWILIO_CONFIRMATION_USER_ID || 'mi-web').trim();
+const twilioConfirmationOrigin = String(process.env.MI_WEB_ORIGIN || `http://${host}:${port}`).trim().replace(/\/$/u, '');
+const twilioConfirmationCsrfToken = String(process.env.MI_WEB_CSRF_TOKEN || 'mi-web-confirmation').trim();
+const usedTwilioConfirmationNonces = new Map();
 const twilioVoice = createTwilioVoiceBackend();
 
 let sendQueue = Promise.resolve();
@@ -284,6 +289,23 @@ function webhookAuthorized(req) {
   if (!webhookToken) return false;
   const auth = String(req.headers.authorization || '');
   return auth === `Bearer ${webhookToken}`;
+}
+
+function twilioConfirmationAuthorized(req) {
+  if (!twilioConfirmationToken) return { status: 401, error: 'unauthorized' };
+  if (String(req.headers.authorization || '') !== `Bearer ${twilioConfirmationToken}`) return { status: 401, error: 'unauthorized' };
+  let origin;
+  try { origin = new URL(String(req.headers.origin || '')).origin; } catch { return { status: 403, error: 'CSRF protection requires a valid same-origin request' }; }
+  if (origin !== twilioConfirmationOrigin) return { status: 403, error: 'cross-origin confirmation request rejected' };
+  if (String(req.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return { status: 403, error: 'cross-site confirmation request rejected' };
+  if (String(req.headers['x-mi-confirmation-csrf'] || '') !== twilioConfirmationCsrfToken) return { status: 403, error: 'CSRF token required' };
+  const nonce = String(req.headers['x-mi-confirmation-nonce'] || '').trim();
+  if (!/^[A-Za-z0-9._:-]{16,160}$/u.test(nonce)) return { status: 403, error: 'confirmation request nonce required' };
+  const nowMs = Date.now();
+  for (const [key, expiresAt] of usedTwilioConfirmationNonces) if (expiresAt <= nowMs) usedTwilioConfirmationNonces.delete(key);
+  if (usedTwilioConfirmationNonces.has(nonce)) return { status: 409, error: 'confirmation request replay rejected' };
+  usedTwilioConfirmationNonces.set(nonce, nowMs + 10 * 60_000);
+  return { userId: twilioConfirmationUserId };
 }
 
 function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') {
@@ -1849,9 +1871,12 @@ async function handle(req, res) {
     if (req.method === 'POST' && url.pathname === '/api/twilio/voice') return await handleTwilioWebhook(req, res, url);
     if (req.method === 'POST' && url.pathname === '/api/twilio/confirmation') {
       if (!twilioVoiceEnabled || !webMaintenance) return sendJson(res, 404, { ok: false, error: 'Twilio voice is disabled' });
+      const auth = twilioConfirmationAuthorized(req);
+      if (auth.status) return sendJson(res, auth.status, { ok: false, error: auth.error });
       const body = await readJsonBody(req);
       if (body.confirm !== true) return sendJson(res, 400, { ok: false, error: 'final confirmation is required' });
-      const confirmation = await twilioVoice.createConfirmation({ to: body.to, purpose: body.purpose, script: body.script, disclosure: body.disclosure || AI_DISCLOSURE, userId: body.userId });
+      if (body.userId !== undefined && body.userId !== auth.userId) return sendJson(res, 403, { ok: false, error: 'confirmation identity does not match the authenticated user' });
+      const confirmation = await twilioVoice.createConfirmation({ to: body.to, purpose: body.purpose, script: body.script, disclosure: body.disclosure || AI_DISCLOSURE, userId: auth.userId });
       return sendJson(res, 201, { ok: true, confirmation });
     }
     if (!webMaintenance && url.pathname !== '/api/health') return sendJson(res, 404, { ok: false, error: 'web maintenance mode is disabled' });

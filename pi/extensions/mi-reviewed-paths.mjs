@@ -9,7 +9,7 @@ function checkedRealPath(value, label) {
   try { return realpathSync(value); } catch { throw new Error(`${label} is unavailable`); }
 }
 
-export function reviewedMiExtensionPaths({ root, daemonPath, capabilityGuardPath, capabilityAdapterPath, diverNotesPath, requireDaemon = false, requireGuard = false, requireAdapter = false, requireDiverNotes = false } = {}) {
+export function reviewedMiExtensionPaths({ root, daemonPath, capabilityGuardPath, capabilityAdapterPath, diverNotesPath, twilioPath, requireDaemon = false, requireGuard = false, requireAdapter = false, requireDiverNotes = false, requireTwilio = false } = {}) {
   const canonicalRoot = checkedRealPath(root, 'Mi root');
   if (!statSync(canonicalRoot).isDirectory()) throw new Error('Mi root is not a directory');
   const expectedExtensionRoot = join(canonicalRoot, 'pi', 'extensions');
@@ -34,5 +34,6 @@ export function reviewedMiExtensionPaths({ root, daemonPath, capabilityGuardPath
     capabilityGuardPath: verify(capabilityGuardPath, 'mi-capability-guard.ts', 'Mi capability guard', requireGuard),
     capabilityAdapterPath: verify(capabilityAdapterPath, 'mi-orchestrator-adapter.ts', 'Mi capability adapter', requireAdapter),
     diverNotesPath: verify(diverNotesPath, 'mi-diver-notes.ts', 'Mi Diver Notes extension', requireDiverNotes),
+    twilioPath: verify(twilioPath, 'mi-twilio.ts', 'Mi Twilio extension', requireTwilio),
   };
 }

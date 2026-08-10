@@ -68,7 +68,7 @@ npm test
 
 # Mi runs from this reviewed tree. Never copy Mi files into Pi's global
 # auto-load directory.
-for file in pi/extensions/mi-daemon.mjs pi/extensions/mi-capability-guard.ts pi/extensions/mi-orchestrator-adapter.ts pi/extensions/mi.ts; do
+for file in pi/extensions/mi-daemon.mjs pi/extensions/mi-capability-guard.ts pi/extensions/mi-orchestrator-adapter.ts pi/extensions/mi-twilio.ts pi/extensions/mi.ts; do
   [[ -f "$file" ]] || { echo "Missing reviewed Mi file: $file" >&2; exit 1; }
 done
 
