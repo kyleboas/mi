@@ -49,12 +49,15 @@ assert.equal(normalizeE164('+1 (555) 123-4568'), '+15551234568');
 assert.throws(() => normalizeE164('15551234568'), /E\.164/);
 assert.equal(isProhibitedServiceNumber('+15551234911'), true);
 assert.equal(isProhibitedServiceNumber('+19005551234'), true);
+assert.equal(isProhibitedServiceNumber('+97912345678'), true, 'international premium prefix remains mandatory');
 assert.equal(isProhibitedServiceNumber('+911'), true, 'domestic emergency short code is blocked before E.164 parsing');
 assert.equal(isProhibitedServiceNumber('+44999'), true, 'international emergency code is blocked');
 assert.equal(isProhibitedServiceNumber('+44112'), true, 'international emergency code is blocked');
 await assert.rejects(() => backend.createConfirmation({ to: '+15551234568', purpose: 'test', script: 'hello', disclosure: 'This is a caller.' }), /AI disclosure/);
 await assert.rejects(() => backend.createConfirmation({ to: '+447700900123', purpose: 'test', script: 'hello', disclosure: AI_DISCLOSURE }), /international/);
 await assert.rejects(() => backend.createConfirmation({ to: '+19005551234', purpose: 'premium', script: 'hello', disclosure: AI_DISCLOSURE }), /prohibited/);
+const augmentedProtection = createTwilioVoiceBackend({ env: { ...env, MI_TWILIO_PROHIBITED_PREFIXES: '+1555', MI_TWILIO_ALLOW_PREMIUM: '1', MI_TWILIO_ALLOWED_PREMIUM_PREFIXES: '+1555' }, statePath: join(root, 'augmented-protection.json') });
+await assert.rejects(() => augmentedProtection.createConfirmation({ to: '+19005551234', purpose: 'premium', script: 'hello', disclosure: AI_DISCLOSURE }), /prohibited/, 'custom prefixes must not replace mandatory defaults');
 
 const confirmation = await backend.createConfirmation({ to: '+1 (555) 123-4568', purpose: 'Appointment reminder', script: 'Your appointment is tomorrow.', disclosure: AI_DISCLOSURE, userId: 'user-1' });
 assert.equal(confirmation.to, '+15551234568');
