@@ -73,7 +73,10 @@ export class PiAgentsManager {
 
   private assertSafeCwd(options: StartOptions) {
     if (options.readOnly) return;
-    const collision = this.list().find((agent) => agent.status === 'running' && !agent.readOnly && agent.cwd === options.cwd);
+    // A settled RPC session remains able to accept another prompt, so it is
+    // still a potential writer. Guard every live writable child, not merely a
+    // currently-streaming one.
+    const collision = this.list().find((agent) => this.processes.has(agent.id) && !agent.readOnly && agent.cwd === options.cwd);
     if (collision) throw new Error(`A write-capable Pi Agent is already running in ${options.cwd} (${collision.name}). Use a git worktree, or start this agent read-only.`);
   }
 

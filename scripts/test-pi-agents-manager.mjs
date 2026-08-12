@@ -34,6 +34,7 @@ try {
   await assert.rejects(() => manager.start({ name: 'collision', cwd: root, prompt: 'write' }), /write-capable Pi Agent/);
   await new Promise((resolve) => setTimeout(resolve, 180));
   assert.equal(manager.get(agent.id)?.status, 'complete');
+  await assert.rejects(() => manager.start({ name: 'settled-collision', cwd: root, prompt: 'write' }), /write-capable Pi Agent/);
   const reviewer = await manager.start({ name: 'review', cwd: root, prompt: 'review', readOnly: true });
   assert.equal(manager.get(reviewer.id)?.readOnly, true);
   await manager.stop(reviewer.id);
