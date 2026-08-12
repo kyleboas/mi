@@ -102,12 +102,12 @@ try {
 
   const guard = (handlers.get('tool_call') || [])[0];
   assert.ok(guard, 'the real capability guard is registered');
-  const blockedGlobal = await guard({ toolName: 'orchestrator_delegate', toolCallId: 'global-1', input: {} }, { cwd: workspace });
-  assert.equal(blockedGlobal?.block, true, 'a discovered global orchestrator tool cannot bypass the Mi guard');
+  for (const toolName of ['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover', 'unreviewed_worker_tool']) {
+    const allowed = await guard({ toolName, toolCallId: toolName, input: {} }, { cwd: workspace });
+    assert.equal(allowed, undefined, `${toolName} remains available as a normal Pi extension tool`);
+  }
   const allowedAdapter = await guard({ toolName: 'mi_orchestrator_delegate', toolCallId: 'adapter-1', input: {} }, { cwd: workspace });
-  assert.equal(allowedAdapter, undefined, 'only the reviewed Mi adapter is allowed through the guard');
-  const blockedUnknown = await guard({ toolName: 'unreviewed_worker_tool', toolCallId: 'unknown-1', input: {} }, { cwd: workspace });
-  assert.equal(blockedUnknown?.block, true, 'unknown extension tools fail closed');
+  assert.equal(allowedAdapter, undefined, 'the reviewed Mi adapter remains available through the guard');
   const allowedAdvisorRead = await guard({ toolName: 'read', toolCallId: 'advisor-read', input: { path: advisorReference } }, { cwd: workspace });
   assert.equal(allowedAdvisorRead, undefined, 'the exact trusted advisor skill and source registry are readable');
   const blockedOtherPi = await guard({ toolName: 'read', toolCallId: 'other-pi', input: { path: path.join(root, 'global', '.pi', 'extensions', 'evil.ts') } }, { cwd: workspace });

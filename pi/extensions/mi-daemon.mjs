@@ -1528,8 +1528,9 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
   const advisorRoot = profile === "advisor-read" ? trustedAdvisorSkillRoot() : "";
   const grantsFile = env.MI_CAPABILITY_GRANTS_FILE || writeWorkerCapabilityGrantsFile(cwd, profile);
   const auditFile = env.MI_CAPABILITY_AUDIT_FILE || join(RUNTIME_DIR, "capability-audit.jsonl");
-  const tools = env.MI_CAPABILITY_TOOLS || env.MI_WORKER_TOOLS || (profile === "worker-write-scoped" ? "read,grep,find,ls,write,edit" : "read,grep,find,ls");
-  const args = ["--mode", "rpc", "--model", model, "--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--tools", tools];
+  // Keep normal Pi extension discovery enabled. The capability guard below
+  // governs built-in tool access through the grants passed to this worker.
+  const args = ["--mode", "rpc", "--model", model, "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes"];
   // --no-skills blocks every discovered global/project skill. Pi still loads
   // this one reviewed root through the explicit additive --skill flag.
   if (advisorRoot) args.push("--skill", advisorRoot);

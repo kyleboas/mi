@@ -74,8 +74,8 @@ try {
   const daemonSource = await readFile(new URL('../pi/extensions/mi-daemon.mjs', import.meta.url), 'utf8');
   const adapterSource = await readFile(new URL('../pi/extensions/mi-orchestrator-adapter.ts', import.meta.url), 'utf8');
   const webSource = await readFile(new URL('./mi-web-chat.mjs', import.meta.url), 'utf8');
-  assert.match(daemonSource, /"--no-extensions"/, 'restricted child workers still suppress ambient extensions');
-  assert.match(daemonSource, /"--extension", MI_CAPABILITY_GUARD/, 'restricted child workers explicitly retain the Mi capability guard');
+  assert.doesNotMatch(daemonSource, /"--no-extensions"/, 'Mi background workers allow normal ambient extensions');
+  assert.match(daemonSource, /"--extension", MI_CAPABILITY_GUARD/, 'Mi background workers explicitly retain the Mi capability guard');
   assert.match(adapterSource, /capabilityProfile: 'advisor-read'/, 'reviewed adapter gives direct advisors a read-only profile');
   assert.match(adapterSource, /cwd: policy\.workspaceCwd[\s\S]*model: WORKERS\[worker\]/, 'reviewed adapter binds generic children to the policy cwd and model');
   assert.match(adapterSource, /advisorTask\(policy, advisor\)/, 'reviewed adapter binds each advisor task to the exact policy objective');

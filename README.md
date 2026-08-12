@@ -11,7 +11,7 @@ Everything else in this repo exists to support those surfaces.
 
 ## Capability-scoped workers
 
-Mi is moving toward capability-based execution. Scoped Pi workers now use explicit capability grant files, reduced environment variables, and the Mi capability guard extension. Read-only scoped workers default to `read,grep,find,ls`; raw host `bash` is denied by default and requires explicit approval or a future stronger sandbox. Flue remains for no-host/virtual agents until scoped host mounts and child-task tool attenuation exist.
+Mi is moving toward capability-based execution. Scoped Pi workers now use explicit capability grant files, reduced environment variables, normal Pi extension discovery, and the Mi capability guard extension. Built-in filesystem and command access is governed by grants; raw host `bash` is denied by default and requires explicit approval or a future stronger sandbox. Flue remains for no-host/virtual agents until scoped host mounts and child-task tool attenuation exist.
 
 ## Install from Git
 

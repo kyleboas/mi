@@ -6,8 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 /**
  * Mi capability guard for scoped Pi workers and coordinators.
  *
- * Every tool must be explicitly known here. A newly installed extension tool
- * therefore starts denied instead of silently gaining Mi's sender authority.
+ * Built-in filesystem and command tools are governed by grants below. Normal Pi
+ * extensions remain usable; sensitive Mi integrations keep their own gates.
  */
 
 type Right = 'read' | 'write' | 'execute' | 'fetch' | 'exchange';
@@ -37,7 +37,6 @@ type ToolRequest = { right: Right; resource: string; path?: string };
 const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate', 'mi_twilio_voice']);
 const DIVER_NOTES_READ_OPERATIONS = new Set(['tasks.list', 'notes.list', 'projects.list', 'project-tasks.list']);
 const DIVER_NOTES_WRITE_OPERATIONS = new Set(['tasks.add', 'tasks.complete', 'tasks.reopen', 'notes.add', 'projects.ensure', 'project-tasks.add', 'project-tasks.complete', 'project-tasks.reopen', 'project-subtasks.add', 'project-subtasks.complete', 'project-subtasks.reopen']);
-const BLOCKED_ORCHESTRATOR_TOOLS = new Set(['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover']);
 const PROTECTED_PATH_NAMES = new Set(['.git', '.pi', '.config', '.ssh', 'node_modules', 'state', 'secrets', 'credentials', 'config']);
 
 function readGrants(): Grant[] {
@@ -160,8 +159,7 @@ function extensionDecision(toolName: string) {
   if (toolName === 'mi_orchestrator_delegate' && ALLOWED_MI_EXTENSION_TOOLS.has(toolName) && process.env.MI_COORDINATOR_MODE === '1' && process.env.MI_COORDINATOR_POLICY_FILE) {
     return { allowed: true, reason: 'reviewed Mi coordinator adapter' };
   }
-  if (BLOCKED_ORCHESTRATOR_TOOLS.has(toolName)) return { allowed: false, reason: 'global orchestrator controls are not available to Mi; use the reviewed Mi adapter' };
-  return { allowed: false, reason: `unreviewed extension tool is denied: ${toolName}` };
+  return { allowed: true, reason: `normal Pi extension tool is available: ${toolName}` };
 }
 
 export default function miCapabilityGuard(pi: ExtensionAPI) {

@@ -95,6 +95,11 @@ try {
   assert.deepEqual(coordinator.args.filter((entry) => entry === '--extension'), ['--extension', '--extension', '--extension'], 'the coordinator adds exactly three reviewed extensions');
   assert.deepEqual(coordinator.args.slice(-6), ['--extension', guard, '--extension', adapter, '--extension', diverNotes], 'the coordinator loads only the reviewed private extensions');
 
+  const daemonSource = await readFile(path.join(repo, 'pi/extensions/mi-daemon.mjs'), 'utf8');
+  assert.doesNotMatch(daemonSource, /"--no-extensions"/, 'Mi background workers allow normal Pi extension discovery');
+  assert.doesNotMatch(daemonSource, /"--tools", tools/, 'Mi background workers do not filter extension tools with a global allowlist');
+  assert.match(daemonSource, /"--extension", MI_CAPABILITY_GUARD/, 'Mi background workers retain the capability guard');
+
   const packageJson = JSON.parse(await readFile(path.join(repo, 'package.json'), 'utf8'));
   const packageText = JSON.stringify(packageJson);
   assert.doesNotMatch(packageText, /\.pi\/agent\/extensions\/mi(?:\.ts|-daemon\.mjs|-capability-guard\.ts|-orchestrator-adapter\.ts)/, 'package settings cannot globally auto-load Mi');

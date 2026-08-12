@@ -37,10 +37,12 @@ assert.match(notifySource, /if \(!pushoverEnabled\(\)\) return \{ skipped: true 
 assert.match(webChatSource, /if \(!pushoverEnabled\(\)\) return false/, 'Mi web chat Pushover must be opt-in only');
 
 assert.match(daemonSource, /const SAFE_PI_ENV_KEYS = \[/, 'Mi daemon defines a reduced Pi worker env allowlist');
-assert.match(daemonSource, /--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--tools", tools/, 'Mi daemon worker RPC disables ambient context/resources and uses explicit tools');
+assert.match(daemonSource, /"--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes"\]/, 'Mi daemon worker RPC disables ambient context resources while retaining normal extensions');
+assert.doesNotMatch(daemonSource, /"--no-extensions"/, 'Mi daemon worker RPC allows normal Pi extension discovery');
+assert.doesNotMatch(daemonSource, /"--tools", tools/, 'Mi daemon worker RPC does not hide extension tools behind a global allowlist');
 assert.match(daemonSource, /"--extension", MI_CAPABILITY_GUARD/, 'Mi daemon worker RPC loads the Mi capability guard explicitly');
 assert.match(daemonSource, /env: reducedPiEnv\(\{ \.\.\.env, MI_CAPABILITY_PROFILE: profile, MI_CAPABILITY_GRANTS_FILE: grantsFile, MI_CAPABILITY_AUDIT_FILE: auditFile,/, 'Mi daemon worker RPC uses reduced env plus capability metadata');
-assert.match(daemonSource, /"read,grep,find,ls"/, 'Mi daemon worker RPC defaults to read/search tools without bash');
+assert.doesNotMatch(daemonSource, /MI_CAPABILITY_TOOLS|MI_WORKER_TOOLS/, 'Mi daemon worker RPC does not use a global tool allowlist');
 assert.match(daemonSource, /worker-write-scoped is only allowed inside the configured Mi workspace/, 'Mi daemon only allows scoped writable workers under its configured workspace');
 assert.match(daemonSource, /const MI_WORKFLOWS_DIR = realpathSync\(/, 'Mi daemon canonicalizes its one configured workspace root');
 assert.match(daemonSource, /const absolute = realpathSync\(cwd\)/, 'Mi daemon rejects symlinked scoped-write cwd escapes');
@@ -51,13 +53,15 @@ assert.doesNotMatch(daemonSource, /env: \{ \.\.\.process\.env, \.\.\.env \}/, 'M
 assert.match(capabilitySource, /'chat-read'[\s\S]*allowBash: false/, 'Capability profiles must deny bash for chat-read');
 assert.match(capabilitySource, /SAFE_ENV_ALLOWLIST/, 'Capability model must include env allowlisting');
 assert.match(guardSource, /toolName === 'bash'[\s\S]*right: 'execute'[\s\S]*resource: 'tool:\/\/bash'/, 'Capability guard must treat bash as an explicit execute capability');
-assert.match(guardSource, /ALLOWED_MI_EXTENSION_TOOLS[\s\S]*mi_orchestrator_delegate/, 'Capability guard must use an explicit reviewed extension-tool allowlist');
+for (const tool of ['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover']) {
+  assert.doesNotMatch(guardSource, new RegExp(`BLOCKED_ORCHESTRATOR_TOOLS|global orchestrator controls are not available to Mi`), `${tool} must not be blanket-denied by the capability guard`);
+}
+assert.match(guardSource, /normal Pi extension tool is available/, 'Capability guard allows ordinary Pi extension tools');
 assert.match(guardSource, /MI_CAPABILITY_PROFILE === 'mi-main-orchestrator'[\s\S]*MI_TWILIO_TOOL_ENABLED === '1'[\s\S]*MI_TWILIO_ENABLED === '1'/, 'Twilio tool requires the narrow orchestrator profile and both enablement gates');
 assert.match(daemonSource, /MI_TWILIO_EXTENSION[\s\S]*--extension/, 'daemon explicitly loads the reviewed Twilio extension');
 assert.match(webChatSource, /twilioConfirmationAuthorized\(req\)[\s\S]*x-mi-confirmation-csrf/, 'Twilio confirmation route authenticates and enforces CSRF');
 assert.match(webChatSource, /userId: auth\.userId/, 'Twilio confirmations bind ownership to authenticated identity');
-assert.match(guardSource, /unreviewed extension tool is denied/, 'Capability guard must deny unknown extension tools by default');
-assert.match(guardSource, /global orchestrator controls are not available to Mi/, 'Capability guard must deny unscoped global orchestrator controls');
+assert.doesNotMatch(guardSource, /unreviewed extension tool is denied/, 'Capability guard must not blanket-deny normal extension tools');
 assert.match(daemonSource, /profile === "advisor-read"[\s\S]*--skill", advisorRoot/, 'advisor workers load only the reviewed skill explicitly after disabling discovery');
 assert.match(daemonSource, /trustedAdvisorSkillRoot\(\)[\s\S]*rights: \["read"\]/, 'advisor skill grants are resolved and read-only');
 assert.match(guardSource, /isTrustedAdvisorReadGrant[\s\S]*profile === 'advisor-read'/, 'guard makes the narrow trusted advisor read exception explicitly');
