@@ -47,6 +47,17 @@ From this repo before install:
 npm run mi --
 ```
 
+## `pi-agents`
+
+`pi-agents` is a standalone Pi-session board. It runs independent Pi RPC sessions in one local manager process, renders them with Pi's TUI components, and lets you reply to, stop, and resume them.
+
+```bash
+pi-agents
+pi-agents start review --read-only -- "Review the current diff"
+```
+
+Only one write-capable Pi Agent may run in a checkout. Use a separate git worktree for parallel implementation tasks; use `--read-only` for parallel review or research.
+
 ## `mi agents`
 
 ![](/assets/mi_agents.jpeg)
