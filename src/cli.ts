@@ -20,7 +20,6 @@ import { runFlueChat } from './flue.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import { runMiTick } from './tick.js';
 import { miDaemonPath } from './mi-runtime-paths.js';
-import { PiAgentsManager } from './pi-agents-manager.js';
 import { memoryPaths, readMemory, readMemoryHistory, runDreamConsolidation } from './memory.js';
 import { handleLoopDiscoverySelection, runLoopDiscovery } from './loop-discovery.js';
 import { decideLoopFactoryImplementation, handleLoopFactoryReply, loopFactoryStatus, runLoopFactoryCapture, runLoopFactoryDigest } from './loop-factory.js';
@@ -889,10 +888,6 @@ function findTaskIndexByIdentity(list: MiTask[], selectedTask: MiTask | undefine
 async function stopTaskInList(task: MiTask) {
   const taskId = task.id || task.sessionFile || task.sessionName || task.name;
   if (!taskId) return;
-  if (PI_AGENTS_MODE) {
-    await piAgentsManager?.stop(taskId);
-    return;
-  }
   await sendTaskSocketRequest({
     type: 'stop_task',
     taskId,
@@ -906,7 +901,7 @@ async function stopTaskInList(task: MiTask) {
 
 async function dismissTaskFromList(task: MiTask) {
   const taskId = task.id || task.sessionFile || task.sessionName || task.name;
-  if (!taskId || PI_AGENTS_MODE) return;
+  if (!taskId) return;
   await sendTaskSocketRequest({
     type: 'dismiss_task',
     taskId,
@@ -919,32 +914,8 @@ async function dismissTaskFromList(task: MiTask) {
 }
 
 async function listTasks() {
-  if (PI_AGENTS_MODE) return piAgentsTasks();
   const result = await sendTaskSocketRequest({ type: 'list_tasks' }, 10000);
   return (result.tasks || []).sort((a, b) => taskStartedMs(b) - taskStartedMs(a) || taskUpdatedMs(b) - taskUpdatedMs(a));
-}
-
-function piAgentsTasks(): MiTask[] {
-  return (piAgentsManager?.list() || []).map((agent) => ({
-    id: agent.id,
-    name: agent.name,
-    sessionName: agent.name,
-    cwd: agent.cwd,
-    status: agent.status,
-    startedAt: agent.startedAt,
-    updatedAt: agent.updatedAt,
-    finishedAt: ['complete', 'error', 'stopped', 'paused'].includes(agent.status) ? agent.updatedAt : undefined,
-    text: agent.text,
-    error: agent.error,
-    progress: agent.progress,
-    lastInput: agent.lastInput,
-    needsUser: agent.status === 'error' || agent.status === 'paused',
-    needsUserReason: agent.status === 'paused' ? 'stopped by Escape' : agent.error,
-    sessionFile: agent.sessionFile,
-    actualSessionFile: agent.sessionFile,
-    sessionId: agent.sessionId,
-    source: 'pi-session',
-  }));
 }
 
 async function listResumeSessions() {
@@ -1033,22 +1004,6 @@ async function miAgentsCommand() {
   const dismissedTaskKeys = new Set<string>();
   const taskDisplayOrder = new Map<string, number>();
   let nextTaskDisplayOrder = 0;
-
-  async function startBoardAgent(options: { name: string; cwd: string; message: string; model?: string; readOnly?: boolean }) {
-    if (PI_AGENTS_MODE) {
-      const agent = await piAgentsManager!.start({ name: options.name, cwd: options.cwd, prompt: options.message, model: options.model, readOnly: options.readOnly });
-      return { taskId: agent.id, sessionFile: agent.sessionFile, sessionId: agent.sessionId, sessionName: agent.name, text: 'Started Pi session.' };
-    }
-    return sendTaskSocketRequest({ type: 'run_worker', name: options.name, cwd: options.cwd, message: options.message, model: options.model, background: true }, 30000);
-  }
-
-  async function continueBoardAgent(task: MiTask, message: string, model?: string) {
-    if (PI_AGENTS_MODE) {
-      await piAgentsManager!.send(task.id || '', message);
-      return { text: 'Sent to Pi session.' };
-    }
-    return sendTaskSocketRequest({ type: 'continue_worker', taskId: task.id || task.sessionFile || task.sessionName || task.name, message, model, background: true }, 30000);
-  }
 
   function rememberTaskDisplayOrder(newTasks: MiTask[], previousTasks: MiTask[] = tasks) {
     const previousForOrderKey = (key: string) => previousTasks.find((entry) => stableTaskKey(entry) === key);
@@ -1393,15 +1348,6 @@ async function miAgentsCommand() {
         .catch((error) => { inputMode = 'normal'; miChatTask = undefined; status = error instanceof Error ? error.message : String(error); requestRender(); });
       return true;
     }
-    if (value.startsWith('/readonly ') && PI_AGENTS_MODE) {
-      const [, name, ...promptParts] = value.trim().split(/\s+/);
-      const prompt = promptParts.join(' ').trim();
-      if (!name || !prompt) { status = 'Usage: /readonly <name> <prompt>'; requestRender(); return true; }
-      const agent = await startBoardAgent({ name, cwd: process.cwd(), message: prompt, model: agentModelWithThinking(), readOnly: true });
-      status = agent.text || `Started read-only ${name}`;
-      await refresh();
-      return true;
-    }
     if (value.startsWith('/new')) {
       const prompt = value.slice('/new'.length).trim();
       inputMode = 'new-prompt';
@@ -1669,8 +1615,7 @@ async function miAgentsCommand() {
     // already-loaded task fields.
     const fullLastOutput = fullLastOutputMode && task ? taskFullOutputFallback(task) : '';
     if (fullLastOutput && task) {
-      const boardName = PI_AGENTS_MODE ? 'pi agents' : 'mi agents';
-      lines.push(fgAccent(truncateText(boardName, width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf(boardName)))));
+      lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
       lines.push(fgThinking(undefined, '─'.repeat(width)));
       const lastInput = task.sessionFile ? '' : taskLastInput(task);
       if (lastInput) {
@@ -1693,8 +1638,7 @@ async function miAgentsCommand() {
       lines.push(...footerLines);
       return lines.map((line) => padVisibleEnd(truncateText(line, width), width));
     }
-    const boardName = PI_AGENTS_MODE ? 'pi agents' : 'mi agents';
-    lines.push(fgAccent(truncateText(boardName, width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf(boardName)))));
+    lines.push(fgAccent(truncateText('mi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('mi agents')))));
     lines.push(fgThinking(undefined, '─'.repeat(width)));
     if (resumeMode) {
       lines.push(fgDim(truncateText('resume pi sessions', width)));
@@ -1834,7 +1778,7 @@ async function miAgentsCommand() {
       requestRender(true);
       return;
     }
-    void startBoardAgent({ name, cwd: HOME, message: value })
+    void sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: value, lastInput: value, background: true }, 30000)
       .then(async (result) => {
         optimisticTask.id = result.taskId || optimisticTask.id;
         optimisticTask.sessionFile = result.sessionFile || optimisticTask.sessionFile;
@@ -1963,7 +1907,7 @@ async function miAgentsCommand() {
       status = `Starting ${name} with ${turn.model}...`;
       agentSubmitting = true;
       requestRender();
-      void startBoardAgent({ name, cwd: HOME, message: turn.body, model: turn.model })
+      void sendTaskSocketRequest({ type: 'run_worker', name, cwd: HOME, message: turn.body, model: turn.model, background: true }, 30000)
         .then(async (result) => {
           optimisticTask.id = result.taskId || optimisticTask.id;
           optimisticTask.sessionFile = result.sessionFile || optimisticTask.sessionFile;
@@ -2055,7 +1999,7 @@ async function miAgentsCommand() {
       Object.assign(task, runningUpdate);
       if (taskKey) pendingTaskUpdates.set(taskKey, runningUpdate);
       requestRender();
-      void continueBoardAgent(task, turn.body, turn.model)
+      void sendTaskSocketRequest({ type: 'continue_worker', taskId, message: turn.body, model: turn.model, background: true }, 30000)
         .then(async () => {
           if (taskKey) {
             pendingTaskUpdates.delete(taskKey);
@@ -2498,11 +2442,6 @@ const MI_DAEMON_PATH = miDaemonPath();
 const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const MI_DAEMON_HOST = process.env.MI_DAEMON_HOST || join(HOME, 'bin', 'mi-daemon-host');
 const MI_MODEL = process.env.MI_MODEL || 'openai-codex/gpt-5.5:low';
-// Pi Agents deliberately reuses this current board rather than maintaining a
-// visual fork. Only its transport changes: independent Pi RPC children replace
-// Mi daemon workers.
-const PI_AGENTS_MODE = process.env.PI_AGENTS_MODE === '1';
-const piAgentsManager = PI_AGENTS_MODE ? new PiAgentsManager() : undefined;
 const PI_CYCLE_PATH = join(HOME, '.pi', 'agent', 'pi-cycle.json');
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, 'preferences.md');
 
