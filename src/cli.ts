@@ -20,6 +20,7 @@ import { runFlueChat } from './flue.js';
 import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons.js';
 import { runMiTick } from './tick.js';
 import { miDaemonPath } from './mi-runtime-paths.js';
+import { PiAgentsManager } from './pi-agents-manager.js';
 import { memoryPaths, readMemory, readMemoryHistory, runDreamConsolidation } from './memory.js';
 import { handleLoopDiscoverySelection, runLoopDiscovery } from './loop-discovery.js';
 import { decideLoopFactoryImplementation, handleLoopFactoryReply, loopFactoryStatus, runLoopFactoryCapture, runLoopFactoryDigest } from './loop-factory.js';
@@ -914,6 +915,17 @@ async function dismissTaskFromList(task: MiTask) {
 }
 
 async function listTasks() {
+  if (PI_AGENTS_MODE) {
+    return piAgentsManager!.list().map((agent) => ({
+      id: agent.id, name: agent.name, sessionName: agent.name, cwd: agent.cwd,
+      status: agent.status, startedAt: agent.startedAt, updatedAt: agent.updatedAt,
+      finishedAt: ['complete', 'error', 'stopped', 'paused'].includes(agent.status) ? agent.updatedAt : undefined,
+      text: agent.text, error: agent.error, progress: agent.progress, lastInput: agent.lastInput,
+      needsUser: agent.status === 'error' || agent.status === 'paused',
+      needsUserReason: agent.status === 'paused' ? 'stopped by Escape' : agent.error,
+      sessionFile: agent.sessionFile, actualSessionFile: agent.sessionFile, sessionId: agent.sessionId, source: 'pi-session',
+    }));
+  }
   const result = await sendTaskSocketRequest({ type: 'list_tasks' }, 10000);
   return (result.tasks || []).sort((a, b) => taskStartedMs(b) - taskStartedMs(a) || taskUpdatedMs(b) - taskUpdatedMs(a));
 }
@@ -960,7 +972,113 @@ async function taskCommand(args: string[]) {
   if (result.sessionFile) console.log(`Visible in /resume: ${result.sessionFile}`);
 }
 
+
+async function piAgentsCommand() {
+  // Current Mi Agents board primitives, labels, editor behavior, and visual
+  // hierarchy are intentionally retained. This compact transport adapter keeps
+  // it Pi-session-only rather than leaking Mi worker/approval semantics.
+  let tasks: MiTask[] = [];
+  let selected = 0;
+  let closed = false;
+  let status = '^F full output • Esc stop agent • /new start';
+  let inputBuffer = '';
+  let fullOutput = false;
+  let tui: TUI | undefined;
+  const editorTui = { terminal: { rows: process.stdout.rows || 24 }, requestRender() { tui?.requestRender(); } } as any;
+  const editor = new Editor(editorTui, piEditorTheme('low'));
+  editor.focused = true;
+  const refresh = () => {
+    tasks = awaitableTasks();
+    selected = Math.max(0, Math.min(selected, Math.max(0, tasks.length - 1)));
+    tui?.requestRender();
+  };
+  const awaitableTasks = () => piAgentsManager!.list().map((agent) => ({
+    id: agent.id, name: agent.name, sessionName: agent.name, cwd: agent.cwd, status: agent.status,
+    startedAt: agent.startedAt, updatedAt: agent.updatedAt,
+    finishedAt: ['complete', 'error', 'stopped', 'paused'].includes(agent.status) ? agent.updatedAt : undefined,
+    text: agent.text, error: agent.error, progress: agent.progress, lastInput: agent.lastInput,
+    needsUser: agent.status === 'error' || agent.status === 'paused',
+    needsUserReason: agent.status === 'paused' ? 'stopped by Escape' : agent.error,
+    sessionFile: agent.sessionFile, sessionId: agent.sessionId, source: 'pi-session',
+  } as MiTask));
+  const selectedTask = () => tasks[selected];
+  const close = () => { if (closed) return; closed = true; clearInterval(timer); tui?.stop(); piAgentsManager?.dispose(); };
+  const submit = async () => {
+    const value = inputBuffer.trim();
+    if (!value) return;
+    try {
+      if (value === '/quit') return close();
+      if (value.startsWith('/new ')) {
+        const [, name, ...prompt] = value.split(/\s+/);
+        if (!name || !prompt.length) throw new Error('Use /new <name> <prompt>.');
+        await piAgentsManager!.start({ name, cwd: process.cwd(), prompt: prompt.join(' ') });
+        status = `Started ${name}`;
+      } else if (value.startsWith('/readonly ')) {
+        const [, name, ...prompt] = value.split(/\s+/);
+        if (!name || !prompt.length) throw new Error('Use /readonly <name> <prompt>.');
+        await piAgentsManager!.start({ name, cwd: process.cwd(), prompt: prompt.join(' '), readOnly: true });
+        status = `Started read-only ${name}`;
+      } else {
+        const task = selectedTask();
+        if (!task?.id) throw new Error('Use /new <name> <prompt> first.');
+        await piAgentsManager!.send(task.id, value);
+        status = `Sent to ${taskName(task)}`;
+      }
+      inputBuffer = ''; editor.setText(''); refresh();
+    } catch (error) { status = error instanceof Error ? error.message : String(error); refresh(); }
+  };
+  editor.onChange = (value) => { inputBuffer = value; tui?.requestRender(); };
+  editor.onSubmit = () => { void submit(); };
+  const render = (width: number) => {
+    const height = process.stdout.rows || 24;
+    const footer = [...editor.render(width).map((line) => line.replaceAll(CURSOR_MARKER, '')), fgDim('Enter send • ↑↓ select • Esc stop • /readonly • /quit').padStart(width)];
+    const contentHeight = Math.max(1, height - footer.length);
+    const lines = [fgAccent(truncateText('pi agents', width)) + fgLightGrey(truncateText(`  ${status}`, Math.max(0, width - widthOf('pi agents')))), fgThinking(undefined, '─'.repeat(width))];
+    if (!tasks.length) lines.push(fgDim('No Pi Agents. Use /new <name> <prompt>.'));
+    else if (fullOutput && selectedTask()) {
+      const task = selectedTask()!;
+      if (task.lastInput) lines.push('', ...renderPiUserMessage(task.lastInput, width));
+      lines.push('', ...renderPiLastOutputMessage(task.text || task.error || task.progress || 'No output yet.', width));
+    } else {
+      for (const label of ['needs input', 'working', 'completed'] as const) {
+        const group = tasks.filter((task) => taskSection(task) === label);
+        if (!group.length) continue;
+        lines.push(fgDim(label));
+        for (const task of group) {
+          const index = tasks.indexOf(task);
+          const icon = isTaskActive(task) ? '●' : isTaskNeedsInput(task) ? '!' : '○';
+          const row = `${index === selected ? '→ ' : '  '}${icon} ${formatTaskRow(task, width - 4)}`;
+          lines.push(index === selected ? fgAccent(truncateText(row, width)) : truncateText(row, width));
+        }
+      }
+      const task = selectedTask();
+      if (task) {
+        lines.push(fgThinking(undefined, '─'.repeat(width)));
+        if (task.lastInput) lines.push(...renderPiUserMessage(task.lastInput, width));
+        const detail = task.error || task.text || task.progress || (isTaskActive(task) ? 'Working…' : 'No result yet.');
+        lines.push('', ...renderPiLastOutputMessage(detail, width));
+      }
+    }
+    const body = lines.slice(0, contentHeight);
+    while (body.length < contentHeight) body.push('');
+    return [...body, ...footer].slice(0, height);
+  };
+  const onInput = (data: string) => {
+    if (!inputBuffer && (data === '\x1b[A' || data === '\x1bOA')) { selected = Math.max(0, selected - 1); return refresh(); }
+    if (!inputBuffer && (data === '\x1b[B' || data === '\x1bOB')) { selected = Math.min(Math.max(0, tasks.length - 1), selected + 1); return refresh(); }
+    if (!inputBuffer && (data === '\x06' || data === '\x0c')) { fullOutput = !fullOutput; status = fullOutput ? 'Full output • ^F back' : '^F full output • Esc stop agent • /new start'; return refresh(); }
+    if (!inputBuffer && data === '\x1b') { const task = selectedTask(); if (task?.id && isTaskActive(task)) void piAgentsManager!.stop(task.id).then(refresh); return; }
+    if (!inputBuffer && data === 'q') return close();
+    editor.handleInput(data);
+  };
+  const screen = new FunctionScreen(render, onInput);
+  tui = startPiTuiScreen(screen, { alternateScreen: true });
+  const timer = setInterval(refresh, 300);
+  refresh();
+}
+
 async function miAgentsCommand() {
+  if (PI_AGENTS_MODE) return piAgentsCommand();
   let tasks: MiTask[] = [];
   let optimisticTasks: MiTask[] = [];
   let selected = 0;
@@ -2442,6 +2560,10 @@ const MI_DAEMON_PATH = miDaemonPath();
 const MI_DAEMON_SYSTEMD_UNIT = process.env.MI_DAEMON_SYSTEMD_UNIT || 'mi-daemon.service';
 const MI_DAEMON_HOST = process.env.MI_DAEMON_HOST || join(HOME, 'bin', 'mi-daemon-host');
 const MI_MODEL = process.env.MI_MODEL || 'openai-codex/gpt-5.5:low';
+const PI_AGENTS_MODE = process.env.PI_AGENTS_MODE === '1';
+// Pi Agents uses the same current board and gestures as Mi Agents. The sole
+// substitution is this local manager of independent Pi RPC child sessions.
+const piAgentsManager = PI_AGENTS_MODE ? new PiAgentsManager() : undefined;
 const PI_CYCLE_PATH = join(HOME, '.pi', 'agent', 'pi-cycle.json');
 const MI_PREFERENCES_PATH = join(MI_TASKS_DIR, 'preferences.md');
 
