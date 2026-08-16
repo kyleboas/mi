@@ -204,10 +204,12 @@ function runAgentsAndSend(input, done) {
 }
 
 // Typing a plain reply to the selected task should send it to the worker, then Esc should stop it into needs input.
-const typedReplyDone = async () => false;
-typedReplyDone.afterMs = 12000;
+const typedReplyDone = async (stdout) => {
+  const recorded = await readFile(requestLog, 'utf8').catch(() => '');
+  return recorded.includes('"type":"stop_task"') && stripAnsi(stdout).includes('stopped by Escape; needs input');
+};
 const typedReplyRun = await runAgentsAndSend([
-  { input: 'please continue selected task\n' },
+  { waitFor: 'selected task', input: 'please continue selected task\n' },
   { waitFor: 'selected task', input: '\x1b\x1b' },
 ], typedReplyDone);
 const typedReplyPlain = stripAnsi(typedReplyRun.stdout);

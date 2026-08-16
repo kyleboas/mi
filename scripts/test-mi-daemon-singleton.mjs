@@ -46,6 +46,7 @@ const runtime = join(root, 'runtime');
 const socketPath = join(runtime, 'main.sock');
 const sessionDir = join(root, 'sessions');
 await mkdir(runtime, { recursive: true });
+await mkdir(join(root, 'workflows'), { recursive: true });
 const miRoot = join(root, 'assistant');
 const privateExtensions = join(miRoot, 'pi', 'extensions');
 await mkdir(privateExtensions, { recursive: true });

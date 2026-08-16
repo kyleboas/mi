@@ -22,7 +22,7 @@ assert.match(cli, /mi loop-discovery \[--force\] \[--dry-run\] \[--notify\] \[--
 assert.match(cli, /if \(command === 'loop-discovery'\) return loopDiscoveryCommand\(args\);/, 'CLI exposes manual loop discovery used by chat transports');
 assert.match(webChat, /handleLoopDiscoverySelectionFromImessage[\s\S]*--select[\s\S]*loop-discovery-selection/, 'iMessage replies can select a loop-discovery candidate');
 assert.match(webChat, /messageLooksLikeLoopDiscoveryRun[\s\S]*runLoopDiscoveryCli\(\['--force'\]\)/, 'iMessage can manually run loop discovery');
-assert.match(daemon, /worker-write-scoped is only allowed under ~\/workflows/, 'daemon refuses write-scoped workers outside workflows');
+assert.match(daemon, /worker-write-scoped is only allowed inside the configured Mi workspace/, 'daemon refuses write-scoped workers outside the configured workspace');
 
 const root = await mkdtemp(join(tmpdir(), 'mi-loop-discovery-'));
 try {

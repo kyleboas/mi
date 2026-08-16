@@ -14,6 +14,7 @@ const tasksPath = join(home, 'mi', 'state', 'tasks.json');
 const sessionsRoot = join(home, '.pi', 'agent', 'sessions', '--home-test--');
 const advisorRoot = join(root, 'advisor-skill');
 await mkdir(sessionsRoot, { recursive: true });
+await mkdir(join(home, 'workflows'), { recursive: true });
 await mkdir(join(home, 'mi', 'state'), { recursive: true });
 await mkdir(advisorRoot, { recursive: true });
 const privateExtensions = join(home, 'assistant', 'pi', 'extensions');
@@ -260,7 +261,10 @@ try {
 
   console.log('Mi agent dedupe repro checks passed.');
 } finally {
-  daemon.kill('SIGTERM');
-  await new Promise((resolve) => daemon.once('exit', resolve));
+  if (daemon.exitCode === null) {
+    const exited = new Promise((resolve) => daemon.once('exit', resolve));
+    daemon.kill('SIGTERM');
+    await exited;
+  }
   await rm(root, { recursive: true, force: true });
 }
