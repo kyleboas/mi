@@ -2,6 +2,7 @@ import { open, rm, mkdir, readFile, rename, stat, writeFile } from 'node:fs/prom
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { runBudgetGuardMonitor } from './budget-guard-monitor.js';
 import { runCapabilityGrantGc, writeCapabilityGrantGcMarker } from './capability-gc.js';
 import { tickReminderCrons } from './crons.js';
 import { runImessageMonitor } from './imessage-monitor.js';
@@ -11,6 +12,7 @@ import { logEvent } from './state.js';
 export type MiTickResult = {
   reminders: Array<{ name: string; status: 'ok' | 'error' | 'skipped' }>;
   imessageMonitor: Awaited<ReturnType<typeof runImessageMonitor>>;
+  budgetGuardMonitor: Awaited<ReturnType<typeof runBudgetGuardMonitor>>;
   capabilityGrantGc: Awaited<ReturnType<typeof runCapabilityGrantGc>>;
   memory: Awaited<ReturnType<typeof runDreamConsolidation>>;
 };
@@ -126,13 +128,18 @@ export async function runMiTick(): Promise<MiTickResult> {
       error: error instanceof Error ? error.message : String(error),
     }));
     const imessageMonitor = await runImessageMonitor();
+    const budgetGuardMonitor = await runBudgetGuardMonitor().catch((error) => ({
+      status: 'error' as const,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
 
     await logEvent('mi.tick.complete', {
       reminders: reminders.length,
       capabilityGrantGc,
       memory: memory.status,
       imessageMonitor: imessageMonitor.status,
+      budgetGuardMonitor: budgetGuardMonitor.status,
     });
-    return { reminders, imessageMonitor, capabilityGrantGc, memory };
+    return { reminders, imessageMonitor, budgetGuardMonitor, capabilityGrantGc, memory };
   });
 }
