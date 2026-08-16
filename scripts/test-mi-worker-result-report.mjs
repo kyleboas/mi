@@ -19,6 +19,7 @@ const terraFinalText = 'Terra final result posted exactly once.';
 const stoppedFinalText = 'This stopped result must never reach main chat.';
 
 await mkdir(home, { recursive: true });
+await mkdir(join(home, 'workflows'), { recursive: true });
 await mkdir(runtime, { recursive: true });
 await mkdir(miRoot, { recursive: true });
 const privateExtensions = join(miRoot, 'pi', 'extensions');
@@ -189,8 +190,11 @@ try {
 
   console.log('mi worker result report e2e passed');
 } finally {
-  daemon.kill('SIGTERM');
-  await new Promise((resolve) => daemon.once('exit', resolve));
+  if (daemon.exitCode === null) {
+    const exited = new Promise((resolve) => daemon.once('exit', resolve));
+    daemon.kill('SIGTERM');
+    await exited;
+  }
   await rm(root, { recursive: true, force: true });
   if (daemon.exitCode && daemon.exitCode !== 0 && daemon.exitCode !== null) process.stderr.write(daemonStderr);
 }

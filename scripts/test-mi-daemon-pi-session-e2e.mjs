@@ -84,6 +84,7 @@ try {
   await mkdir(sessionDir, { recursive: true });
   await mkdir(variantDir, { recursive: true });
   await mkdir(miRoot, { recursive: true });
+  await mkdir(join(home, 'workflows'), { recursive: true });
   const privateExtensions = join(miRoot, 'pi', 'extensions');
   await mkdir(privateExtensions, { recursive: true });
   for (const file of ['mi-capability-guard.ts', 'mi-orchestrator-adapter.ts']) await copyFile(new URL(`../pi/extensions/${file}`, import.meta.url), join(privateExtensions, file));
