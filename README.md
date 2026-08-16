@@ -82,12 +82,15 @@ Mi discovers pi sessions from the default pi session store (`~/.pi/agent/session
 
 - runs due reminder-only crons from `~/mi/state/crons.json`;
 - removes expired capability grant files;
-- runs memory consolidation when it is due; and
-- runs the iMessage send-failure repair monitor.
+- runs memory consolidation when it is due;
+- runs the iMessage send-failure repair monitor; and
+- polls Budget Guard for deduplicated iMessage alerts.
 
-A lock at `state/tick.lock` prevents overlapping runs. The systemd timer runs every minute, while the repair monitor limits itself to once every 15 minutes by default (`MI_IMESSAGE_MONITOR_INTERVAL_MS`).
+A lock at `state/tick.lock` prevents overlapping runs. The systemd timer runs every minute, while the repair and Budget Guard monitors each limit themselves to once every 15 minutes by default.
 
-When the Photon bridge is running, tick notices can use its local-only outbound endpoint. A new install writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and does not start the timer. Keep it false until an operator chooses to send notices. Pushover is opt-in through `MI_PUSHOVER_NOTIFY=1` or `MI_PUSHOVER_FALLBACK=1`.
+When the Photon bridge is running, tick notices can use its local-only outbound endpoint. A new install writes `MI_PROACTIVE_IMESSAGE_NOTIFY=false` and does not start the timer. Keep it false until an operator chooses to send general notices. Pushover is opt-in through `MI_PUSHOVER_NOTIFY=1` or `MI_PUSHOVER_FALLBACK=1`.
+
+Budget Guard alerts are a separate, iMessage-only path enabled by default. The monitor stays silent on its first healthy observation, then texts on 50%, 75%, and 90% crossings, hard stops, synchronization failures, outages, recoveries, and resumes. It never invokes Telegram, Web chat, or Pushover. State is deduplicated in `state/budget-guard-monitor-state.json`.
 
 The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, durable deliveries, and recent Mi thread activity. A repair attempt restarts only the Photon bridge, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
 
@@ -148,7 +151,10 @@ Optional env:
 - `MI_PHOTON_NOTIFY_PORT=8788` — local-only outbound iMessage notification endpoint.
 - `MI_PROACTIVE_IMESSAGE_NOTIFY=true` — opt in to proactive iMessage notices.
 - `MI_IMESSAGE_MONITOR_ENABLED=false` — disable the tick-owned repair monitor.
-- `MI_IMESSAGE_MONITOR_INTERVAL_MS=900000` — monitor cadence. The default is 15 minutes.
+- `MI_IMESSAGE_MONITOR_INTERVAL_MS=900000` — repair-monitor cadence. The default is 15 minutes.
+- `MI_BUDGET_GUARD_IMESSAGE_NOTIFY=false` — disable Budget Guard iMessage alerts.
+- `MI_BUDGET_GUARD_MONITOR_INTERVAL_MS=900000` — Budget Guard polling cadence. The default is 15 minutes.
+- `MI_BUDGET_GUARD_STATUS_URL` — optional status endpoint override; defaults to the live Budget Guard Worker.
 
 The bridge exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify`. The monitor checks durable deliveries, Photon logs and service state, the notify endpoint, and stale thread activity. It restarts only `mi-photon-bridge.service` by default. It does not restart Web chat or the daemon.
 

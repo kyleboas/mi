@@ -13,6 +13,7 @@ const deployScript = await readFile(new URL('../scripts/deploy-mi.sh', import.me
 assert.match(cli, /if \(command === 'tick'\) return tickCommand\(\);/, 'CLI exposes mi tick as the single scheduled entrypoint');
 assert.match(tick, /tickReminderCrons\(\)/, 'mi tick runs written reminder and prompt crons');
 assert.match(tick, /runImessageMonitor\(\)/, 'mi tick runs the iMessage bridge monitor');
+assert.match(tick, /runBudgetGuardMonitor\(\)/, 'mi tick polls Budget Guard for iMessage alerts');
 assert.match(tick, /runDreamConsolidation\(\)/, 'mi tick runs bounded memory upkeep');
 assert.match(tick, /runCapabilityGrantGc\(\)/, 'mi tick cleans expired worker capability grants');
 assert.doesNotMatch(tick, /chief-of-staff|proactive|runMiCheck|loopDiscovery|loopFactory|opportunity|projectQuestion|weeklyReview|verification_required/, 'mi tick does not run the removed nag and inference stack');
@@ -60,6 +61,7 @@ try {
       MI_TICK_NOTIFICATION_LIMIT: '1',
       MI_DREAM_ENABLED: 'false',
       MI_IMESSAGE_MONITOR_ENABLED: 'false',
+      MI_BUDGET_GUARD_IMESSAGE_NOTIFY: 'false',
       MI_PROACTIVE_IMESSAGE_NOTIFY: 'false',
       MI_PUSHOVER_NOTIFY: 'false',
       PUSHOVER_USER: '',
@@ -73,6 +75,7 @@ try {
   assert.deepEqual(second.reminders.map((item) => item.status), ['ok', 'skipped'], 'the next tick sends the next written reminder without running command crons');
   assert.equal(first.memory.status, 'skipped', 'memory upkeep can be disabled for a fixture');
   assert.equal(first.imessageMonitor.status, 'skipped', 'iMessage monitor can be disabled for a fixture');
+  assert.equal(first.budgetGuardMonitor.status, 'skipped', 'Budget Guard iMessage monitor can be disabled for a fixture');
   assert.equal(first.capabilityGrantGc.deleted, 1, 'tick deletes expired capability grants');
   assert.equal(first.capabilityGrantGc.kept, 1, 'tick keeps fresh capability grants');
 } finally {
