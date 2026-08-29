@@ -24,9 +24,11 @@ try {
   process.env.MI_ROOT = miRoot;
   process.env.MI_IMESSAGE_WORKSPACE_ROOT = workspace;
   process.env.MI_IMESSAGE_WORKSPACE_CWD = workspace;
-  const { conversationIdFor, createImessageRuntime: createRuntime, deliveryIdFor, formatImessagePlainText, IMESSAGE_REPLIES, requestDigestFor } = await import('./mi-imessage-runtime.mjs');
+  const { conversationIdFor, createImessageRuntime: createRuntime, deliveryIdFor, formatImessagePlainText, isSameConversationResend, IMESSAGE_REPLIES, requestDigestFor } = await import('./mi-imessage-runtime.mjs');
   const { readPendingConfirmation } = await import('../dist/src/pending-confirmations.js');
   assert.equal(formatImessagePlainText('## Brief\n### Priorities\n1. **Board:** Test it.\n- Approve outreach.'), 'Brief\nPriorities\n1. Board: Test it.\n• Approve outreach.', 'iMessage output strips Markdown while preserving readable structure');
+  assert.equal(isSameConversationResend('send it again'), true);
+  assert.equal(isSameConversationResend('send Alice again'), false, 'external-recipient sends are not treated as same-conversation repeats');
   assert.match(conversationIdFor({ id: 'SPACE A' }, { sender: { id: '+1' } }), /^imessage-[a-f0-9]{32}$/);
   assert.notEqual(conversationIdFor({ id: 'SPACE A' }, { sender: { id: '+1' } }), conversationIdFor({ id: 'SPACE B' }, { sender: { id: '+1' } }), 'space identity separates conversations');
   assert.equal(conversationIdFor({}, { sender: { id: '+1 555' } }), conversationIdFor({}, { sender: { id: '+1  555' } }), 'sender fallback is normalized');
@@ -43,6 +45,10 @@ try {
   const first = await runtime.handleEvent({ ...event('thread-a', 'one', 'inspect this'), sendReply: send });
   const duplicate = await runtime.handleEvent({ ...event('thread-a', 'one', 'inspect this'), sendReply: send });
   const second = await runtime.handleEvent({ ...event('thread-a', 'two', 'inspect that'), sendReply: send });
+  const resend = await runtime.handleEvent({ ...event('thread-a', 'resend', 'send it again'), sendReply: send });
+  assert.equal(resend.status, 'sent');
+  assert.equal(sent.at(-1), 'reply 2', 'same-conversation resend repeats the latest sent reply');
+  assert.equal(prompts, 2, 'same-conversation resend does not invoke Pi or require confirmation');
   const separate = await runtime.handleEvent({ ...event('thread-b', 'three', 'inspect other'), sendReply: send });
   assert.equal(first.status, 'sent');
   assert.equal(duplicate.duplicate, true, 'duplicate after completion does not start Pi');
