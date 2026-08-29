@@ -124,18 +124,19 @@ export function requestDigestFor(conversationId, message, text, timestamp) {
   }));
 }
 
-function cleanReply(value, fallback = IMESSAGE_REPLIES.missingEvidence) {
+function cleanReply(value, fallback = IMESSAGE_REPLIES.missingEvidence, strict = false) {
   const text = redactV2Text(String(value || '')).replace(/[—–]/g, '-').replace(/\0/g, '').replace(/\n{3,}/g, '\n\n').trim();
   if (!text) return fallback;
   const controlReply = /^Action class: [a-z][a-z0-9_-]*\.\s+Exact objective: [\s\S]+?\s+This could make a real change or contact another service\. Reply "(?:confirm|deny) [a-f0-9]{32}"/i.test(text)
     || /^I still need confirmation for the pending action\.\s+Reply confirm [a-f0-9]{32} or deny [a-f0-9]{32}\.$/i.test(text);
-  const safe = sanitizeImessageCompletion(text, '');
-  if (!safe && !controlReply) return fallback;
+  const safe = strict ? sanitizeImessageCompletion(text, '') : text;
+  if (strict && !safe && !controlReply) return fallback;
   const candidate = safe || text;
   return candidate
     .replace(/(?:~|\/)(?:home|Users|tmp)\/[A-Za-z0-9_.@/:-]+/g, '[private path]')
     .replace(/\b(?:task|thread|session|correlation)[ _-]?(?:id)?\s*[:=]\s*[A-Za-z0-9._:-]{6,}\b/gi, '[private id]')
-    .replace(/\b(?:photon|pi|worker|daemon|gateway|routing|handoff|prompt|model)\b/gi, '')
+    .replace(/\b(?:system|hidden|internal)\s+prompt\b/gi, '[private instructions]')
+    .replace(/\b(?:photon|pi|worker|daemon|gateway|routing|handoff)\b/gi, '')
     .replace(/\s{2,}/g, ' ')
     .trim().slice(0, maxCompletionChars) || fallback;
 }
@@ -865,7 +866,7 @@ export class ImessageRuntime {
       if (!waited.ok) return { reply: waited.reason === 'timeout' ? IMESSAGE_REPLIES.timeout : IMESSAGE_REPLIES.missingEvidence, taskIds: ids };
       const failedTask = waited.tasks.some((task) => Boolean(task.error) || ['error', 'stopped', 'inactive'].includes(String(task.status || '').toLowerCase()));
       const findings = waited.tasks.map((task) => task.text || '').filter(Boolean).join('\n\n');
-      const reply = failedTask ? IMESSAGE_REPLIES.interruption : cleanReply(result.ok ? (findings || result.text) : '', result.ok ? IMESSAGE_REPLIES.missingEvidence : result.reason === 'timeout' ? IMESSAGE_REPLIES.timeout : IMESSAGE_REPLIES.interruption);
+      const reply = failedTask ? IMESSAGE_REPLIES.interruption : cleanReply(result.ok ? (findings || result.text) : '', result.ok ? IMESSAGE_REPLIES.missingEvidence : result.reason === 'timeout' ? IMESSAGE_REPLIES.timeout : IMESSAGE_REPLIES.interruption, true);
       return { reply, taskIds: ids };
     }
     if (!result.ok) {
