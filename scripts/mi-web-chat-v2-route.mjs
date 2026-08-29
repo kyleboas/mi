@@ -14,7 +14,7 @@ function normalizedMessageText(message) {
 
 export function messageHasLocalWorkTarget(message) {
   const text = normalizedMessageText(message);
-  return /\b(?:mi|diver\s*notes?|routing|app|ui|notification|reminder|calendar|cron|schedule|video|watchlist|logo|favicon|chat|pwa|site|service|typing|code|file|repo|branch|github|pull\s*request|\bpr\b|test|daemon|systemd|tailscale|candidate|project|research|worker)\b/.test(text)
+  return /\b(?:mi|diver\s*notes?|routing|apps?|ui|notifications?|reminders?|calendars?|crons?|schedules?|videos?|watchlists?|logos?|favicons?|chats?|pwa|sites?|services?|typing|code|files?|repos?|branches?|github|pull\s*requests?|\bprs?\b|tests?|daemons?|systemd|tailscale|candidates?|projects?|research|workers?)\b/.test(text)
     || /\b(?:code|repo|project)\/[a-z0-9_.-]+|~\/code\/[a-z0-9_.-]+|\/home\/\w+\/(?:code\/)?[a-z0-9_.-]+/.test(text);
 }
 
@@ -35,11 +35,24 @@ export function v2RiskClassification(message) {
   const text = objective.toLowerCase();
   const rawText = String(message || '').toLowerCase();
   if (!text || /^[^\p{L}\p{N}]+$/u.test(text)) return { kind: 'clarify', objective };
-  const prohibited = /(?:\bdelete\b|\berase\b|\bwipe\b|\bpurge\b|\bdestroy\b|\brm\b|\b(?:remove|clear|drop)\s+(?:all\s+)?(?:(?:[a-z0-9_.-]+)\s+){0,2}(?:data|database|account|project)\b|\bformat\s+(?:the\s+)?(?:disk|drive)\b|\bsecret\b|\btoken\b|\bpassword\b|\bpasscode\b|\bcredential\b|\bauth(?:entication)?\b|\blog\s*in\b|\bbuy\b|\bpurchase\b|\bpay\b|\bspend\b|\btransfer\s+(?:money|funds|cash)|\bwire\s+(?:money|funds))/i.test(text)
-    || /(?:secret|token|password|credential|api[_-]?key)\s*=/i.test(rawText);
-  if (prohibited) return { kind: 'never-delegate', objective };
-  const needsConfirmation = /(?:\bdeploy\b|\bproduction\b|\brelease\b|\bpublish\b|\bannouncement\b|\bmerge\b|\brestart\b|\bsystemctl\b|\bservice\b|\binstall\b|\bemail\b|\bmail\b|\btweet\b|\bpost\b|\bsend\b|\bmessage\b|\b(?:tell|contact|notify|forward)\b|\btransfer\b|\bupload\b|\bshare\b)/i.test(text)
-    || (/\b(?:book|reserve|order)\b/i.test(text) && !/\brecommend\s+(?:a\s+)?book\b/i.test(text));
+  const adviceQuestion = /^(?:how|what|why|when|where|which)\b|^(?:should|can|could|would)\s+(?:i|we)\b/i.test(text);
+  const destructiveAction = /^(?:(?:please\s+)?|(?:can|could|would)\s+you\s+(?:please\s+)?|i\s+want\s+you\s+to\s+)(?:delete|erase|wipe|purge|destroy|rm|format)\b/i.test(text)
+    || /\brm\s+-rf\b/i.test(text)
+    || /(?:&&|;)\s*(?:delete|erase|wipe|purge|destroy|rm|format)\b/i.test(text)
+    || /\b(?:remove|clear|drop)\s+(?:all\s+)?(?:(?:[a-z0-9_.-]+)\s+){0,2}(?:data|database|account|project)\b/i.test(text);
+  const credentialAction = !adviceQuestion && (/\b(?:show|tell|give|read|reveal|find|print|copy|send|share|expose|dump)\b[\s\S]{0,80}\b(?:secret|token|password|passcode|credential|api[ _-]?key)s?\b/i.test(text)
+    || /\b(?:use|change|reset|rotate|update|set|create|delete|remove|replace)\s+(?:me\s+)?(?:(?:my|the|a|an)\s+)?(?:secret|token|password|passcode|credential|api[ _-]?key)s?\b/i.test(text)
+    || /^(?:(?:please\s+)?|(?:can|could|would)\s+you\s+(?:please\s+)?)(?:log\s*in|login|sign\s*in|authenticate)\b/i.test(text)
+    || /(?:secret|token|password|credential|api[_-]?key)\s*=/i.test(rawText));
+  const financialAction = !adviceQuestion && /^(?:(?:please\s+)?|(?:can|could|would)\s+you\s+(?:please\s+)?|i\s+want\s+you\s+to\s+)(?:buy|purchase|pay|spend|transfer|wire)\b/i.test(text);
+  const privateInstructionExtraction = /\b(?:show|reveal|print|repeat|quote|dump|expose|give|tell)\b[\s\S]{0,80}\b(?:system\s+prompt|hidden\s+instructions?|internal\s+(?:files?|paths?|identifiers?|details?))\b/i.test(text);
+  if (destructiveAction || credentialAction || financialAction || privateInstructionExtraction) return { kind: 'never-delegate', objective };
+  const highImpactVerb = /\b(?:deploy|release|publish|merge|restart|systemctl|install|email|mail|tweet|post|send|message|contact|notify|forward|transfer|upload|share|approve|deny|reject|accept|ban|block|suspend|mute|hide|moderate)\b/i.test(text);
+  const scheduledAction = /\b(?:book|reserve|order|schedule)\b/i.test(text)
+    || /\b(?:set\s+up|create|add)\s+(?:(?:a|an|the)\s+)?(?:meeting|call|appointment|calendar\s+event|reminder)\b/i.test(text)
+    || /\bremind\s+me\b/i.test(text);
+  const moderationRemoval = /\bremove\s+(?:(?:the|a|an|this|that)\s+)?(?:post|comment|member|user|thread|application)\b/i.test(text);
+  const needsConfirmation = !adviceQuestion && (highImpactVerb || scheduledAction || moderationRemoval);
   const directContactRequest = /^(?:(?:please\s+)?|(?:(?:can|could|would)\s+you\s+(?:please\s+)?))(?:text|imessage|dm|whatsapp|ping)\s+(?!of\b|in\b|from\b|file\b|files\b|field\b|box\b|editor\b|content\b|contents\b|body\b|string\b)[a-z'’]+\b/i.test(text);
   const externalReplyRequest = /\breply\s+(?:to\s+(?!this\b|that\b|it\b|the\s+(?:message|thread|conversation|reply)\b)(?:[a-z'’]+|@[a-z0-9_.-]+|\+?\d[\d\s().-]*)\b|(?:by|via|over|on|in)\s+(?:email|mail|text|imessage|dm|whatsapp|slack|discord|telegram|x|twitter)\b)/i.test(text);
   if (needsConfirmation || directContactRequest || externalReplyRequest) return { kind: 'confirm', objective, actionClass: 'confirmed-high-impact' };
@@ -56,7 +69,7 @@ export function v2ActionPlan(message, workspace) {
   const text = objective.toLowerCase();
   const advisorSelections = directAdvisorSelections(objective);
   const localWrite = /^(?:please\s+)?(?:fix|implement|update|repair|patch|make|add|create|change|build|wire|adjust|improve|tighten|complete|reopen|append|replace|set|ensure|save)\b/.test(text)
-    && messageHasLocalWorkTarget(objective);
+    && (messageHasLocalWorkTarget(objective) || /\b(?:a|an|the)?\s*(?:task|note|project|project\s+task|subtask)s?\b/i.test(text));
   const workspaceInfo = workspace || { root: '', cwd: '' };
   return {
     objective,

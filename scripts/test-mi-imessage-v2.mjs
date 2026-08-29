@@ -202,6 +202,13 @@ try {
   assert.equal(sent.at(-1), 'I could not reopen this conversation safely. Please try again.');
   assert.equal(prompts, beforeCorrupt, 'corrupted session does not start Pi');
 
+  const ordinaryTermRuntime = await createRuntime({
+    stateRoot: join(root, 'ordinary-term'),
+    spawnRpc: async () => ({ ok: true, text: 'Found the saved power outages prompt.', reason: 'settled' }),
+  });
+  const ordinaryTerm = await ordinaryTermRuntime.handleEvent({ ...event('ordinary-term', 'ordinary-term', 'find the saved note'), sendReply: send });
+  assert.equal(ordinaryTerm.reply, 'Found the saved power outages prompt.', 'ordinary note text is not mistaken for internal prompt leakage');
+
   const diagnosticRawDetail = 'PRIVATE_PROMPT /home/kyle/private/session.jsonl task-secret test-token-not-secret';
   const diagnosticLogs = [];
   const originalConsoleError = console.error;
