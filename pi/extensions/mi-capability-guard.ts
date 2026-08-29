@@ -34,8 +34,8 @@ type AuditRecord = {
 
 type ToolRequest = { right: Right; resource: string; path?: string };
 
-const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate']);
-const DIVER_NOTES_READ_OPERATIONS = new Set(['tasks.list', 'notes.list', 'projects.list', 'project-tasks.list']);
+const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate', 'mi_diver_notes']);
+const DIVER_NOTES_READ_OPERATIONS = new Set(['tactics-journal.context', 'tasks.list', 'notes.list', 'projects.list', 'project-tasks.list']);
 const DIVER_NOTES_WRITE_OPERATIONS = new Set(['tasks.add', 'tasks.complete', 'tasks.reopen', 'notes.add', 'projects.ensure', 'project-tasks.add', 'project-tasks.complete', 'project-tasks.reopen', 'project-subtasks.add', 'project-subtasks.complete', 'project-subtasks.reopen']);
 const BLOCKED_ORCHESTRATOR_TOOLS = new Set(['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover']);
 const PROTECTED_PATH_NAMES = new Set(['.git', '.pi', '.config', '.ssh', 'node_modules', 'state', 'secrets', 'credentials', 'config']);

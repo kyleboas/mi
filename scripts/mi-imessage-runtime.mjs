@@ -352,6 +352,15 @@ async function recoverStaleRunning(stateRoot) {
   }
 }
 
+async function tacticsJournalContext(message) {
+  if (!/\btactics\s+journal\b/i.test(String(message || ''))) return '';
+  const file = path.join(root, 'state', 'tactics-journal-monitor-state.json');
+  try {
+    const value = JSON.parse(await readFile(file, 'utf8'));
+    return JSON.stringify({ checkedAt: value.checkedAt, availability: value.availability, checks: value.checks });
+  } catch { return ''; }
+}
+
 function workspaceFromEnvironment() {
   const workspaceRootSetting = String(process.env.MI_IMESSAGE_WORKSPACE_ROOT || path.join(os.homedir(), 'workflows')).trim();
   const workspaceCwdSetting = String(process.env.MI_IMESSAGE_WORKSPACE_CWD || workspaceRootSetting).trim();
@@ -787,7 +796,8 @@ export class ImessageRuntime {
       ? diverNotesPreflight({ message, plan })
       : { access: 'none' };
     if (diverNotes.reply) return { reply: diverNotes.reply, taskIds: [] };
-    return this.runCoordinator(record, directory, { ...plan, diverNotesAccess: diverNotes.access });
+    const suppliedContext = await tacticsJournalContext(message);
+    return this.runCoordinator(record, directory, { ...plan, diverNotesAccess: diverNotes.access, suppliedContext });
   }
 
   async runCoordinator(record, directory, plan) {
@@ -841,7 +851,7 @@ export class ImessageRuntime {
     const startedAt = Date.now();
     const result = await this.spawnRpc({
       launch, requestId: correlationId,
-      prompt: miCoordinatorPrompt({ message: record.rawMessage, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass, advisorSelections: plan.advisorSelections, diverNotesAccess: plan.diverNotesAccess }),
+      prompt: miCoordinatorPrompt({ message: record.rawMessage, tacticsContext: plan.suppliedContext, confirmedObjective: plan.confirmedObjective, actionClass: plan.actionClass, advisorSelections: plan.advisorSelections, diverNotesAccess: plan.diverNotesAccess }),
       timeoutMs: coordinatorTimeoutMs,
       onSpawn: (child) => {
         this.children.add(child);

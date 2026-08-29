@@ -1,6 +1,10 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { invokeDivernote, invokeProjectContent } from '../../../.pi/agent/extensions/divernote/adapter.ts';
+import type { invokeDivernote as InvokeDivernote, invokeProjectContent as InvokeProjectContent } from '../../../.pi/agent/extensions/divernote/adapter.ts';
+
+const divernoteAdapter = await import('../../../.pi/agent/extensions/divernote/adapter.ts');
+const invokeDivernote = (divernoteAdapter.invokeDivernote || divernoteAdapter.default?.invokeDivernote) as typeof InvokeDivernote;
+const invokeProjectContent = (divernoteAdapter.invokeProjectContent || divernoteAdapter.default?.invokeProjectContent) as typeof InvokeProjectContent;
 
 export const DIVER_NOTES_BACKEND = 'canonical-pi-divernote';
 const TOOL_CONTENT_CAP = 24 * 1024;
@@ -16,10 +20,12 @@ type OperationSpec = {
   itemType?: 'task' | 'note';
   itemOperation?: 'retrieve' | 'add' | 'edit';
   projectGroup?: 'projects' | 'project-tasks' | 'project-subtasks';
-  projectOperation?: 'list' | 'create' | 'add' | 'complete' | 'reopen';
+  projectOperation?: 'list' | 'read' | 'create' | 'add' | 'complete' | 'reopen';
+  aggregate?: 'tactics-journal-context';
 };
 
 const operations: Record<string, OperationSpec> = {
+  'tactics-journal.context': { args: {}, aggregate: 'tactics-journal-context' },
   'tasks.list': { args: {}, itemType: 'task', itemOperation: 'retrieve' },
   'tasks.add': { args: { text: 'text', date: 'date' }, required: ['text'], write: true, itemType: 'task', itemOperation: 'add' },
   'tasks.complete': { args: { id: 'id' }, required: ['id'], write: true, itemType: 'task', itemOperation: 'edit' },
@@ -49,12 +55,58 @@ function canonicalInput(operation: string, input: Input) {
   return { spec, values: Object.fromEntries(Object.keys(spec.args).filter((key) => input[key] !== undefined).map((key) => [key, input[key]])) };
 }
 
+function recordList(value: unknown, key: string) {
+  if (!value || typeof value !== 'object' || !Array.isArray((value as Record<string, unknown>)[key])) return [];
+  return (value as Record<string, unknown>)[key] as Array<Record<string, unknown>>;
+}
+
+function compactText(value: unknown, limit = 700) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function compactTacticsJournalContext(notesValue: unknown, tasksValue: unknown, projectsValue: unknown, projectValues: unknown[]) {
+  const relevant = /\b(?:tactics journal|newsletter|football clubs?|board|community|ama)\b/i;
+  const notes = recordList(notesValue, 'notes')
+    .filter((note) => relevant.test(String(note.text || '')))
+    .slice(-8)
+    .map((note) => ({ text: compactText(note.text, 360), date: note.date }));
+  const tasks = recordList(tasksValue, 'tasks')
+    .filter((task) => relevant.test(String(task.text || '')))
+    .slice(-8)
+    .map((task) => ({ text: compactText(task.text, 220), state: task.state, date: task.date }));
+  const projects = projectValues.map((value) => {
+    const project = value && typeof value === 'object' ? (value as Record<string, unknown>).project as Record<string, unknown> : undefined;
+    if (!project) return undefined;
+    return {
+      name: compactText(project.name, 160), lifecycle: project.lifecycle, updatedAt: project.updatedAt,
+      tasks: recordList(project, 'tasks')
+        .filter((task) => task.completed !== true && String(task.status || '').toLowerCase() !== 'completed')
+        .slice(0, 6)
+        .map((task) => ({ text: compactText(task.text || task.title, 220), status: task.status, date: task.date })),
+    };
+  }).filter(Boolean);
+  return { scope: 'Tactics Journal', notes, tasks, projects, projectCount: recordList(projectsValue, 'projects').length };
+}
+
 export async function runDiverNotes(input: Input, { invokeItem = invokeDivernote, invokeProject = invokeProjectContent }: { invokeItem?: ItemInvoke; invokeProject?: ProjectInvoke } = {}): Promise<{ ok: boolean; value?: unknown; error?: string }> {
   try {
     const operation = String(input?.operation || '');
     const { spec, values } = canonicalInput(operation, input);
     let value: unknown;
-    if (spec.itemType && spec.itemOperation) {
+    if (spec.aggregate === 'tactics-journal-context') {
+      const [notesValue, tasksValue, projectsValue] = await Promise.all([
+        invokeItem('retrieve', { itemType: 'note' }), invokeItem('retrieve', { itemType: 'task' }), invokeProject('projects', 'list', {}),
+      ]);
+      const relevantProjects = recordList(projectsValue, 'projects')
+        .filter((project) => /\b(?:tactics journal|board|community|ama)\b/i.test(String(project.name || '')))
+        .slice(0, 8);
+      const projectValues = await Promise.all(relevantProjects.map((project) => invokeProject('projects', 'read', { project: String(project.id || project.slug || '') })));
+      value = compactTacticsJournalContext(notesValue, tasksValue, projectsValue, projectValues);
+    } else if (operation === 'project-tasks.list') {
+      const projectValue = await invokeProject('projects', 'read', values as Parameters<ProjectInvoke>[2]);
+      const project = projectValue && typeof projectValue === 'object' ? (projectValue as Record<string, unknown>).project as Record<string, unknown> : undefined;
+      value = { project: project ? { name: project.name, lifecycle: project.lifecycle, updatedAt: project.updatedAt } : undefined, tasks: recordList(project, 'tasks') };
+    } else if (spec.itemType && spec.itemOperation) {
       const itemInput = { ...values, itemType: spec.itemType } as Parameters<ItemInvoke>[1];
       if (operation === 'tasks.complete' || operation === 'tasks.reopen') itemInput.state = operation.endsWith('complete') ? 'completed' : 'open';
       value = await invokeItem(spec.itemOperation, itemInput);
@@ -96,7 +148,7 @@ export default function miDiverNotes(pi: ExtensionAPI) {
   pi.registerTool({
     name: 'mi_diver_notes',
     label: 'Divernote',
-    description: 'Use the canonical Pi Divernote path to read or make the exact requested change in the owner’s private vault.',
+    description: 'Use the canonical Pi Divernote path to read or make the exact requested change in the owner’s private vault. For a Tactics Journal operating brief, use tactics-journal.context once.',
     parameters: diverNotesSchema,
     async execute(_id, params) {
       const result = await runDiverNotes(params as Input);
