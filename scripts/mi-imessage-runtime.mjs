@@ -816,7 +816,7 @@ export class ImessageRuntime {
     });
     let piConfigDirectory;
     try {
-      piConfigDirectory = process.env.PI_CONFIG_DIR || await prepareCoordinatorPiConfig(this.stateRoot);
+      piConfigDirectory = process.env.PI_CODING_AGENT_DIR || await prepareCoordinatorPiConfig(this.stateRoot);
     } catch {
       console.error('Diver could not prepare its private Pi authentication directory.');
       return { reply: IMESSAGE_REPLIES.startFailure, taskIds: [] };
@@ -831,7 +831,7 @@ export class ImessageRuntime {
         MI_ROOT: root, MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: grants,
         MI_CAPABILITY_AUDIT_FILE: path.join(directory, 'runtime', 'capability-audit.jsonl'),
         MI_COORDINATOR_POLICY_FILE: policy, MI_SOCKET_PATH: socketPath,
-        ...(piConfigDirectory ? { PI_CONFIG_DIR: piConfigDirectory } : {}),
+        ...(piConfigDirectory ? { PI_CODING_AGENT_DIR: piConfigDirectory } : {}),
       }),
     });
     const taskIds = new Set();
