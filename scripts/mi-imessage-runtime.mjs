@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
-import { realpathSync, statSync } from 'node:fs';
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { constants as fsConstants, realpathSync, statSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -151,6 +151,32 @@ async function ensurePrivateDirectory(directory) {
   const verified = await lstat(directory);
   if (!verified.isDirectory() || verified.isSymbolicLink()) throw new Error('private directory is not a real directory');
   await chmod(directory, 0o700);
+}
+
+export async function prepareCoordinatorPiConfig(stateRoot, sourceAuthPath = path.join(os.homedir(), '.pi', 'agent', 'auth.json')) {
+  const source = await lstat(sourceAuthPath).catch((error) => error?.code === 'ENOENT' ? undefined : Promise.reject(error));
+  if (!source) return undefined;
+  if (!source.isFile() || source.isSymbolicLink() || (source.mode & 0o077) !== 0 || (typeof process.getuid === 'function' && source.uid !== process.getuid())) {
+    throw new Error('Pi auth source is not a private owned file');
+  }
+  const configDirectory = path.join(stateRoot, 'imessage', 'runtime', 'pi-config');
+  await ensurePrivateDirectory(configDirectory);
+  const destination = path.join(configDirectory, 'auth.json');
+  const current = await lstat(destination).catch((error) => error?.code === 'ENOENT' ? undefined : Promise.reject(error));
+  if (current) {
+    if (!current.isFile() || current.isSymbolicLink() || (typeof process.getuid === 'function' && current.uid !== process.getuid())) throw new Error('Pi auth copy is not a private owned file');
+    await chmod(destination, 0o600);
+    return configDirectory;
+  }
+  const temporary = path.join(configDirectory, `.auth-${process.pid}-${randomBytes(8).toString('hex')}.tmp`);
+  try {
+    await copyFile(sourceAuthPath, temporary, fsConstants.COPYFILE_EXCL);
+    await chmod(temporary, 0o600);
+    await rename(temporary, destination);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+  return configDirectory;
 }
 
 async function atomicJsonWrite(file, value) {
@@ -788,6 +814,13 @@ export class ImessageRuntime {
       correlationId, objective: plan.objective, workspace, allowWrite: plan.allowWrite,
       advisorSelections: [...new Set(plan.advisorSelections || [])].filter((name) => name === 'Seth' || name === 'Alex'), socketPath,
     });
+    let piConfigDirectory;
+    try {
+      piConfigDirectory = process.env.PI_CONFIG_DIR || await prepareCoordinatorPiConfig(this.stateRoot);
+    } catch {
+      console.error('Diver could not prepare its private Pi authentication directory.');
+      return { reply: IMESSAGE_REPLIES.startFailure, taskIds: [] };
+    }
     const launch = miCoordinatorLaunch({
       piCommand: process.env.PI_CMD || 'pi', cwd: workspace.cwd, sessionPath,
       model: process.env.DIVER_WORKER_MODEL || process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.6-luna:high',
@@ -798,6 +831,7 @@ export class ImessageRuntime {
         MI_ROOT: root, MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: grants,
         MI_CAPABILITY_AUDIT_FILE: path.join(directory, 'runtime', 'capability-audit.jsonl'),
         MI_COORDINATOR_POLICY_FILE: policy, MI_SOCKET_PATH: socketPath,
+        ...(piConfigDirectory ? { PI_CONFIG_DIR: piConfigDirectory } : {}),
       }),
     });
     const taskIds = new Set();
