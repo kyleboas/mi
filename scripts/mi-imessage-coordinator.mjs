@@ -37,6 +37,21 @@ function boundedFailureText(value) {
   return typeof value === 'string' ? value.slice(0, FAILURE_DETAIL_CAP) : '';
 }
 
+function safeFailureDiagnostic(response, stderr = '') {
+  const detail = `${responseFailureText(response)} ${boundedFailureText(stderr)}`.toLowerCase();
+  const signals = [];
+  if (/openai-codex/.test(detail)) signals.push('provider=openai-codex');
+  if (/no (?:api )?key|missing (?:api )?key/.test(detail)) signals.push('missing-api-key');
+  if (/no authentication|authentication (?:is )?missing|login required/.test(detail)) signals.push('missing-auth');
+  if (/token expired|oauth.{0,30}expired/.test(detail)) signals.push('oauth-expired');
+  if (/\b401\b|unauthori[sz]ed/.test(detail)) signals.push('http-401');
+  if (/\b403\b|forbidden/.test(detail)) signals.push('http-403');
+  if (/\beacces\b|permission denied/.test(detail)) signals.push('filesystem-denied');
+  if (/\berofs\b|read-only file system/.test(detail)) signals.push('filesystem-read-only');
+  if (/\benoent\b|no such file/.test(detail)) signals.push('file-missing');
+  return signals.slice(0, 4).join(',');
+}
+
 function failureFieldText(value) {
   if (typeof value === 'string') return boundedFailureText(value);
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
@@ -203,6 +218,7 @@ export function runMiCoordinatorRpc({
         reason,
         text: finalText || '',
         failureClass: result.ok ? undefined : safeCoordinatorFailureClass(failureClass),
+        diagnostic: result.ok ? undefined : safeFailureDiagnostic(rejectionResponse, stderr),
         child,
       };
       resolve(finishedResult);

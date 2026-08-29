@@ -833,7 +833,7 @@ export class ImessageRuntime {
       return { reply, taskIds: ids };
     }
     if (!result.ok) {
-      console.error(`Mi iMessage coordinator failed: ${safeCoordinatorFailureClass(result.failureClass)}`);
+      console.error(`Diver iMessage coordinator failed: ${safeCoordinatorFailureClass(result.failureClass)}${result.diagnostic ? ` (${result.diagnostic})` : ''}`);
       const reply = result.reason === 'timeout' ? IMESSAGE_REPLIES.timeout
         : ['exited-SIGTERM', 'exited-SIGINT', 'exited-SIGKILL'].includes(result.reason) ? IMESSAGE_REPLIES.interruption
           : result.reason === 'spawn-error' ? IMESSAGE_REPLIES.startFailure : IMESSAGE_REPLIES.startFailure;

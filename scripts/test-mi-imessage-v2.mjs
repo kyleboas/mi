@@ -219,7 +219,7 @@ try {
   assert.equal(diagnostic.status, 'sent');
   assert.equal(sent.at(-1), IMESSAGE_REPLIES.startFailure, 'diagnostics keep the generic user-facing reply');
   assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_PROMPT|session\.jsonl|task-secret|test-token-not-secret/, 'raw rejection detail cannot reach runtime results');
-  assert.deepEqual(diagnosticLogs, ['Mi iMessage coordinator failed: provider-auth-failed'], 'runtime logs only the allowlisted failure class');
+  assert.deepEqual(diagnosticLogs, ['Diver iMessage coordinator failed: provider-auth-failed'], 'runtime logs the allowlisted failure class without untrusted detail when none is present');
   assert.doesNotMatch(diagnosticLogs.join('\n'), /PRIVATE_PROMPT|session\.jsonl|task-secret|test-token-not-secret/, 'raw rejection detail cannot reach runtime logs');
 
   const order = [];
