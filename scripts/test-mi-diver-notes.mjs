@@ -7,8 +7,17 @@ const mod = await import(pathToFileURL(new URL('../pi/extensions/mi-diver-notes.
 const { runDiverNotes, boundedDivernoteResult, DIVER_NOTES_BACKEND, DIVER_NOTES_READ_OPERATIONS, DIVER_NOTES_WRITE_OPERATIONS } = mod;
 assert.equal(DIVER_NOTES_BACKEND, 'canonical-pi-divernote');
 assert.ok(DIVER_NOTES_READ_OPERATIONS.has('notes.list'));
+assert.ok(DIVER_NOTES_READ_OPERATIONS.has('tactics-journal.context'));
 assert.ok(DIVER_NOTES_WRITE_OPERATIONS.has('notes.add'));
 let call;
+let projectCalls = [];
+const contextResult = await runDiverNotes({ operation: 'tactics-journal.context' }, {
+  invokeItem: async (_operation, input) => input.itemType === 'note' ? { notes: [{ text: 'Tactics Journal idea', date: '2026-08-01' }] } : { tasks: [] },
+  invokeProject: async (group, operation, input) => { projectCalls.push({ group, operation, input }); return operation === 'list' ? { projects: [] } : { project: { name: 'Board', tasks: [] } }; },
+});
+assert.equal(contextResult.ok, true);
+assert.equal(JSON.parse(JSON.stringify(contextResult.value)).scope, 'Tactics Journal');
+assert.equal(projectCalls[0].operation, 'list');
 const result = await runDiverNotes({ operation: 'notes.add', text: 'This is a note.' }, {
   invokeItem: async (operation, input) => { call = { operation, input }; return { ok: true, note: { text: input.text } }; },
 });

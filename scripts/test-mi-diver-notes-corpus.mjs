@@ -143,7 +143,8 @@ for (const [index, [message, expectedClass, expectedAccess, expectedHandoff, ope
     const invoke = async () => fixtureFor(actualOperation);
     const result = await runDiverNotes(input, { invokeItem: invoke, invokeProject: invoke });
     assert.equal(result.ok, true, `case ${index + 1} reaches mocked broker: ${result.error || 'ok'}`);
-    assert.equal(result.value.mocked, true);
+    if (actualOperation === 'project-tasks.list') assert.ok('tasks' in result.value, 'project task reads return a bounded task list');
+    else assert.equal(result.value.mocked, true);
     mocked = 'mocked-success';
   }
   const outcome = { message, route: route.kind, access: intent.access, handoff, operation: actualOperation, expectedOperation: operation, reply: preflight.reply || mocked, mocked };
