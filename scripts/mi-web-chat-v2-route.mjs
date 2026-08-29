@@ -37,8 +37,11 @@ export function v2RiskClassification(message) {
   if (!text || /^[^\p{L}\p{N}]+$/u.test(text)) return { kind: 'clarify', objective };
   const adviceQuestion = /^(?:how|what|why|when|where|which)\b|^(?:should|can|could|would)\s+(?:i|we)\b/i.test(text);
   const destructiveAction = /^(?:(?:please\s+)?|(?:can|could|would)\s+you\s+(?:please\s+)?|i\s+want\s+you\s+to\s+)(?:delete|erase|wipe|purge|destroy|rm|format)\b/i.test(text)
+    || /\brm\s+-rf\b/i.test(text)
+    || /(?:&&|;)\s*(?:delete|erase|wipe|purge|destroy|rm|format)\b/i.test(text)
     || /\b(?:remove|clear|drop)\s+(?:all\s+)?(?:(?:[a-z0-9_.-]+)\s+){0,2}(?:data|database|account|project)\b/i.test(text);
-  const credentialAction = !adviceQuestion && (/\b(?:show|tell|give|read|reveal|find|print|copy|send|share|expose|dump|use|change|reset|rotate|update|set|create|delete|remove|replace)\s+(?:me\s+)?(?:(?:my|the|a|an)\s+)?(?:secret|token|password|passcode|credential|api[ _-]?key)s?\b/i.test(text)
+  const credentialAction = !adviceQuestion && (/\b(?:show|tell|give|read|reveal|find|print|copy|send|share|expose|dump)\b[\s\S]{0,80}\b(?:secret|token|password|passcode|credential|api[ _-]?key)s?\b/i.test(text)
+    || /\b(?:use|change|reset|rotate|update|set|create|delete|remove|replace)\s+(?:me\s+)?(?:(?:my|the|a|an)\s+)?(?:secret|token|password|passcode|credential|api[ _-]?key)s?\b/i.test(text)
     || /^(?:(?:please\s+)?|(?:can|could|would)\s+you\s+(?:please\s+)?)(?:log\s*in|login|sign\s*in|authenticate)\b/i.test(text)
     || /(?:secret|token|password|credential|api[_-]?key)\s*=/i.test(rawText));
   const financialAction = !adviceQuestion && /^(?:(?:please\s+)?|(?:can|could|would)\s+you\s+(?:please\s+)?|i\s+want\s+you\s+to\s+)(?:buy|purchase|pay|spend|transfer|wire)\b/i.test(text);

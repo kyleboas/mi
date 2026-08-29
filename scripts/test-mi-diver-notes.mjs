@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { diverNotesIntent } from './mi-diver-notes-intent.mjs';
 
 const mod = await import(pathToFileURL(new URL('../pi/extensions/mi-diver-notes.ts', import.meta.url).pathname).href);
-const { runDiverNotes, DIVER_NOTES_BACKEND, DIVER_NOTES_READ_OPERATIONS, DIVER_NOTES_WRITE_OPERATIONS } = mod;
+const { runDiverNotes, boundedDivernoteResult, DIVER_NOTES_BACKEND, DIVER_NOTES_READ_OPERATIONS, DIVER_NOTES_WRITE_OPERATIONS } = mod;
 assert.equal(DIVER_NOTES_BACKEND, 'canonical-pi-divernote');
 assert.ok(DIVER_NOTES_READ_OPERATIONS.has('notes.list'));
 assert.ok(DIVER_NOTES_WRITE_OPERATIONS.has('notes.add'));
@@ -15,5 +15,9 @@ const result = await runDiverNotes({ operation: 'notes.add', text: 'This is a no
 assert.deepEqual(call, { operation: 'add', input: { itemType: 'note', text: 'This is a note.' } });
 assert.equal(result.ok, true);
 assert.equal((await runDiverNotes({ operation: 'notes.add' }, { invokeItem: async () => ({}) })).ok, false);
+const bounded = JSON.parse(boundedDivernoteResult({ notes: Array.from({ length: 1000 }, (_, id) => ({ id, text: 'x'.repeat(200) })) }));
+assert.equal(bounded.truncated, true);
+assert.equal(bounded.total, 1000);
+assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= 24 * 1024);
 assert.deepEqual(diverNotesIntent({ message: 'Add a note. The note text is: This is a note.', plan: { allowWrite: true } }), { access: 'write' });
 console.log('Mi canonical Divernote extension checks passed.');

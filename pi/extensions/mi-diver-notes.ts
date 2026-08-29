@@ -3,6 +3,7 @@ import { Type } from 'typebox';
 import { invokeDivernote, invokeProjectContent } from '../../../.pi/agent/extensions/divernote/adapter.ts';
 
 export const DIVER_NOTES_BACKEND = 'canonical-pi-divernote';
+const TOOL_CONTENT_CAP = 24 * 1024;
 
 type Input = Record<string, unknown>;
 type ItemInvoke = typeof invokeDivernote;
@@ -68,6 +69,23 @@ export async function runDiverNotes(input: Input, { invokeItem = invokeDivernote
   }
 }
 
+export function boundedDivernoteResult(value: unknown) {
+  const text = JSON.stringify(value);
+  if (Buffer.byteLength(text) <= TOOL_CONTENT_CAP) return text;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return JSON.stringify({ truncated: true });
+  const record = value as Record<string, unknown>;
+  const arrayKey = Object.keys(record).find((key) => Array.isArray(record[key]));
+  if (!arrayKey) return JSON.stringify({ truncated: true });
+  const source = record[arrayKey] as unknown[];
+  const items: unknown[] = [];
+  for (const item of source) {
+    const candidate = JSON.stringify({ [arrayKey]: [...items, item], total: source.length, truncated: true });
+    if (Buffer.byteLength(candidate) > TOOL_CONTENT_CAP) break;
+    items.push(item);
+  }
+  return JSON.stringify({ [arrayKey]: items, total: source.length, truncated: items.length < source.length });
+}
+
 const toolVariants = Object.entries(operations).map(([operation, spec]) => Type.Object({
   operation: Type.Literal(operation),
   ...Object.fromEntries(Object.keys(spec.args).map((key) => [key, Type.Optional(Type.String({ maxLength: key === 'text' ? 12000 : 512 }))])),
@@ -83,7 +101,7 @@ export default function miDiverNotes(pi: ExtensionAPI) {
     async execute(_id, params) {
       const result = await runDiverNotes(params as Input);
       return result.ok
-        ? { content: [{ type: 'text', text: JSON.stringify(result.value).slice(0, 128 * 1024) }], details: { operation: params.operation, backend: DIVER_NOTES_BACKEND } }
+        ? { content: [{ type: 'text', text: boundedDivernoteResult(result.value) }], details: { operation: params.operation, backend: DIVER_NOTES_BACKEND } }
         : { content: [{ type: 'text', text: result.error || 'Divernote request failed.' }], details: { operation: params.operation, backend: DIVER_NOTES_BACKEND, failed: true } };
     },
   });

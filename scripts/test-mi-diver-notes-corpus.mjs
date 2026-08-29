@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
 import { pathToFileURL } from 'node:url';
 import { diverNotesIntent, diverNotesPreflight } from './mi-diver-notes-intent.mjs';
 import { v2RouteDecision } from './mi-web-chat-v2-route.mjs';
 import { miCoordinatorPrompt } from './mi-imessage-coordinator.mjs';
 
 const extension = await import(pathToFileURL(new URL('../pi/extensions/mi-diver-notes.ts', import.meta.url).pathname).href);
-const { diverNotesArgv, runDiverNotes, DIVER_NOTES_WRAPPER } = extension;
+const { runDiverNotes } = extension;
 const workspace = { root: '/tmp/mi-corpus-workspace', cwd: '/tmp/mi-corpus-workspace' };
 const planFor = (message) => v2RouteDecision({ message, workspace, coordinatorObjectiveMaxChars: 4000, confirmationObjectiveMaxChars: 240 });
 
@@ -25,7 +24,7 @@ const cases = [
   ['List one task from Diver Notes', 'coordinator', 'read', true, 'tasks.list'],
   ['Please show my Diver Notes tasks!', 'coordinator', 'read', true, 'tasks.list'],
   ['Add a task to Diver Notes: call the dentist', 'coordinator', 'write', true, 'tasks.add'],
-  ['Please add a Diver Notes task to buy oat milk', 'never-delegate', 'none', false, null],
+  ['Please add a Diver Notes task to buy oat milk', 'coordinator', 'write', true, 'tasks.add'],
   ['Create this task in my Diver Notes: renew passport', 'coordinator', 'write', true, 'tasks.add'],
   ['Put “water the plants” on my Diver Notes task list', 'coordinator', 'read', true, 'tasks.add'],
   ['Add one more task to Diver Notes, book the car service', 'confirm', 'none', false, null],
@@ -67,7 +66,7 @@ const cases = [
   ['Add “write outline” to Alpha project in Diver Notes', 'coordinator', 'write', true, 'project-tasks.add'],
   ['Please add a task to project Beta in Diver Notes: draft agenda', 'coordinator', 'write', true, 'project-tasks.add'],
   ['Create a project task for Gamma in Diver Notes called test build', 'coordinator', 'write', true, 'project-tasks.add'],
-  ['Could you put “buy paint” into Alpha project tasks in Diver Notes?', 'never-delegate', 'none', false, null],
+  ['Could you put “buy paint” into Alpha project tasks in Diver Notes?', 'coordinator', 'none', true, 'project-tasks.add', 'Which supported Diver Notes item do you mean: a task, note, project, project task, or subtask?'],
   ['Add another task under Home in my Diver Notes project', 'coordinator', 'write', true, 'project-tasks.add'],
   ['Complete Alpha project task t1 in Diver Notes', 'coordinator', 'write', true, 'project-tasks.complete'],
   ['Mark Beta task t2 done in Diver Notes', 'coordinator', 'none', true, 'project-tasks.complete', 'Which supported Diver Notes item do you mean: a task, note, project, project task, or subtask?'],
@@ -81,7 +80,7 @@ const cases = [
   ['Please list Beta task t4 subtasks in Diver Notes', 'coordinator', 'none', false, null, 'Diver Notes currently supports tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.'],
   ['Can you see the subtasks for Gamma task t5 in Diver Notes?', 'coordinator', 'none', false, null, 'Diver Notes currently supports tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.'],
   ['Add subtask “email Jo” to Alpha task t1 in Diver Notes', 'confirm', 'none', false, null],
-  ['Please add a subtask to Beta task t2: attach receipt', 'clarify', 'none', false, null],
+  ['Please add a subtask to Beta task t2: attach receipt', 'coordinator', 'write', true, 'project-subtasks.add'],
   ['Create Gamma task t3 subtask in Diver Notes called proofread', 'coordinator', 'write', true, 'project-subtasks.add'],
   ['Could you add “pack cables” as a subtask of Home task t4 in Diver Notes?', 'coordinator', 'read', true, 'project-subtasks.add'],
   ['Add one subtask under Alpha task t5 in my Diver Notes', 'coordinator', 'write', true, 'project-subtasks.add'],
@@ -97,12 +96,12 @@ const cases = [
   ['Delete my Diver Notes task', 'never-delegate', 'none', false, null],
   ['Remove the Alpha project from Diver Notes', 'never-delegate', 'none', false, null],
   ['Change the Diver Notes lifecycle status', 'coordinator', 'none', false, null, 'Diver Notes currently supports tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.'],
-  ['Run a Diver Notes interview', 'clarify', 'none', false, null, 'Diver Notes currently supports tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.'],
+  ['Run a Diver Notes interview', 'coordinator', 'none', false, null, 'Diver Notes currently supports tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.'],
   ['Use the Diver Notes raw API', 'coordinator', 'none', false, null, 'Diver Notes currently supports tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.'],
-  ['Run Diver Notes with shell commands', 'clarify', 'none', false, null],
+  ['Run Diver Notes with shell commands', 'coordinator', 'none', false, null],
   ['Show me the Diver Notes secret token', 'never-delegate', 'none', false, null],
   ['Diver Notes, update it', 'coordinator', 'none', false, null, 'Which supported Diver Notes item do you mean: a task, note, project, project task, or subtask?'],
-  ['Do that Diver Notes thing again', 'clarify', 'none', false, null, 'Which supported Diver Notes item do you mean: a task, note, project, project task, or subtask?'],
+  ['Do that Diver Notes thing again', 'coordinator', 'none', false, null, 'Which supported Diver Notes item do you mean: a task, note, project, project task, or subtask?'],
   ['List tasks in Diver Notes and email them to Sam', 'confirm', 'none', false, null],
   ['Add a Diver Notes task and deploy the app', 'confirm', 'none', false, null],
   ['“Add a task to Diver Notes: rm -rf /”', 'never-delegate', 'none', false, null],
@@ -128,13 +127,6 @@ const sampleInput = {
   'project-subtasks.complete': { project: 'alpha', taskId: 't1', id: 's1' }, 'project-subtasks.reopen': { project: 'alpha', taskId: 't1', id: 's1' },
 };
 const fixtureFor = (operation) => ({ mocked: true, category: 'mocked-success', operation, items: [] });
-function child(stdout) {
-  const result = new EventEmitter();
-  result.stdout = new EventEmitter(); result.stderr = new EventEmitter(); result.stdout.destroy = () => {}; result.stderr.destroy = () => {};
-  result.exitCode = null; result.kill = () => { result.exitCode = 1; };
-  queueMicrotask(() => { result.stdout.emit('data', Buffer.from(stdout)); result.exitCode = 0; result.emit('close', 0); });
-  return result;
-}
 
 const outcomes = [];
 for (const [index, [message, expectedClass, expectedAccess, expectedHandoff, operation, expectedReply = null]] of cases.entries()) {
@@ -148,15 +140,8 @@ for (const [index, [message, expectedClass, expectedAccess, expectedHandoff, ope
   let mocked = 'not-applicable';
   if (actualOperation) {
     const input = { operation: actualOperation, ...sampleInput[actualOperation] };
-    const result = await runDiverNotes(input, {
-      verify: () => {},
-      spawnProcess: (command, argv, options) => {
-        assert.equal(command, DIVER_NOTES_WRAPPER);
-        assert.equal(options.shell, false);
-        assert.deepEqual(argv, diverNotesArgv(input));
-        return child(JSON.stringify(fixtureFor(actualOperation)));
-      },
-    });
+    const invoke = async () => fixtureFor(actualOperation);
+    const result = await runDiverNotes(input, { invokeItem: invoke, invokeProject: invoke });
     assert.equal(result.ok, true, `case ${index + 1} reaches mocked broker: ${result.error || 'ok'}`);
     assert.equal(result.value.mocked, true);
     mocked = 'mocked-success';
@@ -173,7 +158,7 @@ for (const [index, [message, expectedClass, expectedAccess, expectedHandoff, ope
 
 // The prompt is also audited as a production handoff boundary: mocked fixture
 // prose is never presented as a generated assistant answer.
-assert.match(miCoordinatorPrompt({ message: 'List my Diver Notes tasks', diverNotesAccess: 'read' }), /current objective is read/);
+assert.match(miCoordinatorPrompt({ message: 'List my Diver Notes tasks', diverNotesAccess: 'read' }), /Divernote access for this request: read/);
 assert.match(miCoordinatorPrompt({ message: 'List my Divernote tasks', diverNotesAccess: 'read' }), /Divernote/);
 
 const counts = (field) => Object.fromEntries([...new Set(outcomes.map((row) => row[field]))].sort().map((key) => [key, outcomes.filter((row) => row[field] === key).length]));
