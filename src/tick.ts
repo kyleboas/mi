@@ -6,12 +6,14 @@ import { runBudgetGuardMonitor } from './budget-guard-monitor.js';
 import { runCapabilityGrantGc, writeCapabilityGrantGcMarker } from './capability-gc.js';
 import { tickReminderCrons } from './crons.js';
 import { runImessageMonitor } from './imessage-monitor.js';
+import { runTacticsJournalMonitor } from './tactics-journal-monitor.js';
 import { runDreamConsolidation } from './memory.js';
 import { logEvent } from './state.js';
 
 export type MiTickResult = {
   reminders: Array<{ name: string; status: 'ok' | 'error' | 'skipped' }>;
   imessageMonitor: Awaited<ReturnType<typeof runImessageMonitor>>;
+  tacticsJournalMonitor: Awaited<ReturnType<typeof runTacticsJournalMonitor>>;
   budgetGuardMonitor: Awaited<ReturnType<typeof runBudgetGuardMonitor>>;
   capabilityGrantGc: Awaited<ReturnType<typeof runCapabilityGrantGc>>;
   memory: Awaited<ReturnType<typeof runDreamConsolidation>>;
@@ -128,6 +130,10 @@ export async function runMiTick(): Promise<MiTickResult> {
       error: error instanceof Error ? error.message : String(error),
     }));
     const imessageMonitor = await runImessageMonitor();
+    const tacticsJournalMonitor = await runTacticsJournalMonitor().catch((error) => ({
+      status: 'error' as const,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
     const budgetGuardMonitor = await runBudgetGuardMonitor().catch((error) => ({
       status: 'error' as const,
       reason: error instanceof Error ? error.message : String(error),
@@ -138,8 +144,9 @@ export async function runMiTick(): Promise<MiTickResult> {
       capabilityGrantGc,
       memory: memory.status,
       imessageMonitor: imessageMonitor.status,
+      tacticsJournalMonitor: tacticsJournalMonitor.status,
       budgetGuardMonitor: budgetGuardMonitor.status,
     });
-    return { reminders, imessageMonitor, budgetGuardMonitor, capabilityGrantGc, memory };
+    return { reminders, imessageMonitor, tacticsJournalMonitor, budgetGuardMonitor, capabilityGrantGc, memory };
   });
 }

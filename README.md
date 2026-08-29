@@ -4,7 +4,7 @@ Mi is a small local assistant interface built around four surfaces:
 
 1. `mi` — the main Mi conversation.
 2. `mi agents` — the live background-agent view.
-3. `mi tick` — scheduled reminders, memory upkeep, capability-file cleanup, and iMessage repair checks.
+3. `mi tick` — scheduled reminders, memory upkeep, capability-file cleanup, iMessage repair checks, and Tactics Journal public health checks.
 4. the Mi pi extension — side-channel Mi commands inside pi.
 
 Everything else in this repo exists to support those surfaces.
@@ -83,7 +83,8 @@ Mi discovers pi sessions from the default pi session store (`~/.pi/agent/session
 - runs due reminder-only crons from `~/mi/state/crons.json`;
 - removes expired capability grant files;
 - runs memory consolidation when it is due;
-- runs the iMessage send-failure repair monitor; and
+- runs the iMessage send-failure repair monitor;
+- checks the public Tactics Journal site health API, Board shell, Community status, and AMA status; and
 - polls Budget Guard for deduplicated iMessage alerts.
 
 A lock at `state/tick.lock` prevents overlapping runs. The systemd timer runs every minute, while the repair and Budget Guard monitors each limit themselves to once every 15 minutes by default.
@@ -93,6 +94,8 @@ When the Photon bridge is running, tick notices can use its local-only outbound 
 Budget Guard alerts are a separate, iMessage-only path enabled by default. The monitor stays silent on its first healthy observation, then texts on 50%, 75%, and 90% crossings, hard stops, synchronization failures, outages, recoveries, and resumes. It never invokes Telegram, Web chat, or Pushover. State is deduplicated in `state/budget-guard-monitor-state.json`.
 
 The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, durable deliveries, and recent Mi thread activity. A repair attempt restarts only the Photon bridge, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
+
+The Tactics Journal monitor uses public, read-only endpoints only. It checks `https://tacticsjournal.com/api/health`, `https://board.tacticsjournal.com/`, `https://tacticsjournal.com/api/community/me`, and `https://tacticsjournal.com/api/ama/active`. It alerts only when the combined state changes between healthy and degraded. It does not prove signed-in Board actions, Community writes, application decisions, moderation, billing, or permissions. Disable it with `MI_TACTICS_JOURNAL_MONITOR_ENABLED=false`; change its cadence with `MI_TACTICS_JOURNAL_MONITOR_INTERVAL_MS`.
 
 Add reminder crons explicitly:
 
