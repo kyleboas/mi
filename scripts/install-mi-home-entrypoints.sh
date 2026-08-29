@@ -46,8 +46,6 @@ install_stack_wrapper() {
 }
 
 install_stack_wrapper
-install_wrapper install-mi-model-eval-gateway.sh
-install_wrapper uninstall-mi-model-eval-gateway.sh
 
 while IFS=$'\t' read -r name expected action; do
   [[ "$name" == \#* || "$action" != archive-* ]] && continue

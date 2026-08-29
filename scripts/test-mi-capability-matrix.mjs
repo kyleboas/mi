@@ -25,8 +25,6 @@ const coverage = {
     agents: ['test-mi-agent-e2e.mjs', 'test-mi-agent-render-snapshot.mjs'],
     tick: ['test-mi-tick.mjs'],
     approvals: ['test-mi-approvals-status.mjs'],
-    'loop-discovery': ['test-mi-loop-discovery.mjs'],
-    'loop-factory': ['test-mi-loop-factory.mjs'],
     check: ['test-mi-cli-surfaces.mjs'],
     cron: ['test-mi-cli-surfaces.mjs'],
     task: ['test-mi-cli-surfaces.mjs', 'test-mi-daemon-pi-session-e2e.mjs'],
@@ -71,9 +69,6 @@ const coverage = {
     'GET /api/worker-state': ['test-mi-web-api-e2e.mjs'],
     'GET /api/thread-state': ['test-mi-web-api-e2e.mjs', 'test-mi-web-chat-routing.mjs'],
     'POST /api/notify': ['test-mi-web-api-e2e.mjs'],
-    'POST /api/twilio/confirmation': ['test-mi-twilio-voice.mjs'],
-    'POST /api/twilio/status': ['test-mi-twilio-voice.mjs'],
-    'POST /api/twilio/voice': ['test-mi-twilio-voice.mjs'],
     'POST /api/send': ['test-mi-web-api-e2e.mjs', 'test-mi-web-chat-routing.mjs'],
     'POST /api/photo': ['test-mi-web-api-e2e.mjs'],
   },
@@ -91,7 +86,7 @@ function actualCliCommands(source) {
     found.add(match[1]);
     found.add(match[2]);
   }
-  for (const alias of ['--once', 'raw', 'pi', 'pi-commands', 'ui', 'chat', 'open', 'ask', 'inbox', 'threads', 'temp', 'compact', 'agents', 'tick', 'approvals', 'loop-discovery', 'loop-factory', 'check', 'cron', 'task', 'make', 'run', 'edit', 'logs']) {
+  for (const alias of ['--once', 'raw', 'pi', 'pi-commands', 'ui', 'chat', 'open', 'ask', 'inbox', 'threads', 'temp', 'compact', 'agents', 'tick', 'approvals', 'check', 'cron', 'task', 'make', 'run', 'edit', 'logs']) {
     if (main.includes(`command === '${alias}'`)) found.add(alias);
   }
   found.delete('help');

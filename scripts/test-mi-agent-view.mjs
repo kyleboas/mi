@@ -8,7 +8,7 @@ const daemon = readFileSync(new URL('../pi/extensions/mi-daemon.mjs', import.met
 const miExtension = readFileSync(new URL('../pi/extensions/mi.ts', import.meta.url), 'utf8');
 const miAgentE2e = readFileSync(new URL('../scripts/test-mi-agent-e2e.mjs', import.meta.url), 'utf8');
 
-assert.match(cli, /mi agents\s+Open mi agents live background agent view/, 'usage documents mi agents startup command and mi agents name');
+assert.match(cli, /diver agents\s+Open the live background-agent view/, 'usage documents Diver agents startup command and name');
 assert.match(cli, /AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTheme, UserMessageComponent/, 'CLI imports pi message components and theme');
 assert.match(cli, /CombinedAutocompleteProvider, CURSOR_MARKER, Editor, matchesKey, ProcessTerminal, TUI, type Component, type Focusable, type SlashCommand/, 'CLI imports pi Editor, autocomplete provider, key matching, and pi-tui runtime for input and differential rendering');
 assert.match(cli, /initTheme\(process\.env\.PI_THEME, false\)/, 'CLI initializes pi theme before rendering pi components');

@@ -68,7 +68,7 @@ npm test
 
 # Mi runs from this reviewed tree. Never copy Mi files into Pi's global
 # auto-load directory.
-for file in pi/extensions/mi-daemon.mjs pi/extensions/mi-capability-guard.ts pi/extensions/mi-orchestrator-adapter.ts pi/extensions/mi-twilio.ts pi/extensions/mi.ts; do
+for file in pi/extensions/mi-daemon.mjs pi/extensions/mi-capability-guard.ts pi/extensions/mi-orchestrator-adapter.ts pi/extensions/mi.ts; do
   [[ -f "$file" ]] || { echo "Missing reviewed Mi file: $file" >&2; exit 1; }
 done
 
@@ -78,7 +78,6 @@ MI_AUTO_ACTIONS_ENABLED=false \
 MI_IMESSAGE_MONITOR_ENABLED=false \
 MI_DAILY_BRIEF=false \
 MI_QUESTIONS_ENABLED=false \
-MI_LOOP_FACTORY_ENABLED=false \
 PUSHOVER_USER= \
 PUSHOVER_TOKEN= \
 node scripts/test-mi-tick.mjs
@@ -87,7 +86,6 @@ MI_AUTO_ACTIONS_ENABLED=false \
 MI_IMESSAGE_MONITOR_ENABLED=false \
 MI_DAILY_BRIEF=false \
 MI_QUESTIONS_ENABLED=false \
-MI_LOOP_FACTORY_ENABLED=false \
 PUSHOVER_USER= \
 PUSHOVER_TOKEN= \
 MI_ROOT="$ROOT" \
@@ -119,7 +117,6 @@ restart_system_unit() {
 
 restart_user_unit mi-daemon.service
 restart_user_unit mi-web-chat.service
-restart_user_unit mi-flue.service
 # A deploy does not wake scheduled or outbound work unless an operator makes a
 # separate, explicit choice and supplies both safety values.
 if [[ ${MI_DEPLOY_ACTIVATE_TIMER:-0} == 1 ]]; then

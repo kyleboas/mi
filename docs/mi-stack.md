@@ -24,9 +24,7 @@ The check reports fixed expected values only: the two production aliases, Photon
 Production install first writes the tracked non-secret `coding-main` baseline through the gateway-client stage, then adds `mi-concierge` (medium). It removes installed `mi-eval-*` aliases and overlay state, and preserves unrelated Pi registry providers/models/settings. The production alias stage fails instead of guessing a missing baseline. Evaluation remains an explicit separate cycle:
 
 ```bash
-sudo /home/kyle/install-mi-model-eval-gateway.sh
 npm run eval:mi-models
-sudo /home/kyle/uninstall-mi-model-eval-gateway.sh
 ```
 
 Normal iMessage operation does not use Web chat or a legacy router. The focused runtime owns durable conversation sessions and delivery recovery.
@@ -52,8 +50,6 @@ The canonical installer archives only a wrapper whose SHA-256 matches its known 
 
 - `~/fix-mi-gateway.sh` — obsolete; archive when ownership matches.
 - `~/install-mi-subscription-gateway.sh` — superseded by the stack entrypoint; archive when ownership matches.
-- `~/install-mi-model-eval-gateway.sh` — replace from tracked source only when ownership matches.
-- `~/uninstall-mi-model-eval-gateway.sh` — replace from tracked source only when ownership matches.
 
 The Web installer removes only exact known Mi-owned predecessor drop-ins and preserves unrelated content.
 

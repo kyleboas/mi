@@ -3,7 +3,7 @@
 import { readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
-import { EVAL_ALIASES, uninstallEvalModels } from './install-mi-model-eval-models.mjs';
+const EVAL_ALIASES = ['mi-eval-luna-low', 'mi-eval-sol-low', 'mi-eval-sol-medium', 'mi-eval-terra-low', 'mi-eval-sol-high'];
 
 export const PRODUCTION_ALIASES = ['mi-concierge'];
 const configDir = resolve(process.env.MI_GATEWAY_CONFIG_DIR || '/home/kyle/.pi/agent');
@@ -28,11 +28,17 @@ export async function installProductionModels({ directory = configDir, checkOnly
   const missing = PRODUCTION_ALIASES.filter((alias) => !settings.enabledModels.includes(`vps-gateway/${alias}`) || !provider.models.some((model) => model?.id === alias));
   const evalPresent = EVAL_ALIASES.filter((alias) => settings.enabledModels.includes(`vps-gateway/${alias}`) || provider.models.some((model) => model?.id === alias));
   if (checkOnly) return { changed: false, missing, evalPresent };
-  if (evalPresent.length > 0) await uninstallEvalModels({ directory });
-  if (missing.length === 0) return { changed: evalPresent.length > 0, missing, evalPresent };
-  // Re-read after eval restoration: its exact rollback may have restored an
-  // earlier production registry snapshot.
-  if (evalPresent.length > 0) return installProductionModels({ directory, checkOnly: false });
+  if (evalPresent.length > 0) {
+    provider.models = provider.models.filter((model) => !EVAL_ALIASES.includes(model?.id));
+    settings.enabledModels = settings.enabledModels.filter((model) => !EVAL_ALIASES.some((alias) => model === `vps-gateway/${alias}`));
+  }
+  if (missing.length === 0) {
+    if (evalPresent.length > 0) {
+      await atomicJson(modelsPath, models);
+      await atomicJson(settingsPath, settings);
+    }
+    return { changed: evalPresent.length > 0, missing, evalPresent };
+  }
   for (const alias of PRODUCTION_ALIASES) {
     if (!provider.models.some((model) => model?.id === alias)) provider.models.push({ ...baseline, id: alias, name: `VPS Gateway ${alias}` });
     const scoped = `vps-gateway/${alias}`;

@@ -12,7 +12,6 @@ import webpush from 'web-push';
 import { appendThreadMessage, getThread, threadContext } from '../dist/src/threads.js';
 import { runFlueChat } from '../dist/src/flue.js';
 import { logEvent } from '../dist/src/state.js';
-import { AI_DISCLOSURE, createTwilioVoiceBackend, validateTwilioSignature } from '../dist/src/twilio-voice.js';
 import { workerCompletionInstruction } from './mi-worker-completion.mjs';
 
 import { reviewedMiExtensionPaths } from '../pi/extensions/mi-reviewed-paths.mjs';
@@ -78,17 +77,6 @@ const researchRoot = process.env.MI_RESEARCH_ROOT || path.join(home, 'research-p
 const detectCandidatesScript = process.env.MI_DETECT_CANDIDATES_SCRIPT || path.join(researchRoot, 'scripts', 'list_detect_candidates.py');
 const detectCandidatesLimit = Number(process.env.MI_DETECT_CANDIDATES_LIMIT || 50);
 const detectCandidatesTimeoutMs = Number(process.env.MI_DETECT_CANDIDATES_TIMEOUT_MS || 30000);
-const loopDiscoveryStatePath = process.env.MI_LOOP_DISCOVERY_STATE_PATH || path.join(home, '.pi', 'agent', 'state', 'loop-discovery.json');
-const loopFactoryStatePath = process.env.MI_LOOP_FACTORY_STATE_PATH || path.join(home, '.pi', 'agent', 'state', 'loop-factory.json');
-const loopFactoryNotesPath = process.env.MI_LOOP_FACTORY_NOTES_PATH || path.join(home, 'NOTES.md');
-const loopFactoryWorkflowsDir = process.env.MI_LOOP_FACTORY_WORKFLOWS_DIR || path.join(home, 'workflows');
-const twilioVoiceEnabled = /^(1|true|yes|on)$/i.test(process.env.MI_TWILIO_ENABLED || '');
-const twilioConfirmationToken = String(process.env.MI_TWILIO_CONFIRMATION_TOKEN || webhookToken).trim();
-const twilioConfirmationUserId = String(process.env.MI_TWILIO_CONFIRMATION_USER_ID || 'mi-web').trim();
-const twilioConfirmationOrigin = String(process.env.MI_WEB_ORIGIN || `http://${host}:${port}`).trim().replace(/\/$/u, '');
-const twilioConfirmationCsrfToken = String(process.env.MI_WEB_CSRF_TOKEN || 'mi-web-confirmation').trim();
-const usedTwilioConfirmationNonces = new Map();
-const twilioVoice = createTwilioVoiceBackend();
 
 let sendQueue = Promise.resolve();
 const activeJobs = new Map();
@@ -241,12 +229,6 @@ async function readJsonBody(req, maxBytes = 64 * 1024) {
   return raw ? JSON.parse(raw) : {};
 }
 
-async function readTwilioForm(req) {
-  const raw = await readRequestText(req, 64 * 1024);
-  const params = Object.fromEntries(new URLSearchParams(raw).entries());
-  return params;
-}
-
 function extensionForMime(mimeType) {
   const normalized = String(mimeType || '').toLowerCase();
   if (normalized === 'image/jpeg' || normalized === 'image/jpg') return '.jpg';
@@ -291,23 +273,6 @@ function webhookAuthorized(req) {
   return auth === `Bearer ${webhookToken}`;
 }
 
-function twilioConfirmationAuthorized(req) {
-  if (!twilioConfirmationToken) return { status: 401, error: 'unauthorized' };
-  if (String(req.headers.authorization || '') !== `Bearer ${twilioConfirmationToken}`) return { status: 401, error: 'unauthorized' };
-  let origin;
-  try { origin = new URL(String(req.headers.origin || '')).origin; } catch { return { status: 403, error: 'CSRF protection requires a valid same-origin request' }; }
-  if (origin !== twilioConfirmationOrigin) return { status: 403, error: 'cross-origin confirmation request rejected' };
-  if (String(req.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return { status: 403, error: 'cross-site confirmation request rejected' };
-  if (String(req.headers['x-mi-confirmation-csrf'] || '') !== twilioConfirmationCsrfToken) return { status: 403, error: 'CSRF token required' };
-  const nonce = String(req.headers['x-mi-confirmation-nonce'] || '').trim();
-  if (!/^[A-Za-z0-9._:-]{16,160}$/u.test(nonce)) return { status: 403, error: 'confirmation request nonce required' };
-  const nowMs = Date.now();
-  for (const [key, expiresAt] of usedTwilioConfirmationNonces) if (expiresAt <= nowMs) usedTwilioConfirmationNonces.delete(key);
-  if (usedTwilioConfirmationNonces.has(nonce)) return { status: 409, error: 'confirmation request replay rejected' };
-  usedTwilioConfirmationNonces.set(nonce, nowMs + 10 * 60_000);
-  return { userId: twilioConfirmationUserId };
-}
-
 function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') {
   res.writeHead(status, {
     'Content-Type': contentType,
@@ -315,33 +280,6 @@ function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') 
     'Cache-Control': 'no-store',
   });
   res.end(body);
-}
-
-function sendTwiml(res, status, body) {
-  return sendText(res, status, body, 'text/xml; charset=utf-8');
-}
-
-async function handleTwilioWebhook(req, res, url) {
-  if (!twilioVoiceEnabled) return sendJson(res, 404, { ok: false, error: 'Twilio voice is disabled' });
-  if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST required' });
-  const params = await readTwilioForm(req);
-  const pathname = url.pathname;
-  const signature = String(req.headers['x-twilio-signature'] || '');
-  const callbackUrl = twilioVoice.webhookUrl(pathname);
-  if (!callbackUrl || !validateTwilioSignature(callbackUrl, params, signature, twilioVoice.config.authToken)) return sendJson(res, 403, { ok: false, error: 'invalid Twilio signature' });
-  if (pathname === '/api/twilio/status') {
-    const callSid = String(params.CallSid || '');
-    const callStatus = String(params.CallStatus || '');
-    if (!callSid || !callStatus) return sendJson(res, 400, { ok: false, error: 'CallSid and CallStatus required' });
-    try {
-      return sendJson(res, 200, { ok: true, call: await twilioVoice.updateStatus(callSid, callStatus) });
-    } catch (error) {
-      return sendJson(res, 404, { ok: false, error: redact(error instanceof Error ? error.message : String(error)) });
-    }
-  }
-  // Calls use inline, approved TwiML so an unredacted script is never stored
-  // for later retrieval by this endpoint. Keep this route signed and inert.
-  return sendTwiml(res, 410, '<Response><Say>This voice webhook is not enabled for inline TwiML calls.</Say></Response>');
 }
 
 async function sendFile(res, filePath, contentType) {
@@ -672,162 +610,6 @@ function taskNameFromPrompt(prompt) {
 
 function normalizedMessageText(message) {
   return String(message || '').trim().toLowerCase();
-}
-
-function readLoopDiscoveryState() {
-  try {
-    return JSON.parse(readFileSync(loopDiscoveryStatePath, 'utf8'));
-  } catch {
-    return undefined;
-  }
-}
-
-function normalizeLoopSelectionText(value) {
-  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function pendingLoopDiscoveryCandidateFor(message) {
-  const state = readLoopDiscoveryState();
-  const brief = state?.latestBrief;
-  if (!brief?.candidates?.length || brief.selected) return undefined;
-  const text = String(message || '').trim();
-  const numeric = text.match(/^#?([1-5])\b/);
-  if (numeric) return brief.candidates[Number(numeric[1]) - 1];
-  const target = normalizeLoopSelectionText(text);
-  if (!target) return undefined;
-  return brief.candidates.find((candidate) => {
-    const haystack = normalizeLoopSelectionText(`${candidate.name || ''} ${candidate.key || ''} ${candidate.why || ''}`);
-    return haystack.includes(target) || target.split(' ').filter((part) => part.length > 3).some((part) => haystack.includes(part));
-  });
-}
-
-async function runLoopDiscoveryCli(args, timeoutMs = 60000) {
-  const localTsx = path.join(root, 'node_modules', '.bin', 'tsx');
-  const miBin = process.env.MI_BIN || (existsSync(localTsx) ? localTsx : 'mi');
-  const cliArgs = miBin === localTsx ? [path.join(root, 'src', 'cli.ts'), 'loop-discovery', ...args] : ['loop-discovery', ...args];
-  return await new Promise((resolve) => {
-    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_DISCOVERY_STATE_PATH: loopDiscoveryStatePath, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: reviewedPrivateMiPaths().daemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      resolve({ ok: false, text: 'Loop discovery took too long to respond.' });
-    }, timeoutMs);
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({ ok: false, text: error.message });
-    });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      resolve({ ok: code === 0, text: (stdout || stderr || '').trim() });
-    });
-  });
-}
-
-function messageLooksLikeLoopDiscoveryRun(message) {
-  const text = normalizedMessageText(message);
-  return /\b(?:run|start|do|mine|find)\b[\s\S]{0,60}\b(?:loop discovery|pi conversations? for loops|what i should loop|workflow candidates?)\b/.test(text)
-    || /\b(?:run loop discovery|find what i should loop|mine my pi conversations for loops)\b/.test(text);
-}
-
-async function handleLoopDiscoverySelectionFromImessage(threadId, message) {
-  if (!pendingLoopDiscoveryCandidateFor(message)) return undefined;
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage' });
-  const result = await runLoopDiscoveryCli(['--select', message]);
-  const reply = sanitizeMiConversationText(result.text || (result.ok ? 'Got it, I started grilling that loop in Pi.' : 'I matched that loop, but I could not start the Pi task.'));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.ok ? 'loop-discovery-selection' : 'loop-discovery-error' });
-  return { ok: result.ok, reply, handoff: result.ok };
-}
-
-async function handleLoopDiscoveryRunFromImessage(threadId, message) {
-  if (!messageLooksLikeLoopDiscoveryRun(message)) return undefined;
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage' });
-  const result = await runLoopDiscoveryCli(['--force']);
-  const reply = sanitizeMiConversationText(result.text || 'I ran loop discovery, but it did not return a brief.');
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.ok ? 'loop-discovery-brief' : 'loop-discovery-error' });
-  return { ok: result.ok, reply, handoff: false };
-}
-
-function readLoopFactoryState() {
-  try {
-    return JSON.parse(readFileSync(loopFactoryStatePath, 'utf8'));
-  } catch {
-    return undefined;
-  }
-}
-
-async function runLoopFactoryCli(args, timeoutMs = 60000) {
-  const localTsx = path.join(root, 'node_modules', '.bin', 'tsx');
-  const miBin = process.env.MI_BIN || (existsSync(localTsx) ? localTsx : 'mi');
-  const cliArgs = miBin === localTsx ? [path.join(root, 'src', 'cli.ts'), 'loop-factory', ...args] : ['loop-factory', ...args];
-  return await new Promise((resolve) => {
-    const child = spawn(miBin, cliArgs, { cwd: root, env: reducedPiEnv({ MI_ROOT: root, MI_LOOP_FACTORY_STATE_PATH: loopFactoryStatePath, MI_LOOP_FACTORY_NOTES_PATH: loopFactoryNotesPath, MI_LOOP_FACTORY_WORKFLOWS_DIR: loopFactoryWorkflowsDir, MI_SOCKET_PATH: miSocketPath, MI_RUNTIME_DIR: miRuntimeDir, MI_DAEMON_PATH: reviewedPrivateMiPaths().daemonPath, MI_DAEMON_HOST: miDaemonHost, MI_DAEMON_SYSTEMD_UNIT: miDaemonSystemdUnit, MI_WORKER_MODEL: workerModel }), stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      resolve({ ok: false, text: 'Loop Factory took too long to respond.' });
-    }, timeoutMs);
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
-    child.on('error', (error) => {
-      clearTimeout(timer);
-      resolve({ ok: false, text: error.message });
-    });
-    child.on('exit', (code) => {
-      clearTimeout(timer);
-      resolve({ ok: code === 0, text: (stdout || stderr || '').trim() });
-    });
-  });
-}
-
-function messageLooksLikeLoopFactoryCapture(message) {
-  const text = String(message || '').trim().toLowerCase();
-  if (!text || /(password\s*=|secret\s*=|token\s*=|api[_-]?key\s*=|\.env\b|infisical|agent-secrets)/i.test(text)) return false;
-  return /\b(?:this is a loop|make this a workflow|automate this recurring thing|i keep doing this|next time do this automatically|turn this into a workflow|workflow this|make a workflow for this)\b/i.test(text)
-    || /\b(?:again and again|over and over|every time|whenever|recurring|repeated|repeatable|i keep|keeps happening|done this (?:three|3)\+? times|3\+ times|third time)\b[\s\S]{0,100}\b(?:workflow|automate|delegate|loop|capture|systematize)\b/i.test(text);
-}
-
-function messageLooksLikeLoopFactoryReply(message) {
-  const state = readLoopFactoryState();
-  if (!state?.activeGrilling?.candidateId) return false;
-  const text = String(message || '').trim();
-  return /^[rR]$/.test(text) || /^loop factory[:\s]/i.test(text) || /^answer(?: for)? the loop/i.test(text);
-}
-
-function messageLooksLikeLoopFactoryDecision(message) {
-  const state = readLoopFactoryState();
-  if (!state?.candidates?.some((candidate) => candidate.status === 'build_ready')) return false;
-  return /^\s*(?:queue now|later|never)\s*$/i.test(String(message || ''));
-}
-
-async function handleLoopFactoryReplyFromImessage(threadId, message) {
-  if (!messageLooksLikeLoopFactoryReply(message)) return undefined;
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage' });
-  const result = await runLoopFactoryCli(['reply', message]);
-  const reply = sanitizeMiConversationText(result.text || (result.ok ? 'Sent that to the active Loop Factory session.' : 'I could not send that to Loop Factory.'));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.ok ? 'loop-factory-reply' : 'loop-factory-error' });
-  return { ok: result.ok, reply, handoff: result.ok };
-}
-
-async function handleLoopFactoryCaptureFromImessage(threadId, message) {
-  if (!messageLooksLikeLoopFactoryCapture(message)) return undefined;
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage' });
-  const result = await runLoopFactoryCli(['capture', message]);
-  const reply = sanitizeMiConversationText(result.text || (result.ok ? 'Captured that loop.' : 'I could not capture that loop.'));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.ok ? 'loop-factory-capture' : 'loop-factory-error' });
-  return { ok: result.ok, reply, handoff: result.ok };
-}
-
-async function handleLoopFactoryDecisionFromImessage(threadId, message) {
-  if (!messageLooksLikeLoopFactoryDecision(message)) return undefined;
-  await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'imessage' });
-  const result = await runLoopFactoryCli(['decide', message]);
-  const reply = sanitizeMiConversationText(result.text || (result.ok ? 'Recorded that Loop Factory decision.' : 'I could not record that Loop Factory decision.'));
-  await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.ok ? 'loop-factory-decision' : 'loop-factory-error' });
-  return { ok: result.ok, reply, handoff: result.ok };
 }
 
 function estimatedWorkSeconds(message) {
@@ -1867,18 +1649,6 @@ function formatZonedTime(timeZone, label) {
 async function handle(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   try {
-    if (req.method === 'POST' && url.pathname === '/api/twilio/status') return await handleTwilioWebhook(req, res, url);
-    if (req.method === 'POST' && url.pathname === '/api/twilio/voice') return await handleTwilioWebhook(req, res, url);
-    if (req.method === 'POST' && url.pathname === '/api/twilio/confirmation') {
-      if (!twilioVoiceEnabled || !webMaintenance) return sendJson(res, 404, { ok: false, error: 'Twilio voice is disabled' });
-      const auth = twilioConfirmationAuthorized(req);
-      if (auth.status) return sendJson(res, auth.status, { ok: false, error: auth.error });
-      const body = await readJsonBody(req);
-      if (body.confirm !== true) return sendJson(res, 400, { ok: false, error: 'final confirmation is required' });
-      if (body.userId !== undefined && body.userId !== auth.userId) return sendJson(res, 403, { ok: false, error: 'confirmation identity does not match the authenticated user' });
-      const confirmation = await twilioVoice.createConfirmation({ to: body.to, purpose: body.purpose, script: body.script, disclosure: body.disclosure || AI_DISCLOSURE, userId: auth.userId });
-      return sendJson(res, 201, { ok: true, confirmation });
-    }
     if (!webMaintenance && url.pathname !== '/api/health') return sendJson(res, 404, { ok: false, error: 'web maintenance mode is disabled' });
     if (req.method === 'GET' && url.pathname === '/') return sendText(res, 200, html, 'text/html; charset=utf-8');
     if (req.method === 'GET' && (url.pathname === '/favicon.jpg' || url.pathname === '/apple-touch-icon.png')) return sendFile(res, faviconPath, 'image/jpeg');
@@ -1932,13 +1702,6 @@ async function handle(req, res) {
       const workerMessage = photoPath
         ? [`Photo uploaded from Mi web chat.${message ? `\n\nUser message:\n${message}` : ''}`, `Local file path: ${photoPath}`, 'Use the read tool to inspect this image if needed.'].join('\n\n')
         : message;
-      if (!photoPath && messageLooksLikeLoopFactoryCapture(message)) {
-        await appendThreadMessage(threadId, 'user', message, { unread: false, source: 'web' });
-        const result = await runLoopFactoryCli(['capture', message]);
-        const reply = sanitizeMiConversationText(result.text || (result.ok ? 'Captured that loop.' : 'I could not capture that loop.'));
-        await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.ok ? 'loop-factory-capture' : 'loop-factory-error' });
-        return sendJson(res, 200, { ok: result.ok, queued: false, reply, jobs: activeJobsFor(threadId), messages: await readMessages(threadId) });
-      }
       const job = queueSendJob(threadId, workerMessage);
       return sendJson(res, 202, { ok: true, queued: true, job: publicJob(job), jobs: activeJobsFor(threadId), messages: await readMessages(threadId) });
     }

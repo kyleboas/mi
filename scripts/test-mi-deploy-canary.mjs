@@ -78,7 +78,7 @@ exit 0
     await writeFile(path.join(seed, 'package.json'), '{"private":true}\n');
     await writeFile(path.join(seed, 'scripts/test-mi-tick.mjs'), '');
     await writeFile(path.join(seed, 'dist/src/cli.js'), '');
-    for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-twilio.ts', 'mi.ts']) {
+    for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi.ts']) {
       await writeFile(path.join(seed, 'pi/extensions', file), '');
     }
     git(seed, ['add', '.']);
