@@ -790,7 +790,7 @@ export class ImessageRuntime {
     });
     const launch = miCoordinatorLaunch({
       piCommand: process.env.PI_CMD || 'pi', cwd: workspace.cwd, sessionPath,
-      model: process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.5:low',
+      model: process.env.DIVER_WORKER_MODEL || process.env.MI_WORKER_MODEL || 'openai-codex/gpt-5.6-luna:high',
       capabilityGuardPath: reviewed.capabilityGuardPath,
       capabilityAdapterPath: reviewed.capabilityAdapterPath,
       diverNotesPath: reviewed.diverNotesPath,
