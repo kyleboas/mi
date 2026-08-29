@@ -26,6 +26,7 @@ assert.deepEqual(directAdvisorSelections('Ask Seth and Alex how to grow Tactics 
 assert.deepEqual(directAdvisorSelections('/skill:advisor ask Seth about the offer'), ['Seth']);
 assert.equal(diverNotesPreflight({ message: 'list my Divernote tasks', plan: {} }).access, 'read');
 assert.equal(diverNotesPreflight({ message: 'add a Divernote task to call Sam', plan: { allowWrite: true } }).access, 'write');
+assert.equal(diverNotesPreflight({ message: 'Diver, create my Tactics Journal operating brief for this week. Include the three highest-impact growth opportunities, current commitments, and the next actions requiring my approval. Use my Divernote notes and Tactics Journal data. Do not take external actions.', plan: { allowWrite: false } }).access, 'read');
 assert.equal(v2RouteDecision({ message: 'Add a note. The note text would be: “This is a note.”', workspace }).plan.allowWrite, true);
 assert.equal(diverNotesPreflight({ message: 'Add a note. The note text would be: “This is a note.”', plan: { allowWrite: true } }).access, 'write');
 assert.equal(diverNotesPreflight({ message: 'show my Divernote documents', plan: {} }).unsupported, true);
