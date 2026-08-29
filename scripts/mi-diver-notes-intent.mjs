@@ -23,7 +23,8 @@ export function diverNotesPreflight({ message, plan, gate = 'allow' } = {}) {
   if (unsupportedDocument.test(text) && mentionsVault) return { access: 'none', clarify: true, unsupported: true, reply: unsupportedReply };
   if (/\bsubtasks?\b/i.test(text) && (readVerb.test(text) || /\bsee\b/i.test(text)) && !writeVerb.test(text) && !/\bcheck\s+off\b/i.test(text) && !/\bback\s+on\s+(?:the\s+)?list\b/i.test(text)) return { access: 'none', clarify: true, unsupported: true, reply: unsupportedReply };
   if ((contextOnly.test(text) && !mentionsVault) || explicitContextOnly.test(text)) return { access: 'none', clarify: true, reply: ambiguousReply };
-  const target = explicitVault.test(text) || (firstPersonVault.test(text) && noun.test(text));
+  const target = explicitVault.test(text) || (firstPersonVault.test(text) && noun.test(text))
+    || (writeVerb.test(text) && /\b(?:a|an|the)?\s*(?:task|note|project|project\s+task|subtask)s?\b/i.test(text));
   if (!target) return { access: 'none' };
   if (writeVerb.test(text)) return plan?.allowWrite === true ? { access: 'write' } : { access: 'read' };
   if (readVerb.test(text)) return { access: 'read' };
