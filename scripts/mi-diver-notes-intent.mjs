@@ -4,6 +4,7 @@
 const noun = /\b(?:task|tasks|project|projects|note|notes)\b/i;
 const unsupportedDocument = /\b(?:document|documents|details?|manual|evidence|proofs?|interviews?|lifecycle|raw\s+api)\b/i;
 const readVerb = /\b(?:list|read|show|find|search|check|review|what(?:'s| is)?|which)\b/i;
+const contextualRead = /\b(?:use|using|consult|consider|review|read|check|search|look\s+(?:at|through)|draw\s+(?:on|from)|based\s+on|according\s+to|from)\b[\s\S]{0,80}\b(?:my\s+)?diver\s*notes?\b|\b(?:my\s+)?diver\s*notes?\b[\s\S]{0,80}\b(?:as|for)\s+(?:context|input|source)\b/i;
 const writeVerb = /^(?:(?:please\s+)?(?:add|create|update|change|complete|reopen|append|replace|set|make|ensure|save)|(?:please\s+)?(?:can|could|would)\s+you\s+(?:please\s+)?(?:add|create|update|change|complete|reopen|append|replace|set|make|ensure|save))\b/i;
 // Accept the old spaced spelling as input, but never emit it: the product name
 // is Divernote.
@@ -27,6 +28,7 @@ export function diverNotesPreflight({ message, plan, gate = 'allow' } = {}) {
     || (writeVerb.test(text) && /\b(?:a|an|the)?\s*(?:task|note|project|project\s+task|subtask)s?\b/i.test(text));
   if (!target) return { access: 'none' };
   if (writeVerb.test(text)) return plan?.allowWrite === true ? { access: 'write' } : { access: 'read' };
+  if (contextualRead.test(text) && mentionsVault && noun.test(text)) return { access: 'read' };
   if (readVerb.test(text)) return { access: 'read' };
   return { access: 'none', clarify: true, reply: ambiguousReply };
 }
