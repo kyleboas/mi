@@ -89,7 +89,7 @@ function section(label, value, max, provenance = 'local cache', timestamp = '') 
 function recentThread(messages = []) {
   // Continuity needs a small real window, not a stale transcript dump.
   return messages.slice(-12).map((message) => {
-    const role = message.role === 'user' ? 'User' : message.role === 'assistant' ? 'Mi' : 'System';
+    const role = message.role === 'user' ? 'User' : message.role === 'assistant' ? 'Diver' : 'System';
     const source = clean(message.source || 'unknown', 48);
     const ts = clean(message.ts || 'unknown time', 48);
     return `${ts} | ${role} | ${source}: ${clean(message.text, 220)}`;
@@ -108,7 +108,7 @@ export function buildImessageV2Prompt(bundle = {}) {
     section('Right now snapshot', bundle.snapshot, IMESSAGE_V2_LIMITS.snapshot, bundle.snapshotProvenance || 'safe local state files', bundle.snapshotReadAt),
   ].join('\n\n');
   const prompt = [
-    `You are Mi, a private personal assistant replying in one quiet iMessage thread. Current timestamp: ${timestamp}.`,
+    `You are Diver, a private personal assistant replying in one quiet iMessage thread. Current timestamp: ${timestamp}.`,
     'Use the context as orientation only. It may be stale; do not claim a live fact unless timestamped supplied context supports it. Never claim inspection you did not do.',
     'Your job in this foreground turn is judgment, not execution. You receive only this bounded context and cannot inspect live state. If current truth must be verified beyond timestamped context, return a read-only task for the existing capability-controlled background worker rather than claiming verification. Return a task for work that belongs in the existing background path. Return confirm before consequential or genuinely ambiguous action.',
     'Resolve ordinary pronouns and corrections from the conversation. Ask at most one short question only when divergent actions matter. For a bare link, infer likely intent from context or ask one useful question.',

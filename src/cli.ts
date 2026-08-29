@@ -72,50 +72,43 @@ async function getScopedModelsSelectorComponent() {
 }
 
 function usage() {
-  return `Mi - tiny private assistant harness
+  return `Diver - private assistant harness
 
 Usage:
-  mi                              Open the full-screen Mi terminal UI
-  mi pi                           Open Mi main in pi
-  mi raw                          Open the minimal fallback conversation
-  mi --once <message>             Send one message to main and exit
-  mi chat [thread]                Open main or an existing temporary conversation
-  mi ask [--thread <id>] <message> Send one message to a Mi thread and exit
-  mi inbox                        Show Mi main + temporary conversations
-  mi threads                      List Mi conversations
-  mi temp <title>                 Create/open a temporary conversation
-  mi compact [thread]             Compact old read messages in a thread
-  mi agents                       Open mi agents live background agent view
-  mi pi-commands --json           List Pi slash commands and Mi agents dispatch classes
-  mi tick                         Run written crons, memory upkeep, and iMessage health repair
-  mi approvals [approve|reject <id>] List or resolve pending approvals
-  mi loop-discovery [--force] [--dry-run] [--notify] [--select <value>]
+  diver                           Open the full-screen Diver terminal UI
+  diver pi                        Open Diver main in pi
+  diver raw                       Open the minimal fallback conversation
+  diver --once <message>          Send one message to main and exit
+  diver chat [thread]             Open main or an existing temporary conversation
+  diver ask [--thread <id>] <message> Send one message to a Diver thread and exit
+  diver inbox                     Show Diver main and temporary conversations
+  diver threads                   List Diver conversations
+  diver temp <title>              Create or open a temporary conversation
+  diver compact [thread]          Compact old read messages in a thread
+  diver agents                    Open the live background-agent view
+  diver pi-commands --json        List Pi slash commands and Diver dispatch classes
+  diver tick                      Run written crons, memory upkeep, and health checks
+  diver approvals [approve|reject <id>] List or resolve pending approvals
+  diver loop-discovery [--force] [--dry-run] [--notify] [--select <value>]
                                   Mine Pi sessions for recurring workflow candidates
-  mi loop-factory capture <text>  Capture a user-noticed recurring loop
-  mi loop-factory reply <text>    Reply to the active Loop Factory grilling session; r accepts the recommendation
-  mi loop-factory digest [--notify] [--force]
-                                  Run the Loop Factory digest/build-ready scan
-  mi loop-factory decide <queue now|later|never> [candidate]
-                                  Decide whether to queue a build-ready spec for implementation
-  mi loop-factory status          Show Loop Factory candidate counts
-  mi memory show                  Show durable Mi memory
-  mi memory dream                 Force a dream consolidation run
-  mi memory log --limit N         Show recent memory history entries
-  mi cron list                    List Mi reminder crons
-  mi cron check                   Run due Mi cron jobs now
-  mi cron remove <name>           Remove a Mi cron job
-  mi cron add <name> (--every <1h>|--at <iso>) --message <text>
-  mi cron add <name> (--every <1h>|--at <iso>) --prompt <text> [--thread <id>]
-  mi cron add <name> (--every <1h>|--at <iso>) [--cwd <path>] -- <command>  (legacy/deprecated)
-  mi task <name> [--cwd <path>] -- <task prompt>
-  mi task reply <task-id-or-name> -- <follow-up prompt>
-  mi task list                    List background agent tasks
+  diver loop-factory capture <text>
+  diver loop-factory reply <text>
+  diver loop-factory digest [--notify] [--force]
+  diver loop-factory decide <queue now|later|never> [candidate]
+  diver loop-factory status
+  diver memory show
+  diver memory dream
+  diver memory log --limit N
+  diver cron list
+  diver cron check
+  diver cron remove <name>
+  diver cron add <name> (--every <1h>|--at <iso>) --message <text>
+  diver cron add <name> (--every <1h>|--at <iso>) --prompt <text> [--thread <id>]
+  diver task <name> [--cwd <path>] -- <task prompt>
+  diver task reply <task-id-or-name> -- <follow-up prompt>
+  diver task list
 
-  mi make <description> [--name <name>]
-  mi run <assistant>
-  mi edit <assistant> <change>
-  mi check <assistant>            Validate an assistant file
-  mi logs <assistant> [limit]
+The old mi command remains a compatibility alias.
 `;
 }
 
@@ -296,7 +289,7 @@ function renderThreadLine(thread: { id: string; title: string; kind: string; unr
 
 async function inboxCommand() {
   const threads = await listThreads();
-  console.log('Mi');
+  console.log('Diver');
   for (const thread of threads) console.log(`  ${renderThreadLine(thread)}`);
 }
 
@@ -306,7 +299,7 @@ async function showThread(threadId: string) {
   const messages = await readThreadMessages(threadId, 30);
   const unread = messages.filter((message) => message.unread);
 
-  console.log(`Mi / ${thread.title}`);
+  console.log(`Diver / ${thread.title}`);
   if (unread.length > 0) {
     console.log(`\nUnread:`);
     for (const message of unread) console.log(`${message.role}> ${message.text}`);
@@ -326,7 +319,7 @@ async function askMi(threadId: string, message: string) {
   await logEvent('mi.thread.user', { threadId, message });
 
   const context = await threadContext(threadId);
-  const prompt = `You are Mi, ${miUserPossessive()} private persistent assistant. Reply as Mi in the current conversation. Be concise. Do not claim to have inspected files or services unless context explicitly says so. Risky actions require approval.\n\nThread: ${thread.title}\n\n${context}\n\nCurrent user message:\n${message}`;
+  const prompt = `You are Diver, ${miUserPossessive()} private persistent assistant. Reply as Diver in the current conversation. Be concise. Do not claim to have inspected files or services unless context explicitly says so. Risky actions require approval.\n\nThread: ${thread.title}\n\n${context}\n\nCurrent user message:\n${message}`;
   const result = await runFlueChat(prompt);
   const reply = result.reply || 'Got it.';
   await appendThreadMessage(threadId, 'assistant', reply, { unread: false, source: result.source });
