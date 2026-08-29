@@ -11,8 +11,8 @@ try {
   const cwd = fixture.root;
 
   let result = runCli(['help'], { env, cwd });
-  assert.match(result.stdout, /Mi - tiny private assistant harness/);
-  assert.match(result.stdout, /mi agents/);
+  assert.match(result.stdout, /Diver - private assistant harness/);
+  assert.match(result.stdout, /diver agents/);
 
   result = runCli(['definitely-not-a-command'], { env, cwd, check: false });
   assert.notEqual(result.status, 0);
@@ -25,7 +25,7 @@ try {
   assert.match(result.stdout, /welcome|Got it|Hello/i);
 
   result = runCli(['inbox'], { env, cwd });
-  assert.match(result.stdout, /Mi/);
+  assert.match(result.stdout, /Diver/);
   assert.match(result.stdout, /main/);
 
   result = runCli(['threads'], { env, cwd });
@@ -35,10 +35,10 @@ try {
   assert.match(result.stdout, /No temporary conversations/);
 
   result = runCli(['temp', 'Scratch Space'], { env, cwd, input: '/exit\n', timeout: 45000 });
-  assert.match(result.stdout, /Mi \/ Scratch Space/);
+  assert.match(result.stdout, /Diver \/ Scratch Space/);
 
   result = runCli(['chat', 'temp-scratch-space'], { env, cwd, input: '/exit\n', timeout: 45000 });
-  assert.match(result.stdout, /Mi \/ Scratch Space/);
+  assert.match(result.stdout, /Diver \/ Scratch Space/);
 
   result = runCli(['compact', 'main'], { env, cwd });
   assert.match(result.stdout, /Compacted/);

@@ -13,6 +13,8 @@ const deployScript = await readFile(new URL('../scripts/deploy-mi.sh', import.me
 assert.match(cli, /if \(command === 'tick'\) return tickCommand\(\);/, 'CLI exposes mi tick as the single scheduled entrypoint');
 assert.match(tick, /tickReminderCrons\(\)/, 'mi tick runs written reminder and prompt crons');
 assert.match(tick, /runImessageMonitor\(\)/, 'mi tick runs the iMessage bridge monitor');
+assert.match(tick, /runTacticsJournalMonitor\(\)/, 'mi tick runs the Tactics Journal public health monitor');
+assert.match(tick, /tacticsJournalMonitor/, 'mi tick returns Tactics Journal monitor status');
 assert.match(tick, /runBudgetGuardMonitor\(\)/, 'mi tick polls Budget Guard for iMessage alerts');
 assert.match(tick, /runDreamConsolidation\(\)/, 'mi tick runs bounded memory upkeep');
 assert.match(tick, /runCapabilityGrantGc\(\)/, 'mi tick cleans expired worker capability grants');
