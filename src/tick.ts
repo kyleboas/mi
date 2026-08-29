@@ -1,3 +1,4 @@
+import './env.js';
 import { open, rm, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
