@@ -4,8 +4,9 @@ import { pathToFileURL } from 'node:url';
 import { diverNotesIntent } from './mi-diver-notes-intent.mjs';
 
 const mod = await import(pathToFileURL(new URL('../pi/extensions/mi-diver-notes.ts', import.meta.url).pathname).href);
-const { runDiverNotes, boundedDivernoteResult, DIVER_NOTES_BACKEND, DIVER_NOTES_READ_OPERATIONS, DIVER_NOTES_WRITE_OPERATIONS } = mod;
+const { runDiverNotes, boundedDivernoteResult, DIVERNOTE_COMMAND, DIVER_NOTES_BACKEND, DIVER_NOTES_READ_OPERATIONS, DIVER_NOTES_WRITE_OPERATIONS } = mod;
 assert.equal(DIVER_NOTES_BACKEND, 'canonical-pi-divernote');
+assert.equal(DIVERNOTE_COMMAND, '/home/kyle/.local/bin/divernote');
 assert.ok(DIVER_NOTES_READ_OPERATIONS.has('notes.list'));
 assert.ok(DIVER_NOTES_READ_OPERATIONS.has('tactics-journal.context'));
 assert.ok(DIVER_NOTES_WRITE_OPERATIONS.has('notes.add'));
