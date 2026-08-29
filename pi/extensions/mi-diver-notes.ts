@@ -1,13 +1,16 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import type { invokeDivernote as InvokeDivernote, invokeProjectContent as InvokeProjectContent } from '../../../.pi/agent/extensions/divernote/adapter.ts';
+import { createLockedDivernoteRunner } from '../../src/tactics-journal-context.ts';
 
 const divernoteAdapter = await import('../../../.pi/agent/extensions/divernote/adapter.ts');
 const adapterInvokeDivernote = (divernoteAdapter.invokeDivernote || divernoteAdapter.default?.invokeDivernote) as typeof InvokeDivernote;
 const adapterInvokeProjectContent = (divernoteAdapter.invokeProjectContent || divernoteAdapter.default?.invokeProjectContent) as typeof InvokeProjectContent;
 const adapterRunner = (divernoteAdapter.execDivernote || divernoteAdapter.default?.execDivernote) as Parameters<typeof InvokeDivernote>[3];
 export const DIVERNOTE_COMMAND = '/home/kyle/.local/bin/divernote';
-const absoluteRunner = (_file: string, args: string[], options: Parameters<NonNullable<typeof adapterRunner>>[2]) => adapterRunner(DIVERNOTE_COMMAND, args, options);
+const absoluteRunner = createLockedDivernoteRunner(
+  (_file, args, options) => adapterRunner(DIVERNOTE_COMMAND, args, options),
+);
 const invokeDivernote = ((operation, input, signal) => adapterInvokeDivernote(operation, input, signal, absoluteRunner)) as typeof InvokeDivernote;
 const invokeProjectContent = ((group, operation, input, signal) => adapterInvokeProjectContent(group, operation, input, signal, absoluteRunner)) as typeof InvokeProjectContent;
 
