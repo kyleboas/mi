@@ -99,14 +99,28 @@ export async function runDiverNotes(input: Input, { invokeItem = invokeDivernote
     const { spec, values } = canonicalInput(operation, input);
     let value: unknown;
     if (spec.aggregate === 'tactics-journal-context') {
-      const [notesValue, tasksValue, projectsValue] = await Promise.all([
-        invokeItem('retrieve', { itemType: 'note' }), invokeItem('retrieve', { itemType: 'task' }), invokeProject('projects', 'list', {}),
-      ]);
+      const read = async (request: () => Promise<unknown>) => {
+        try { return await request(); } catch { return undefined; }
+      };
+      // The encrypted vault client is not safe to fan out across concurrent CLI
+      // processes. Read sequentially and keep independent sources available when
+      // one project cannot be read.
+      const notesValue = await read(() => invokeItem('retrieve', { itemType: 'note' }));
+      const tasksValue = await read(() => invokeItem('retrieve', { itemType: 'task' }));
+      const projectsValue = await read(() => invokeProject('projects', 'list', {}));
+      if (notesValue === undefined && tasksValue === undefined && projectsValue === undefined) throw new Error('Divernote context sources failed.');
       const relevantProjects = recordList(projectsValue, 'projects')
         .filter((project) => /\b(?:tactics journal|board|community|ama)\b/i.test(String(project.name || '')))
         .slice(0, 8);
-      const projectValues = await Promise.all(relevantProjects.map((project) => invokeProject('projects', 'read', { project: String(project.id || project.slug || '') })));
-      value = compactTacticsJournalContext(notesValue, tasksValue, projectsValue, projectValues);
+      const projectValues: unknown[] = [];
+      for (const project of relevantProjects) {
+        const projectValue = await read(() => invokeProject('projects', 'read', { project: String(project.id || project.slug || '') }));
+        if (projectValue !== undefined) projectValues.push(projectValue);
+      }
+      value = {
+        ...compactTacticsJournalContext(notesValue, tasksValue, projectsValue, projectValues),
+        availability: { notes: notesValue !== undefined, tasks: tasksValue !== undefined, projects: projectsValue !== undefined },
+      };
     } else if (operation === 'project-tasks.list') {
       const projectValue = await invokeProject('projects', 'read', values as Parameters<ProjectInvoke>[2]);
       const project = projectValue && typeof projectValue === 'object' ? (projectValue as Record<string, unknown>).project as Record<string, unknown> : undefined;

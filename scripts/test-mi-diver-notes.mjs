@@ -19,6 +19,30 @@ const contextResult = await runDiverNotes({ operation: 'tactics-journal.context'
 assert.equal(contextResult.ok, true);
 assert.equal(JSON.parse(JSON.stringify(contextResult.value)).scope, 'Tactics Journal');
 assert.equal(projectCalls[0].operation, 'list');
+let activeReads = 0;
+let maxActiveReads = 0;
+const partialContext = await runDiverNotes({ operation: 'tactics-journal.context' }, {
+  invokeItem: async (_operation, input) => {
+    activeReads += 1;
+    maxActiveReads = Math.max(maxActiveReads, activeReads);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    activeReads -= 1;
+    return input.itemType === 'note' ? { notes: [{ text: 'Board activation plan' }] } : { tasks: [] };
+  },
+  invokeProject: async (_group, operation, input) => {
+    activeReads += 1;
+    maxActiveReads = Math.max(maxActiveReads, activeReads);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    activeReads -= 1;
+    if (operation === 'list') return { projects: [{ id: 'board', name: 'Board' }, { id: 'ama', name: 'AMA' }] };
+    if (input.project === 'ama') throw new Error('temporary project read failure');
+    return { project: { name: 'Board', tasks: [{ text: 'Ship activation test', status: 'open' }] } };
+  },
+});
+assert.equal(partialContext.ok, true);
+assert.equal(maxActiveReads, 1, 'aggregate vault reads must be sequential');
+assert.deepEqual(partialContext.value.availability, { notes: true, tasks: true, projects: true });
+assert.equal(partialContext.value.projects.length, 1, 'one failed project read does not discard healthy context');
 const result = await runDiverNotes({ operation: 'notes.add', text: 'This is a note.' }, {
   invokeItem: async (operation, input) => { call = { operation, input }; return { ok: true, note: { text: input.text } }; },
 });
