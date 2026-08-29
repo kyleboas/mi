@@ -354,10 +354,16 @@ async function recoverStaleRunning(stateRoot) {
 
 async function tacticsJournalContext(message) {
   if (!/\btactics\s+journal\b/i.test(String(message || ''))) return '';
-  const file = path.join(root, 'state', 'tactics-journal-monitor-state.json');
+  const monitorFile = path.join(root, 'state', 'tactics-journal-monitor-state.json');
+  const briefFile = path.join(root, 'state', 'tactics-journal-brief-state.json');
   try {
-    const value = JSON.parse(await readFile(file, 'utf8'));
-    return JSON.stringify({ checkedAt: value.checkedAt, availability: value.availability, checks: value.checks });
+    const monitor = JSON.parse(await readFile(monitorFile, 'utf8'));
+    let brief;
+    try {
+      const candidate = JSON.parse(await readFile(briefFile, 'utf8'));
+      if (candidate?.version === 1 && candidate?.context && Date.now() - Date.parse(candidate.checkedAt) <= 30 * 60 * 1000) brief = { checkedAt: candidate.checkedAt, context: candidate.context };
+    } catch {}
+    return JSON.stringify({ monitor: { checkedAt: monitor.checkedAt, availability: monitor.availability, checks: monitor.checks }, brief });
   } catch { return ''; }
 }
 

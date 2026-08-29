@@ -8,6 +8,7 @@ import { runCapabilityGrantGc, writeCapabilityGrantGcMarker } from './capability
 import { tickReminderCrons } from './crons.js';
 import { runImessageMonitor } from './imessage-monitor.js';
 import { runTacticsJournalMonitor } from './tactics-journal-monitor.js';
+import { refreshTacticsJournalBriefSnapshot } from './tactics-journal-context.js';
 import { runDreamConsolidation } from './memory.js';
 import { logEvent } from './state.js';
 
@@ -15,6 +16,7 @@ export type MiTickResult = {
   reminders: Array<{ name: string; status: 'ok' | 'error' | 'skipped' }>;
   imessageMonitor: Awaited<ReturnType<typeof runImessageMonitor>>;
   tacticsJournalMonitor: Awaited<ReturnType<typeof runTacticsJournalMonitor>>;
+  tacticsJournalBrief: Awaited<ReturnType<typeof refreshTacticsJournalBriefSnapshot>> | { status: 'error'; reason: string };
   budgetGuardMonitor: Awaited<ReturnType<typeof runBudgetGuardMonitor>>;
   capabilityGrantGc: Awaited<ReturnType<typeof runCapabilityGrantGc>>;
   memory: Awaited<ReturnType<typeof runDreamConsolidation>>;
@@ -135,6 +137,10 @@ export async function runMiTick(): Promise<MiTickResult> {
       status: 'error' as const,
       reason: error instanceof Error ? error.message : String(error),
     }));
+    const tacticsJournalBrief = await refreshTacticsJournalBriefSnapshot().catch((error) => ({
+      status: 'error' as const,
+      reason: error instanceof Error ? error.message : String(error),
+    }));
     const budgetGuardMonitor = await runBudgetGuardMonitor().catch((error) => ({
       status: 'error' as const,
       reason: error instanceof Error ? error.message : String(error),
@@ -146,8 +152,9 @@ export async function runMiTick(): Promise<MiTickResult> {
       memory: memory.status,
       imessageMonitor: imessageMonitor.status,
       tacticsJournalMonitor: tacticsJournalMonitor.status,
+      tacticsJournalBrief: tacticsJournalBrief.status,
       budgetGuardMonitor: budgetGuardMonitor.status,
     });
-    return { reminders, imessageMonitor, tacticsJournalMonitor, budgetGuardMonitor, capabilityGrantGc, memory };
+    return { reminders, imessageMonitor, tacticsJournalMonitor, tacticsJournalBrief, budgetGuardMonitor, capabilityGrantGc, memory };
   });
 }
