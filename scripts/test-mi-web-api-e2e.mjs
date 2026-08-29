@@ -25,15 +25,6 @@ try {
   web = await startWebChat({
     ...fixture.env,
     MI_WEB_CHAT_WEBHOOK_TOKEN: token,
-    MI_TWILIO_ENABLED: '1',
-    MI_TWILIO_CONFIRMATION_TOKEN: 'twilio-confirmation-token',
-    MI_TWILIO_CONFIRMATION_USER_ID: 'web-user-1',
-    TWILIO_ACCOUNT_SID: 'ACtest',
-    TWILIO_API_KEY_SID: 'SKtest',
-    TWILIO_API_KEY_SECRET: 'test-secret',
-    TWILIO_AUTH_TOKEN: 'auth-token',
-    MI_TWILIO_FROM_NUMBER: '+15551234567',
-    MI_TWILIO_ALLOWED_COUNTRY_CODES: '1',
     MI_WEB_MAX_UPLOAD_BYTES: '8',
     MI_WEB_UPLOAD_DIR: join(fixture.miRoot, 'state', 'web-uploads'),
     MI_WEB_WORKER_THRESHOLD_SECONDS: '1',
@@ -64,20 +55,6 @@ try {
 
   let unauthorized = await httpJson(base, '/api/notify', { method: 'POST', body: { text: 'secretless note' } });
   assert.equal(unauthorized.status, 401);
-
-  let twilioUnauthorized = await httpJson(base, '/api/twilio/confirmation', { method: 'POST', body: { confirm: true, to: '+15551234568', purpose: 'test', script: 'AI assistant test call.' } });
-  assert.equal(twilioUnauthorized.status, 401, 'Twilio confirmation requires authentication');
-  let twilioNoCsrf = await httpJson(base, '/api/twilio/confirmation', { method: 'POST', token: 'twilio-confirmation-token', body: { confirm: true, to: '+15551234568', purpose: 'test', script: 'AI assistant test call.' } });
-  assert.equal(twilioNoCsrf.status, 403, 'Twilio confirmation requires same-origin CSRF protections');
-  const twilioHeaders = { Origin: base, 'X-Mi-Confirmation-CSRF': 'mi-web-confirmation', 'X-Mi-Confirmation-Nonce': 'cross-user-request-0001' };
-  let twilioCrossUser = await httpJson(base, '/api/twilio/confirmation', { method: 'POST', token: 'twilio-confirmation-token', headers: twilioHeaders, body: { confirm: true, userId: 'web-user-2', to: '+15551234568', purpose: 'test', script: 'AI assistant test call.' } });
-  assert.equal(twilioCrossUser.status, 403, 'confirmation identity is bound to the authenticated user');
-  const validTwilioHeaders = { ...twilioHeaders, 'X-Mi-Confirmation-Nonce': 'valid-request-0000001' };
-  let twilioConfirmation = await httpJson(base, '/api/twilio/confirmation', { method: 'POST', token: 'twilio-confirmation-token', headers: validTwilioHeaders, body: { confirm: true, to: '+15551234568', purpose: 'test', script: 'AI assistant test call.' } });
-  assert.equal(twilioConfirmation.status, 201, twilioConfirmation.text);
-  assert.equal(twilioConfirmation.json.confirmation.userId, undefined, 'confirmation response does not expose the user identity');
-  const replay = await httpJson(base, '/api/twilio/confirmation', { method: 'POST', token: 'twilio-confirmation-token', headers: validTwilioHeaders, body: { confirm: true, to: '+15551234568', purpose: 'test', script: 'AI assistant test call.' } });
-  assert.equal(replay.status, 409, 'confirmation request nonce rejects replay');
 
   json = (await httpJson(base, '/api/notify', { method: 'POST', token, body: { text: 'webhook note', source: 'test' } })).json;
   assert.equal(json.ok, true);

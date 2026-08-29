@@ -167,17 +167,13 @@ The bridge exposes a local-only notification endpoint at `http://127.0.0.1:8788/
 
 The canonical stack first installs the gateway client and its non-secret `coding-main` Pi registry baseline, then installs the production `mi-concierge` alias. The alias stage fails closed if that baseline cannot be established. The tracked modular scripts remain internal implementation and test units.
 
-#### Decision-only model evaluation
 
 The immutable aliases `mi-eval-luna-low`, `mi-eval-sol-low`, `mi-eval-sol-medium`, `mi-eval-terra-low`, and `mi-eval-sol-high` live only in a temporary overlay. The normal production installer and registry setup never install them. An evaluation is always install → evaluate → uninstall:
 
 ```bash
-sudo /home/kyle/install-mi-model-eval-gateway.sh
 npm run eval:mi-models
-sudo /home/kyle/uninstall-mi-model-eval-gateway.sh
 ```
 
-The uninstall is idempotent: it restores the canonical production config/handler, removes only eval-only registry entries, preserves unrelated settings/models and production defaults, restarts the gateway, and waits for the existing authenticated readiness check. The harness uses `/home/kyle/bin/run-heavy`, invokes only `/home/kyle/bin/pi-gateway`, writes sanitized synthetic summaries and blinded outputs under ignored `.tmp/mi-model-eval/`, and never dispatches a task.
 
 ### Mi stack installation
 

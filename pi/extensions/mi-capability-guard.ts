@@ -34,7 +34,7 @@ type AuditRecord = {
 
 type ToolRequest = { right: Right; resource: string; path?: string };
 
-const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate', 'mi_twilio_voice']);
+const ALLOWED_MI_EXTENSION_TOOLS = new Set(['mi_orchestrator_delegate']);
 const DIVER_NOTES_READ_OPERATIONS = new Set(['tasks.list', 'notes.list', 'projects.list', 'project-tasks.list']);
 const DIVER_NOTES_WRITE_OPERATIONS = new Set(['tasks.add', 'tasks.complete', 'tasks.reopen', 'notes.add', 'projects.ensure', 'project-tasks.add', 'project-tasks.complete', 'project-tasks.reopen', 'project-subtasks.add', 'project-subtasks.complete', 'project-subtasks.reopen']);
 const BLOCKED_ORCHESTRATOR_TOOLS = new Set(['orchestrator_delegate', 'orchestrator_steer', 'orchestrator_workers', 'orchestrator_stop', 'orchestrator_takeover']);
@@ -153,10 +153,6 @@ function requestForTool(toolName: string, input: any, cwd: string): ToolRequest 
 }
 
 function extensionDecision(toolName: string) {
-  if (toolName === 'mi_twilio_voice' && process.env.MI_CAPABILITY_PROFILE === 'mi-main-orchestrator' && process.env.MI_TWILIO_TOOL_ENABLED === '1' && process.env.MI_TWILIO_ENABLED === '1') {
-    return { allowed: true, reason: 'reviewed Mi Twilio voice tool; orchestrator profile and backend enablement are both required' };
-  }
-  if (toolName === 'mi_twilio_voice') return { allowed: false, reason: 'Twilio voice requires the reviewed Mi orchestrator profile, MI_TWILIO_TOOL_ENABLED=1, and MI_TWILIO_ENABLED=1' };
   if (toolName === 'mi_orchestrator_delegate' && ALLOWED_MI_EXTENSION_TOOLS.has(toolName) && process.env.MI_COORDINATOR_MODE === '1' && process.env.MI_COORDINATOR_POLICY_FILE) {
     return { allowed: true, reason: 'reviewed Mi coordinator adapter' };
   }

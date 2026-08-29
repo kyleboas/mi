@@ -29,7 +29,7 @@ export async function createHermeticMiEnv(prefix = 'mi-test-') {
   await mkdir(miRoot, { recursive: true, mode: 0o700 });
   const privateExtensions = join(miRoot, 'pi', 'extensions');
   await mkdir(privateExtensions, { recursive: true, mode: 0o700 });
-  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-reviewed-paths.mjs', 'mi-twilio.ts']) {
+  for (const file of ['mi-daemon.mjs', 'mi-capability-guard.ts', 'mi-orchestrator-adapter.ts', 'mi-reviewed-paths.mjs']) {
     await copyFile(repoPath('pi', 'extensions', file), join(privateExtensions, file));
   }
   await mkdir(join(miRoot, 'scripts'), { recursive: true, mode: 0o700 });

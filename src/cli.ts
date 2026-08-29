@@ -21,8 +21,6 @@ import { cronPaths, readCrons, removeCron, tickCrons, upsertCron } from './crons
 import { runMiTick } from './tick.js';
 import { miDaemonPath } from './mi-runtime-paths.js';
 import { memoryPaths, readMemory, readMemoryHistory, runDreamConsolidation } from './memory.js';
-import { handleLoopDiscoverySelection, runLoopDiscovery } from './loop-discovery.js';
-import { decideLoopFactoryImplementation, handleLoopFactoryReply, loopFactoryStatus, runLoopFactoryCapture, runLoopFactoryDigest } from './loop-factory.js';
 import { approveAsCapability, readApprovals, resolveApproval, readRecentEvents, logEvent } from './state.js';
 import { redactSecrets } from './redact.js';
 import {
@@ -89,13 +87,6 @@ Usage:
   diver pi-commands --json        List Pi slash commands and Diver dispatch classes
   diver tick                      Run written crons, memory upkeep, and health checks
   diver approvals [approve|reject <id>] List or resolve pending approvals
-  diver loop-discovery [--force] [--dry-run] [--notify] [--select <value>]
-                                  Mine Pi sessions for recurring workflow candidates
-  diver loop-factory capture <text>
-  diver loop-factory reply <text>
-  diver loop-factory digest [--notify] [--force]
-  diver loop-factory decide <queue now|later|never> [candidate]
-  diver loop-factory status
   diver memory show
   diver memory dream
   diver memory log --limit N
@@ -207,65 +198,6 @@ async function approvalsCommand(args: string[]) {
     return;
   }
   throw new Error(`unknown approvals command: ${subcommand}`);
-}
-
-async function loopDiscoveryCommand(args: string[]) {
-  const select = argValue(args, '--select');
-  if (select) {
-    const result = await handleLoopDiscoverySelection(select, { notify: args.includes('--notify') });
-    console.log(result.reply);
-    if (!result.started && result.matched) process.exitCode = 1;
-    return;
-  }
-  const result = await runLoopDiscovery({
-    mode: 'manual',
-    force: args.includes('--force'),
-    dryRun: args.includes('--dry-run'),
-    notify: args.includes('--notify'),
-    draftAll: args.includes('--draft-all'),
-  });
-  console.log(result.message);
-  if (result.briefId) console.log(`Brief: ${result.briefId}`);
-  if (result.spawned) console.log(`Spawned ${result.spawned} grilling task(s).`);
-}
-
-async function loopFactoryCommand(args: string[]) {
-  const subcommand = args[0] || 'status';
-  if (subcommand === 'capture') {
-    const message = args.slice(1).join(' ').trim();
-    if (!message) throw new Error('loop capture text required');
-    const result = await runLoopFactoryCapture(message, { source: 'manual', startGrilling: true, notify: args.includes('--notify') });
-    console.log(result.reply);
-    if (!result.ok) process.exitCode = 1;
-    return;
-  }
-  if (subcommand === 'reply' || subcommand === 'answer') {
-    const message = args.slice(1).join(' ').trim();
-    if (!message) throw new Error('reply text required; use r to accept the recommendation');
-    const result = await handleLoopFactoryReply(message, { source: 'cli' });
-    console.log(result.reply);
-    if (!result.ok) process.exitCode = 1;
-    return;
-  }
-  if (subcommand === 'digest') {
-    const result = await runLoopFactoryDigest({ mode: 'manual', notify: args.includes('--notify'), force: args.includes('--force') });
-    console.log(result.message);
-    return;
-  }
-  if (subcommand === 'decide' || subcommand === 'decision') {
-    const decision = args.slice(1).join(' ').trim();
-    if (!decision) throw new Error('decision required: queue now, later, or never');
-    const result = await decideLoopFactoryImplementation(decision);
-    console.log(result.reply);
-    if (!result.ok) process.exitCode = 1;
-    return;
-  }
-  if (subcommand === 'status') {
-    const result = await loopFactoryStatus();
-    console.log(result.message);
-    return;
-  }
-  throw new Error(`unknown loop-factory command: ${subcommand}`);
 }
 
 async function logsCommand(args: string[]) {
@@ -4193,8 +4125,6 @@ async function main() {
   if (command === 'pi-commands') return piCommandsCommand(args);
   if (command === 'tick') return tickCommand();
   if (command === 'approvals') return approvalsCommand(args);
-  if (command === 'loop-discovery') return loopDiscoveryCommand(args);
-  if (command === 'loop-factory') return loopFactoryCommand(args);
   if (command === 'memory') return memoryCommand(args);
   if (command === 'cron') return cronCommand(args);
   if (command === 'task') return taskCommand(args);

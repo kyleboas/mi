@@ -150,28 +150,11 @@ async def provider_checks(fake: Path, log: Path):
     await handler.acompletion("mi-concierge", messages("concierge"), response())
     await assert_async_error(_production_rejects_eval(handler), 400)
 
-    sys.modules["pi_subscription_handler"] = M
-    eval_path = ROOT / "mi-model-eval" / "pi_subscription_eval_handler.py"
-    spec = importlib.util.spec_from_file_location("pi_subscription_eval_handler_test", eval_path)
-    assert spec and spec.loader
-    eval_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(eval_module)
-    eval_handler = M.PiSubscriptionLLM(pi_path=str(fake), timeout_seconds=1, profiles={**M.SUBSCRIPTION_PROFILES, **eval_module.EVAL_PROFILES})
-    profile_expectations = eval_module.EVAL_PROFILES
-    assert list(profile_expectations) == [
-        "mi-eval-luna-low", "mi-eval-sol-low", "mi-eval-sol-medium",
-        "mi-eval-terra-low", "mi-eval-sol-high",
-    ]
-    for alias in profile_expectations:
-        await eval_handler.acompletion(alias, messages(alias), response())
     records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     expected_concierge_prefix = [*expected_prefix[:-1], "--thinking", "medium", "--print"]
-    assert records[2]["args"][:-1] == expected_concierge_prefix
-    for record, (inner_model, thinking) in zip(records[3:], profile_expectations.values()):
-        args = record["args"][:-1]
-        assert args[-5:] == ["--model", inner_model, "--thinking", thinking, "--print"], args
+    assert records[1]["args"][:-1] == expected_concierge_prefix
     await assert_async_error(_unknown_profile(handler), 400)
-    await assert_async_error(_effort_override(eval_handler), 400)
+    await assert_async_error(_production_rejects_eval(handler), 400)
 
     nonzero = await _capture_error(handler, "FAIL")
     assert nonzero.status_code == 502 and "secret-marker" not in str(nonzero)

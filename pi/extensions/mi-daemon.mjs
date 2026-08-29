@@ -51,7 +51,6 @@ const REVIEWED_MI_PATHS = reviewedMiExtensionPaths({
   root: MI_ROOT,
   capabilityGuardPath: process.env.MI_CAPABILITY_GUARD,
   capabilityAdapterPath: process.env.MI_CAPABILITY_ADAPTER,
-  twilioPath: process.env.MI_TWILIO_EXTENSION,
   // This process does not spawn a daemon. Clients and web chat validate that
   // path before they spawn it; here the required Pi guard and adapter matter.
   requireDaemon: false,
@@ -59,7 +58,6 @@ const REVIEWED_MI_PATHS = reviewedMiExtensionPaths({
   requireAdapter: true,
 });
 const MI_CAPABILITY_GUARD = REVIEWED_MI_PATHS.capabilityGuardPath;
-const MI_TWILIO_EXTENSION = REVIEWED_MI_PATHS.twilioPath || join(MI_ROOT, 'pi', 'extensions', 'mi-twilio.ts');
 const MI_CAPABILITY_GRANT_TTL_MS = Number(process.env.MI_CAPABILITY_GRANT_TTL_MS || 6 * 60 * 60_000);
 const MI_ADVISOR_SKILL_PATH = process.env.MI_ADVISOR_SKILL_PATH || join(HOME, ".pi", "agent", "skills", "advisor");
 const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "HOSTNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR", "TMP", "TEMP", "PI_PROVIDER", "PI_MODEL", "PI_CONFIG_DIR", "PI_GATEWAY_URL", "AGENT_GATEWAY_URL"];
@@ -1335,7 +1333,6 @@ function startPi() {
   if (piProc && !piProc.killed) return;
   log(`starting ${PI_BIN} --mode rpc --session-dir ${SESSION_DIR} --model ${MI_MODEL}`);
   const args = ["--mode", "rpc", "--session-dir", SESSION_DIR, "--model", MI_MODEL];
-  if (existsSync(MI_TWILIO_EXTENSION)) args.push("--extension", MI_TWILIO_EXTENSION);
   piProc = spawn(PI_BIN, args, {
     cwd: HOME,
     env: { ...process.env, MI_MAIN: "1", MI_CAPABILITY_PROFILE: "mi-main-orchestrator" },
@@ -1536,7 +1533,6 @@ function createRpcProcess({ cwd = HOME, sessionDir, sessionFile, model = MI_MODE
   // REVIEWED_MI_PATHS checked this before any worker can spawn. Never fall
   // back to an unguarded Pi process.
   args.push("--extension", MI_CAPABILITY_GUARD);
-  if (profile === 'mi-main-orchestrator' && existsSync(MI_TWILIO_EXTENSION)) args.push("--extension", MI_TWILIO_EXTENSION);
   if (sessionDir) args.splice(2, 0, "--session-dir", sessionDir);
   if (sessionFile) args.splice(2, 0, "--session", sessionFile);
   const launch = rpcLaunchCommand(args, env);
