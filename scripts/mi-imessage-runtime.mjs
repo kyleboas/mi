@@ -829,6 +829,7 @@ export class ImessageRuntime {
       diverNotesPath: reviewed.diverNotesPath,
       env: reducedEnvironment({
         PATH: `/home/kyle/.local/bin:${process.env.PATH || '/usr/bin:/bin'}`,
+        HOME: '/home/kyle', USER: 'kyle', LOGNAME: 'kyle',
         MI_ROOT: root, MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: grants,
         MI_CAPABILITY_AUDIT_FILE: path.join(directory, 'runtime', 'capability-audit.jsonl'),
         MI_COORDINATOR_POLICY_FILE: policy, MI_SOCKET_PATH: socketPath,
