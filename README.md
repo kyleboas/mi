@@ -1,10 +1,10 @@
-# Mi
+# Diver
 
-Mi is a small local assistant interface built around four surfaces:
+Diver is a small local assistant interface. `mi` remains a compatibility alias during the rename.
 
-1. `mi` — the main Mi conversation.
-2. `mi agents` — the live background-agent view.
-3. `mi tick` — scheduled reminders, memory upkeep, capability-file cleanup, iMessage repair checks, and Tactics Journal public health checks.
+1. `diver` — the main Diver conversation. `mi` remains supported as a compatibility alias.
+2. `diver agents` — the live background-agent view.
+3. `diver tick` — scheduled reminders, memory upkeep, capability-file cleanup, iMessage repair checks, and Tactics Journal public health checks.
 4. the Mi pi extension — side-channel Mi commands inside pi.
 
 Everything else in this repo exists to support those surfaces.

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import 'dotenv/config';
+import './env.js';
 import { AssistantMessageComponent, getMarkdownTheme, getSelectListTheme, initTheme, UserMessageComponent } from '@mariozechner/pi-coding-agent';
 import { AuthStorage, createAgentSessionFromServices, createAgentSessionServices, ModelRegistry, ModelSelectorComponent, SessionManager, SettingsManager } from '@mariozechner/pi-coding-agent';
 import { CombinedAutocompleteProvider, CURSOR_MARKER, Editor, matchesKey, ProcessTerminal, TUI, type Component, type Focusable, type SlashCommand } from '@mariozechner/pi-tui';

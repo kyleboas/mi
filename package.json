@@ -1,5 +1,5 @@
 {
-  "name": "mi-chat",
+  "name": "diver-chat",
   "version": "1.0.0",
   "description": "Tiny private assistant harness: Markdown assistants plus triggers, tools, permissions, and workers.",
   "main": "dist/src/cli.js",
@@ -45,6 +45,7 @@
     "typescript": "^6.0.3"
   },
   "bin": {
+    "diver": "dist/src/cli.js",
     "mi": "dist/src/cli.js"
   }
 }
