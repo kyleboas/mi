@@ -319,6 +319,23 @@ async function listDeliveryFiles(directory) {
   return entries.filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/.test(entry.name)).map((entry) => path.join(directory, 'deliveries', entry.name));
 }
 
+export function isSameConversationResend(value) {
+  const text = String(value || '').trim().toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ');
+  return /^(?:please )?(?:send|resend)(?: it| that| this)? again(?: please)?$/.test(text);
+}
+
+async function lastSentReply(directory) {
+  const deliveries = [];
+  for (const file of await listDeliveryFiles(directory)) {
+    const value = await readJson(file).catch(() => undefined);
+    if (!value || value.status !== 'sent' || typeof value.completionReply !== 'string' || !value.completionReply.trim()) continue;
+    const timestamp = Date.parse(value.sentAt || value.completedAt || value.receivedAt || '');
+    deliveries.push({ reply: value.completionReply, timestamp: Number.isFinite(timestamp) ? timestamp : 0 });
+  }
+  deliveries.sort((left, right) => right.timestamp - left.timestamp);
+  return deliveries[0]?.reply || '';
+}
+
 async function validateSessionFile(file) {
   try {
     const info = await lstat(file);
@@ -787,6 +804,12 @@ export class ImessageRuntime {
         });
       }
       return { reply: confirmation.kind === 'state_error' ? IMESSAGE_REPLIES.startFailure : IMESSAGE_REPLIES.confirmationMissing, taskIds: [] };
+    }
+    if (isSameConversationResend(message)) {
+      const pending = await readPendingConfirmation(record.conversationId, confirmationOptions).catch(() => null);
+      if (pending && isSameConversationResend(pending.objective || pending.summary)) await clearPendingConfirmation(record.conversationId, confirmationOptions).catch(() => undefined);
+      const reply = await lastSentReply(directory);
+      return { reply: reply || 'I do not have an earlier reply in this conversation to resend.', taskIds: [] };
     }
     const route = v2RouteDecision({ message, workspace, coordinatorObjectiveMaxChars, confirmationObjectiveMaxChars });
     if (route.kind === 'cancel') {
