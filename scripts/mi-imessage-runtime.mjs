@@ -124,8 +124,23 @@ export function requestDigestFor(conversationId, message, text, timestamp) {
   }));
 }
 
+export function formatImessagePlainText(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/^\s{0,3}#{1,6}\s+(.+)$/gm, '$1')
+    .replace(/^\s*[-*+]\s+/gm, '• ')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\[([^\]\n]+)\]\([^\s)]+\)/g, '$1')
+    .replace(/^\s*(?:---+|___+)\s*$/gm, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function cleanReply(value, fallback = IMESSAGE_REPLIES.missingEvidence, strict = false) {
-  const text = redactV2Text(String(value || '')).replace(/[—–]/g, '-').replace(/\0/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  const text = redactV2Text(formatImessagePlainText(value)).replace(/[—–]/g, '-').replace(/\0/g, '').trim();
   if (!text) return fallback;
   const controlReply = /^Action class: [a-z][a-z0-9_-]*\.\s+Exact objective: [\s\S]+?\s+This could make a real change or contact another service\. Reply "(?:confirm|deny) [a-f0-9]{32}"/i.test(text)
     || /^I still need confirmation for the pending action\.\s+Reply confirm [a-f0-9]{32} or deny [a-f0-9]{32}\.$/i.test(text);
@@ -137,7 +152,8 @@ function cleanReply(value, fallback = IMESSAGE_REPLIES.missingEvidence, strict =
     .replace(/\b(?:task|thread|session|correlation)[ _-]?(?:id)?\s*[:=]\s*[A-Za-z0-9._:-]{6,}\b/gi, '[private id]')
     .replace(/\b(?:system|hidden|internal)\s+prompt\b/gi, '[private instructions]')
     .replace(/\b(?:photon|pi|worker|daemon|gateway|routing|handoff)\b/gi, '')
-    .replace(/\s{2,}/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
     .trim().slice(0, maxCompletionChars) || fallback;
 }
 
