@@ -73,6 +73,8 @@ The stack timer runs every minute. The iMessage monitor has its own interval and
 
 The Photon bridge offers a loopback-only notification endpoint. Tick can use it when `MI_PROACTIVE_IMESSAGE_NOTIFY=true`. Pushover remains opt-in.
 
+A Divernote work notification names its exact Pi session. A reply to that notification may use the scoped `pi.message` Divernote operation to continue only that session. The canonical Divernote CLI verifies the session against the private vault before it sends the user's text.
+
 ## Local state
 
 Default locations are split by purpose:

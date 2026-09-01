@@ -12,6 +12,7 @@ const explicitVault = /\bdiver\s*notes?\b/i;
 const firstPersonVault = /\b(?:my|mine)\s+(?:tasks?|projects?|notes?|documents?)\b/i;
 const contextOnly = /^(?:please\s+)?(?:add|create|update|change|complete|reopen|append|replace|set)\s+(?:it|that|this|those|them)\b[.!?]*$/i;
 const explicitContextOnly = /\bdiver\s*notes?\b.*\b(?:add|create|update|change|complete|reopen|append|replace|set)\s+(?:it|that|this|those|them)\b/i;
+const piSessionReply = /\bpi\s+session\s+([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\b/gi;
 const supportedSurface = 'tasks, notes, projects, project tasks, and adding, completing, or reopening project subtasks';
 const unsupportedReply = `Divernote currently supports ${supportedSurface}; listing subtasks, documents, details, manuals, interviews, lifecycle operations, and raw API access are unavailable.`;
 const ambiguousReply = `Which supported Divernote item do you mean: a task, note, project, project task, or subtask?`;
@@ -21,6 +22,8 @@ export function diverNotesPreflight({ message, plan, gate = 'allow' } = {}) {
   if (gate !== 'allow') return { access: 'none' };
   const mentionsVault = explicitVault.test(text) || firstPersonVault.test(text);
   if (/\bshell\b/i.test(text) && mentionsVault) return { access: 'none' };
+  const sessionIds = [...new Set([...text.matchAll(piSessionReply)].map(match => match[1]))];
+  if (mentionsVault && sessionIds.length === 1) return plan?.allowWrite === true ? { access: 'write', piSessionId: sessionIds[0] } : { access: 'read' };
   if (unsupportedDocument.test(text) && mentionsVault) return { access: 'none', clarify: true, unsupported: true, reply: unsupportedReply };
   if (/\bsubtasks?\b/i.test(text) && (readVerb.test(text) || /\bsee\b/i.test(text)) && !writeVerb.test(text) && !/\bcheck\s+off\b/i.test(text) && !/\bback\s+on\s+(?:the\s+)?list\b/i.test(text)) return { access: 'none', clarify: true, unsupported: true, reply: unsupportedReply };
   if ((contextOnly.test(text) && !mentionsVault) || explicitContextOnly.test(text)) return { access: 'none', clarify: true, reply: ambiguousReply };

@@ -20,6 +20,14 @@ const TOOL_CONTENT_CAP = 24 * 1024;
 type Input = Record<string, unknown>;
 type ItemInvoke = typeof invokeDivernote;
 type ProjectInvoke = typeof invokeProjectContent;
+type Authorization = { onlyOperation?: string; piSessionId?: string };
+
+function environmentAuthorization(env = process.env): Authorization {
+  return {
+    onlyOperation: String(env.MI_DIVER_NOTES_ONLY_OPERATION || '').trim() || undefined,
+    piSessionId: String(env.MI_DIVER_NOTES_PI_SESSION_ID || '').trim() || undefined,
+  };
+}
 
 type OperationSpec = {
   args: Record<string, string>;
@@ -30,6 +38,7 @@ type OperationSpec = {
   projectGroup?: 'projects' | 'project-tasks' | 'project-subtasks';
   projectOperation?: 'list' | 'read' | 'create' | 'add' | 'complete' | 'reopen';
   aggregate?: 'tactics-journal-context';
+  piMessage?: boolean;
 };
 
 const operations: Record<string, OperationSpec> = {
@@ -49,6 +58,7 @@ const operations: Record<string, OperationSpec> = {
   'project-subtasks.add': { args: { project: 'project', taskId: 'taskId', text: 'text' }, required: ['project', 'taskId', 'text'], write: true, projectGroup: 'project-subtasks', projectOperation: 'add' },
   'project-subtasks.complete': { args: { project: 'project', taskId: 'taskId', id: 'id' }, required: ['project', 'taskId', 'id'], write: true, projectGroup: 'project-subtasks', projectOperation: 'complete' },
   'project-subtasks.reopen': { args: { project: 'project', taskId: 'taskId', id: 'id' }, required: ['project', 'taskId', 'id'], write: true, projectGroup: 'project-subtasks', projectOperation: 'reopen' },
+  'pi.message': { args: { sessionId: 'sessionId', text: 'text' }, required: ['sessionId', 'text'], write: true, piMessage: true },
 };
 
 export const DIVER_NOTES_READ_OPERATIONS = new Set(Object.entries(operations).filter(([, value]) => !value.write).map(([key]) => key));
@@ -96,10 +106,12 @@ function compactTacticsJournalContext(notesValue: unknown, tasksValue: unknown, 
   return { scope: 'Tactics Journal', notes, tasks, projects, projectCount: recordList(projectsValue, 'projects').length };
 }
 
-export async function runDiverNotes(input: Input, { invokeItem = invokeDivernote, invokeProject = invokeProjectContent }: { invokeItem?: ItemInvoke; invokeProject?: ProjectInvoke } = {}): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+export async function runDiverNotes(input: Input, { invokeItem = invokeDivernote, invokeProject = invokeProjectContent, runCommand = absoluteRunner, authorization = environmentAuthorization() }: { invokeItem?: ItemInvoke; invokeProject?: ProjectInvoke; runCommand?: typeof absoluteRunner; authorization?: Authorization } = {}): Promise<{ ok: boolean; value?: unknown; error?: string }> {
   try {
     const operation = String(input?.operation || '');
     const { spec, values } = canonicalInput(operation, input);
+    if (authorization.onlyOperation && authorization.onlyOperation !== operation) throw new Error('Divernote operation is outside the current request.');
+    if (spec.piMessage && (!authorization.piSessionId || authorization.piSessionId !== values.sessionId)) throw new Error('Divernote Pi session is outside the current request.');
     let value: unknown;
     if (spec.aggregate === 'tactics-journal-context') {
       const read = async (request: () => Promise<unknown>) => {
@@ -124,6 +136,11 @@ export async function runDiverNotes(input: Input, { invokeItem = invokeDivernote
         ...compactTacticsJournalContext(notesValue, tasksValue, projectsValue, projectValues),
         availability: { notes: notesValue !== undefined, tasks: tasksValue !== undefined, projects: projectsValue !== undefined },
       };
+    } else if (spec.piMessage) {
+      const result = await runCommand(DIVERNOTE_COMMAND, ['pi-message', '--session-id', String(values.sessionId), '--text', String(values.text), '--json'], { timeout: 10 * 60_000 });
+      if (result.code !== 0) throw new Error('Divernote Pi message failed.');
+      value = JSON.parse(result.stdout);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Divernote Pi message returned invalid data.');
     } else if (operation === 'project-tasks.list') {
       const projectValue = await invokeProject('projects', 'read', values as Parameters<ProjectInvoke>[2]);
       const project = projectValue && typeof projectValue === 'object' ? (projectValue as Record<string, unknown>).project as Record<string, unknown> : undefined;
@@ -170,7 +187,7 @@ export default function miDiverNotes(pi: ExtensionAPI) {
   pi.registerTool({
     name: 'mi_diver_notes',
     label: 'Divernote',
-    description: 'Use the canonical Pi Divernote path to read or make the exact requested change in the owner’s private vault. For a Tactics Journal operating brief, use tactics-journal.context once.',
+    description: 'Use the canonical Pi Divernote path to read or make the exact requested change in the owner’s private vault. Use pi.message when the user replies to a Divernote work notification that names an exact Pi session. For a Tactics Journal operating brief, use tactics-journal.context once.',
     parameters: diverNotesSchema,
     async execute(_id, params) {
       const result = await runDiverNotes(params as Input);

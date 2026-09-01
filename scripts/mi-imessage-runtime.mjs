@@ -59,6 +59,12 @@ function safeId(value) {
   return /^[A-Za-z0-9._:-]{1,200}$/.test(id) ? id : '';
 }
 
+export function diverNotesReplyEnvironment(value) {
+  const sessionId = String(value || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId)) return {};
+  return { MI_DIVER_NOTES_ONLY_OPERATION: 'pi.message', MI_DIVER_NOTES_PI_SESSION_ID: sessionId };
+}
+
 function normalizeIdentity(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -842,7 +848,7 @@ export class ImessageRuntime {
       : { access: 'none' };
     if (diverNotes.reply) return { reply: diverNotes.reply, taskIds: [] };
     const suppliedContext = await tacticsJournalContext(message);
-    return this.runCoordinator(record, directory, { ...plan, diverNotesAccess: diverNotes.access, suppliedContext });
+    return this.runCoordinator(record, directory, { ...plan, diverNotesAccess: diverNotes.access, diverNotesPiSessionId: diverNotes.piSessionId, suppliedContext });
   }
 
   async runCoordinator(record, directory, plan) {
@@ -889,6 +895,7 @@ export class ImessageRuntime {
         MI_ROOT: root, MI_CAPABILITY_PROFILE: 'mi-main-orchestrator', MI_CAPABILITY_GRANTS_FILE: grants,
         MI_CAPABILITY_AUDIT_FILE: path.join(directory, 'runtime', 'capability-audit.jsonl'),
         MI_COORDINATOR_POLICY_FILE: policy, MI_SOCKET_PATH: socketPath,
+        ...diverNotesReplyEnvironment(plan.diverNotesPiSessionId),
         ...(piConfigDirectory ? { PI_CODING_AGENT_DIR: piConfigDirectory } : {}),
       }),
     });
