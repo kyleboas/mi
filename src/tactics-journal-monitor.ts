@@ -6,6 +6,9 @@ import { notifyImessage } from './notify.js';
 
 const DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_STATE_BYTES = 24 * 1024;
+const ADMIN_ALERTS_URL = 'https://tacticsjournal.com/api/internal/imessage-alerts';
+const MAX_ADMIN_ALERTS = 25;
+const MAX_ADMIN_ALERT_MESSAGE_CHARS = 1200;
 
 export type TacticsJournalCheckName = 'site' | 'board' | 'community' | 'ama';
 export type TacticsJournalCheck = { ok: boolean; detail: string };
@@ -30,6 +33,8 @@ export type TacticsJournalMonitorResult = {
   checks?: CheckMap;
   reason?: string;
 };
+
+type AdminAlert = { id: string; message: string };
 
 function enabled() {
   return !/^(0|false|no|off)$/i.test(String(process.env.MI_TACTICS_JOURNAL_MONITOR_ENABLED ?? 'true').trim());
@@ -86,6 +91,49 @@ async function get(fetchFn: typeof fetch, url: string, accept: string) {
   });
 }
 
+async function processAdminAlerts(fetchFn: typeof fetch, notify: NonNullable<MonitorDependencies['notify']>) {
+  const secret = String(process.env.MI_TACTICS_JOURNAL_ALERT_SECRET || '').trim();
+  if (!secret) return 0;
+  const headers = {
+    accept: 'application/json',
+    authorization: `Bearer ${secret}`,
+    'content-type': 'application/json',
+    'user-agent': 'mi-tactics-journal-monitor/1.0',
+  };
+  const response = await fetchFn(ADMIN_ALERTS_URL, {
+    headers,
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`admin alert feed returned HTTP ${response.status}`);
+  const payload = await response.json() as { alerts?: unknown };
+  if (!Array.isArray(payload.alerts)) throw new Error('admin alert feed response incomplete');
+
+  const alerts: AdminAlert[] = payload.alerts.slice(0, MAX_ADMIN_ALERTS).map((value: unknown) => {
+    const alert = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const id = String(alert.id || '').trim();
+    const message = String(alert.message || '').trim();
+    if (!id || id.length > 200 || !message || message.length > MAX_ADMIN_ALERT_MESSAGE_CHARS) {
+      throw new Error('admin alert feed returned an invalid alert');
+    }
+    return { id, message };
+  });
+
+  let sent = 0;
+  for (const alert of alerts) {
+    const result = await notify('Tactics Journal', alert.message, { requireEnabled: false });
+    if (result.ok !== true) throw new Error(`iMessage notification failed${result.status ? ` with HTTP ${result.status}` : ''}`);
+    const acknowledged = await fetchFn(ADMIN_ALERTS_URL, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ids: [alert.id] }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!acknowledged.ok) throw new Error(`admin alert acknowledgement returned HTTP ${acknowledged.status}`);
+    sent += 1;
+  }
+  return sent;
+}
+
 async function checkSite(fetchFn: typeof fetch): Promise<TacticsJournalCheck> {
   const response = await get(fetchFn, process.env.MI_TACTICS_JOURNAL_HEALTH_URL || 'https://tacticsjournal.com/api/health', 'application/json');
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -139,10 +187,20 @@ export async function runTacticsJournalMonitor(dependencies: MonitorDependencies
   const now = dependencies.now || new Date();
   const statePath = dependencies.statePath || defaultStatePath();
   const previous = await readState(statePath);
-  if (!due(previous, now)) return { status: 'skipped', reason: 'interval' };
-
   const fetchFn = dependencies.fetchFn || fetch;
   const notify = dependencies.notify || notifyImessage;
+  let adminNotifications = 0;
+  try {
+    adminNotifications = await processAdminAlerts(fetchFn, notify);
+  } catch (error) {
+    return { status: 'error', reason: boundedText(error instanceof Error ? error.message : error) };
+  }
+  if (!due(previous, now)) {
+    return adminNotifications
+      ? { status: 'notified', notifications: adminNotifications }
+      : { status: 'skipped', reason: 'interval' };
+  }
+
   const checks: CheckMap = {
     site: await safeCheck(() => checkSite(fetchFn)),
     board: await safeCheck(() => checkBoard(fetchFn)),
@@ -168,5 +226,6 @@ export async function runTacticsJournalMonitor(dependencies: MonitorDependencies
   }
 
   await writeState(statePath, { version: 1, checkedAt: now.toISOString(), availability, checks });
-  return { status: message ? 'notified' : 'ok', availability, notifications: message ? 1 : 0, checks };
+  const notifications = adminNotifications + (message ? 1 : 0);
+  return { status: notifications ? 'notified' : 'ok', availability, notifications, checks };
 }

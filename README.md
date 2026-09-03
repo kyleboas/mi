@@ -95,7 +95,7 @@ Budget Guard alerts are a separate, iMessage-only path enabled by default. The m
 
 The repair monitor checks `mi-photon-bridge.service`, recent Photon logs, the local notify endpoint, durable deliveries, and recent Mi thread activity. A repair attempt restarts only the Photon bridge, then checks recovery. The narrow sudoers rule is required for the system service restart. Results use `state/imessage-monitor-state.json` and `state/imessage-monitor.jsonl`; stored details are redacted and bounded.
 
-The Tactics Journal monitor uses public, read-only endpoints only. It checks `https://tacticsjournal.com/api/health`, `https://board.tacticsjournal.com/`, `https://tacticsjournal.com/api/community/me`, and `https://tacticsjournal.com/api/ama/active`. It alerts only when the combined state changes between healthy and degraded. It does not prove signed-in Board actions, Community writes, application decisions, moderation, billing, or permissions. Disable it with `MI_TACTICS_JOURNAL_MONITOR_ENABLED=false`; change its cadence with `MI_TACTICS_JOURNAL_MONITOR_INTERVAL_MS`.
+The Tactics Journal monitor checks `https://tacticsjournal.com/api/health`, `https://board.tacticsjournal.com/`, `https://tacticsjournal.com/api/community/me`, and `https://tacticsjournal.com/api/ama/active`. It alerts only when the combined public-health state changes between healthy and degraded. When `MI_TACTICS_JOURNAL_ALERT_SECRET` is set, every tick also pulls new application and AMA-question alerts from the site's authenticated, read-only iMessage feed. Mi acknowledges each alert only after Photon accepts the message. The public checks do not prove signed-in Board actions, Community writes, application decisions, moderation, billing, or permissions. Disable the monitor with `MI_TACTICS_JOURNAL_MONITOR_ENABLED=false`; change its health-check cadence with `MI_TACTICS_JOURNAL_MONITOR_INTERVAL_MS`.
 
 Add reminder crons explicitly:
 
@@ -158,6 +158,7 @@ Optional env:
 - `MI_BUDGET_GUARD_IMESSAGE_NOTIFY=false` — disable Budget Guard iMessage alerts.
 - `MI_BUDGET_GUARD_MONITOR_INTERVAL_MS=900000` — Budget Guard polling cadence. The default is 15 minutes.
 - `MI_BUDGET_GUARD_STATUS_URL` — optional status endpoint override; defaults to the live Budget Guard Worker.
+- `MI_TACTICS_JOURNAL_ALERT_SECRET` — bearer secret shared with the site's `ADMIN_ALERT_IMESSAGE_SECRET`; leave unset to disable application and AMA-question iMessages.
 
 The bridge exposes a local-only notification endpoint at `http://127.0.0.1:8788/notify`. The monitor checks durable deliveries, Photon logs and service state, the notify endpoint, and stale thread activity. It restarts only `mi-photon-bridge.service` by default. It does not restart Web chat or the daemon.
 
